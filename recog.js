@@ -316,6 +316,29 @@ function refineBoxes(img, pool) {
     for (let dx = c[0] - 2; dx <= c[0] + 2; dx += 2) for (let dy = c[1] - 2; dy <= c[1] + 2; dy += 2)
       for (const dw of [c[2] - 2, c[2], c[2] + 2]) for (const dh of [c[3] - 2, c[3], c[3] + 2]) tryBox(dx, dy, dw, dh);
     if (best > r.s1) { adj[r.cell] = bo; r.box = [b[0] + bo[0], b[1] + bo[1], b[2] + bo[2], b[3] + bo[3]]; r.s1 = best; } }
+  /* 认不出的格子也要贴一次 —— 原来直接跳过(r.unknown continue), 而"认不出"往往**恰恰就是框没贴准造成的**,
+     等于自己把自己锁死。09-12 那局第 12 个大招格(别的英雄补位的 灵魂形态)原框只匹配到 0.47,
+     差 0.08 没过补位门槛被留成"未知"; 框挪 2 像素、缩 2 像素之后是 0.76, 第二名只有 0.16。
+     做法:拿它在全库里最像的那张当锚点搜几何(不认标签的自由搜索实测更差, 见 docs/recognition.md),
+     搜完还要求 ① 最像的没换人 ② 分数够高 ③ 领先第二名够多 ④ 不跟已认出的格子重复, 才认。 */
+  for (const r of pool.skills) { if (!r.unknown) continue; const b = r.box;
+    /* 太暗的格子不猜 —— 锁池时就已经很暗的多半是开局前被拿走 / 被挡住的, 看不清就没法认,
+       猜错比留"未知"更糟(实测两个均值只有 9 和 14 的黑格会被硬认出 0.59/0.60 的假答案;
+       认对的那两个均值是 103 和 198)。门槛沿用别处"亮度 <60 算暗格"的口径。 */
+    if (cellStats(img, b).mean < 60) continue;
+    const g0 = matchSkill(img, b, null); if (!g0.key) continue;
+    let best = g0.s1, bo = [0, 0, 0, 0];
+    const tryBox = (dx, dy, d) => { const v = matchSkill(img, [b[0] + dx, b[1] + dy, b[2] + d, b[3] + d], [g0.key]).s1;
+      if (v > best) { best = v; bo = [dx, dy, d, d]; } };
+    for (let dx = -6; dx <= 6; dx += 3) for (let dy = -6; dy <= 6; dy += 3) for (const d of [-6, -3, 0, 3]) tryBox(dx, dy, d);
+    const c0 = bo.slice();
+    for (let dx = c0[0] - 2; dx <= c0[0] + 2; dx++) for (let dy = c0[1] - 2; dy <= c0[1] + 2; dy++)
+      for (const d of [c0[2] - 2, c0[2], c0[2] + 2]) tryBox(dx, dy, d);
+    if (best < 0.55) continue;
+    const nb = [b[0] + bo[0], b[1] + bo[1], b[2] + bo[2], b[3] + bo[3]], g = matchSkill(img, nb, null);
+    if (g.key !== g0.key || g.s1 < 0.55 || g.s1 - g.s2 < 0.15) continue;
+    if (pool.skills.some(x => x !== r && !x.unknown && x.key === g.key)) continue;
+    adj[r.cell] = bo; r.box = nb; r.key = g.key; r.s1 = g.s1; r.unknown = false; r.rescued = true; }
   /* 英雄卡没有模板可对, 借同一行技能格的偏移(同一行透视一样) */
   const rows = {}; for (const r of pool.skills) if (adj[r.cell]) { const row = LAYOUT.board[r.cell].row; (rows[row] = rows[row] || []).push(adj[r.cell]); }
   const med = a => a.slice().sort((x, y) => x - y)[a.length >> 1];
