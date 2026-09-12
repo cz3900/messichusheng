@@ -9,6 +9,15 @@ let LAYOUT = null, LAYOUT0 = null, SC = 1;   // SC = 屏幕/设计(2560×1440)�
 let BRIGHT = {};   // {key: 库图标(6% 内边距裁剪)的平均亮度},参考帧格子已变黑时的回退基准
 let HBRIGHT = {};  // {heroKey: 英雄卡(横版原画中间正方形)平均亮度},同上用于英雄卡
 let OWNER = {}, HERO_SKILLS = {}, HAS_ULT = {}, KIDX = {};
+/* ---- 观测源(2.0 第 1 步) ----
+   追踪层真正从画面里读的东西只有四样:棋盘每格的亮度统计、面板(有没有图标 + 边框)、面板某个槽的图标匹配、面板标题里的英雄名。
+   把这四样收口成一个可替换的"源":
+     · SRC = null   —— 线上, 直接读像素(守卫落空, 零开销、零行为改变);
+     · 记录源       —— 一边读像素一边把读到的**观测**写进轨迹(worker 用);
+     · 回放源       —— 从轨迹里取, 完全不碰像素(离线对比 1.x / 2.0 用)。
+   这就是"日志里只有结论、没有观测"这个可测试性缺陷的根治点。 */
+let SRC = null;
+const setSource = s => { SRC = s; };
 function init(o) {
   LIB = o.lib; LIB.D = LIB.q.length / LIB.keys.length; NAMES = o.names; META = o.meta; LAYOUT = o.layout; LAYOUT0 = JSON.parse(JSON.stringify(o.layout)); SC = 1; BRIGHT = o.bright || {}; HBRIGHT = o.heroBright || {};
   LIB.keys.forEach((k, i) => KIDX[k] = i);
@@ -148,6 +157,7 @@ const cellBright = (img, b) => { const m = Math.floor(b[2] * 0.2); const [r, g, 
    关键区别:**被选走的格子是整块均匀变暗**,九格全暗;而鼠标/提示框只挡住一部分,剩下的格子还是亮的 →
    只看平均值会被挡一半的格子骗过去,看"最亮的那一格"就骗不过去。 */
 function cellStats(img, b) {
+  if (SRC && SRC.cellStats && b && b.cell != null) return SRC.cellStats(b.cell);
   const m = Math.floor(b[2] * 0.2), x = b[0] + m, y = b[1] + m, w = b[2] - 2 * m, h = b[3] - 2 * m;
   if (w < 3 || h < 3) { const v = cellBright(img, b); return { mean: v, max: v, sat: 0 }; }
   const d = img.data, W = img.w; let sum = 0, n = 0, mx = 0, sat = 0, ns = 0;
@@ -167,17 +177,21 @@ function cellStats(img, b) {
      · 门槛取 10 —— 图库 513 个图标换算到游戏里(实测游戏里的纹理是图库的 1.35~1.58 倍, 取 1.35 保守)最低就是 10, 一个不漏;
      · 真空槽误收从 102 降到 11, 剩下的集中在一帧转场画面, 另有"手数不能多于棋盘暗格数+1"兜底。
    很亮的槽(均值 60+, 空槽实测最高才 45)不用看纹理 —— 免得大片纯色的图标(如风暴之拳)被当成空的。 */
-function slotFilled(img, b) {
+function slotFilled(img, b) { if (SRC && SRC.slotFilled && b && b.slot) return SRC.slotFilled(b.slot);
+  const g = slotSignal(img, b); return g.tiny ? g.mean >= 30 : (g.mean >= 60 || g.lap >= 10); }
+/* 判据背后的两个原始量:均值(亮度)与拉普拉斯标准差(纹理)。分出来是为了能**记录观测**而不只是记录结论 ——
+   2.0 想换一条判据(比如"跟这个槽自己空着时的样子比")时, 拿的是同一批原始量, 不用重跑像素。 */
+function slotSignal(img, b) {
   const m = Math.floor(b[2] * 0.2), x = b[0] + m, y = b[1] + m, w = b[2] - 2 * m, h = b[3] - 2 * m;
-  if (w < 5 || h < 5) return cellBright(img, b) >= 30;
+  if (w < 5 || h < 5) return { mean: cellBright(img, b), lap: 0, tiny: true };
   const d = img.data, W = img.w, g = new Float64Array(w * h); let sum = 0;
   for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) { const p = ((y + j) * W + x + i) * 4, r = d[p], gg = d[p + 1], bl = d[p + 2];
     g[j * w + i] = 0.299 * r + 0.587 * gg + 0.114 * bl; sum += (r + gg + bl) / 3; }
-  if (sum / (w * h) >= 60) return true;
+  const mean = sum / (w * h);
   let ls = 0, ls2 = 0, ln = 0;
   for (let j = 1; j < h - 1; j++) for (let i = 1; i < w - 1; i++) {
     const v = g[(j - 1) * w + i] + g[(j + 1) * w + i] + g[j * w + i - 1] + g[j * w + i + 1] - 4 * g[j * w + i]; ls += v; ls2 += v * v; ln++; }
-  return ln ? Math.sqrt(Math.max(0, ls2 / ln - (ls / ln) ** 2)) >= 10 : false;
+  return { mean, lap: ln ? Math.sqrt(Math.max(0, ls2 / ln - (ls / ln) ** 2)) : 0, tiny: false };
 }
 /* 判格子状态 —— **跟它自己开局时的样子比**, 三选一(用户的思路:被选走后的样子是固定的):
      'N' 没变:亮度还在参考的 0.6 倍以上
@@ -387,6 +401,7 @@ function refBrightness(imgRef, pool) {
 }
 /* ---- 面板 ---- */
 function matchSkill(img, box, cands) {
+  if (SRC && SRC.match && box && box.slot) return SRC.match(box.slot, cands);
   const v = cellVec(img, box); let b1 = -9, k1 = null, b2 = -9, k2 = null;
   /* 只对候选算点积。原来不管候选多少都先 scoreAll 全部 513 个(每个 12288 维),面板 40 个槽位就是 2.5 亿次乘法 —— 白烧 */
   const list = cands ? cands.map(k => KIDX[k]).filter(i => i != null) : null;
@@ -398,6 +413,7 @@ function matchSkill(img, box, cands) {
   return { key: k1, s1: b1, key2: k2, s2: b2 };
 }
 function readPanels(img, candKeys) {
+  if (SRC && SRC.panels) return SRC.panels(candKeys);
   const panels = [];
   for (const side of ['L', 'R']) { const P = LAYOUT.panels[side];
     for (let i = 0; i < 5; i++) { const px0 = P.x0, py0 = P.y_top + P.pitch * i, pw = PW, ph = P.pitch;
@@ -408,14 +424,15 @@ function readPanels(img, candKeys) {
       const boxes4 = [];
       /* 空槽 = 近乎纯黑:内圈九宫格最亮一格 <24(实测 1080p/1440p 空槽 0~13, 高亮面板的空槽也 ≤13;最暗的图标"感染"最亮一格也有 36)。
          以前按整格平均 <40 判空 —— 暗色图标(红色恶魔脸之类)平均只有 28~43, 被当成空槽:面板"没多东西" → 棋盘那格被判"不当落子"(09-11 日志 魔王降临/混沌之军/狂怒…) */
-      for (const [sx, sy, sw] of P.slots) { const b = slotBox(P, px0, py0, sx, sy, sw, side); boxes4.push(b); if (!slotFilled(img, b)) { skills.push(null); continue; }
+      for (const [sx, sy, sw] of P.slots) { const b = slotBox(P, px0, py0, sx, sy, sw, side); b.slot = side + i + ":" + boxes4.length; boxes4.push(b); if (!slotFilled(img, b)) { skills.push(null); continue; }
         if (candKeys === false) { skills.push({ key: '?', s: 0 }); continue; }   // 只数格子, 不认图标
         const r = candKeys && candKeys.length ? matchSkill(img, b, candKeys) : matchSkill(img, b, null); skills.push(r.s1 >= 0.3 ? { key: r.key, s: r.s1 } : { key: '?', s: r.s1 }); }
       const [ax0, ay0, ax1, ay1] = (side === 'L' ? [10, 100, 130, 215] : [290, 100, 410, 215]).map(v => Math.round(v * SC)); const st = regionStats(img, px0 + ax0, py0 + ay0, ax1 - ax0, ay1 - ay0);
       panels.push({ side, idx: i, skills, slotBoxes: boxes4, filled: skills.filter(Boolean).length, borderBright: (bm[0] + bm[1] + bm[2]) / 3, borderRGB: bm, faceSat: st.sat, faceTex: st.lap, hasFace: st.sat < 185 && st.lap > 2000 }); } }
   return panels;
 }
-function readHeroName(img, side, idx, cands, sizeHint, anchor) {   // anchor = {x, y, r}:只在上次找到的位置附近 ±r 找(L 面板按左边缘、R 面板按右边缘对齐), 快几十倍   // 归一化相关(TM_CCOEFF_NORMED)滑窗;积分图求窗口均值/能量,只剩 num 逐像素
+function readHeroName(img, side, idx, cands, sizeHint, anchor) {
+  if (SRC && SRC.heroName) return SRC.heroName(side, idx, cands, sizeHint);   // anchor = {x, y, r}:只在上次找到的位置附近 ±r 找(L 面板按左边缘、R 面板按右边缘对齐), 快几十倍   // 归一化相关(TM_CCOEFF_NORMED)滑窗;积分图求窗口均值/能量,只剩 num 逐像素
   const P = LAYOUT.panels[side], px0 = P.x0, py0 = P.y_top + P.pitch * idx; const [tx0, ty0, tx1, ty1] = side === 'L' ? [60, 0, 330, 50] : [130, 0, 410, 50];
   /* 名字模板是按设计分辨率渲染的位图 —— 把标题区按设计尺寸重采样(SC≠1 时相当于缩回 1440p 再匹配) */
   const rw = tx1 - tx0, rh = ty1 - ty0, G = new Float32Array(rw * rh), d = img.data, W = img.w;
@@ -462,8 +479,11 @@ class Tracker {
     if (this.curCand && c[0] === this.curCand[0] && c[1] === this.curCand[1]) this.curCandRun++; else { this.curCand = c; this.curCandRun = 1; }
     if (this.curCandRun >= 2) { this.curSeat = c; this.curCand = null; this.curCandRun = 0; }
     return this.curSeat; }
-  observe(img) { const { boxes } = alignBoard(img, false); const A = this.boxAdj || {};
-    for (const c in A) if (boxes[c]) boxes[c] = [boxes[c][0] + A[c][0], boxes[c][1] + A[c][1], boxes[c][2] + A[c][2], boxes[c][3] + A[c][3]];   // 锁池时贴准的偏移, 每帧照用
+  observe(img) { let boxes;
+    if (SRC && SRC.boxes) boxes = SRC.boxes();                                   // 回放:棋盘框在轨迹头里(锁池后整局不动)
+    else { boxes = alignBoard(img, false).boxes; const A = this.boxAdj || {};
+      for (const c in A) if (boxes[c]) boxes[c] = [boxes[c][0] + A[c][0], boxes[c][1] + A[c][1], boxes[c][2] + A[c][2], boxes[c][3] + A[c][3]]; }   // 锁池时贴准的偏移, 每帧照用
+    for (const c in boxes) if (boxes[c]) boxes[c].cell = +c;                     // 打标签:cellStats 换成从观测源取时按它寻址
     this.boxesNow = boxes;
     /* 锁池时暗着(被挡/原画暗)的格子:一旦看到它更亮, 就把基准往上调 —— 提示框移开后就能学到真实亮度 */
     if (this.learn && this.learn.size) for (const cell of this.learn) { const st = cellStats(img, boxes[cell]);
@@ -772,4 +792,4 @@ class Tracker {
       seats.push(`${side}${i + 1}:${h ? cn(h) : '-'}|${sk.join('/') || '-'}`); }
     return seats.join('  '); }
 }
-module.exports = { _scoreCell: (img, b) => scoreAll(cellVec(img, b)), init, rescale, SCALE: () => SC, readPool, alignBoard, takenFlags, refBrightness, readPanels, matchSkill, calibratePanels, readHeroName, quickPresence, quickSig, boardSig, fastDark, sigDiff, cellBright, cellStats, isDarkCell, Tracker, cn, OWNER: () => OWNER, LAYOUT: () => LAYOUT };
+module.exports = { setSource, cellState, slotFilled, slotSignal, cellVec, _scoreCell: (img, b) => scoreAll(cellVec(img, b)), init, rescale, SCALE: () => SC, readPool, alignBoard, takenFlags, refBrightness, readPanels, matchSkill, calibratePanels, readHeroName, quickPresence, quickSig, boardSig, fastDark, sigDiff, cellBright, cellStats, isDarkCell, Tracker, cn, OWNER: () => OWNER, LAYOUT: () => LAYOUT };

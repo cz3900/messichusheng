@@ -8,6 +8,8 @@
    开局自动:棋盘出现 → 读池子 → 12 英雄齐就锁定, 不需要按键。中途加入/误按 F10 也能重锁(黑格用库亮度回退)。 */
 const { parentPort } = require("worker_threads"); const fs = require("fs"), path = require("path");
 const R = require("./recog.js"); const D = path.join(__dirname, "data");
+const TR = require("./trace.js");   // 观测轨迹:把每帧**看到了什么**写下来, 真机对局才能离线回放
+const V2 = require("./v2.js");      // 2.0 状态估计(证据累加 + 带容量指派), 由内核开关决定用不用
 const rd = f => { const b = fs.readFileSync(f); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); };   // 小文件的 Buffer 在共享池里, 必须按 offset 截
 
 R.init({ lib: { keys: JSON.parse(fs.readFileSync(D + "/lib_keys.json")), q: new Int8Array(rd(D + "/lib_i8.bin")), scale: new Float32Array(rd(D + "/lib_scale.bin")) },
@@ -67,10 +69,51 @@ let cachedState = null, pendingNext = false, dropRun = 0, rejects = 0;
 let lastNd = 0, lockSig = null, lockWaitLogged = false, fastPicks = new Map(), lastCal = -999;   // fastPicks:快通道判定、等完整识别确认的落子 → 判定时刻   // lockSig:上一次锁池尝试那帧的 60 格亮度(判"画面停住了没有")
 let lastSeat = -1, pickedAtCur = false, lastAdvice = null, curCtx = null;   // 提前算:高亮还在他那儿但已经落子 → 直接给下一位算
 let lastS = null, fastDarkPrev = null, sinceFull = 0, wantFull = false, fastCand = null, lastSusp = "";   // fastCand = 上一帧刚变黑、还等第二次确认的那一格
-let extraSnaps = 0, endSnapped = false;   // 排障截图:撤销英雄 / 选完了, 各自另算额度(每次启动最多 6 张), 不挤占锁池截图
-function snapshot(img, why) { if (why === "retract" || why === "draft_end") { if (extraSnaps >= 6) return; extraSnaps++; } else { if (snapped >= 6) return; snapped++; }   // PNG 编码 ~1 s,只在关键时刻存
-  try { const { PNG } = require("pngjs"); const p = new PNG({ width: img.w, height: img.h, deflateLevel: 1 }); p.data = Buffer.from(img.data.buffer, img.data.byteOffset, img.data.length);
-    parentPort.postMessage({ type: "snapshot", why, png: PNG.sync.write(p, { deflateLevel: 1 }) }); } catch (e) { log("snap", "失败 " + e); } }
+let extraSnaps = 0, endSnapped = false, lastDiff = "";
+/* ---- 两个互相独立的开关 ----
+   TESTMODE(运行模式) —— 只影响截图和日志;**不改变任何判断**。测试模式下两个内核并行跑, 把分歧记下来。
+   CORE(状态估计内核) —— "1x" 或 "v2", 决定谁来判断"被拿走了没有 / 归谁", 也就是谁驱动输出。
+   1.x 的 Tracker **始终**在跑:当前选人 / 我是谁 / 棋盘框 / 对齐质量不属于状态估计, 只有它算。 */
+let TESTMODE = false, CORE = "1x";
+/* ---- 观测轨迹 ---- */
+let TRDIR = null, REC = null, trBytes = 0, EST = null, estDiff = "", estMs = 0;
+const TR_CAP = +(process.env.AD_TRACE_CAP || 40) * 1024 * 1024;   // 单局上限, 超了就停写(别把用户硬盘写满)
+const needV2 = () => CORE === "v2" || TESTMODE;                   // 2.0 要不要跑(驱动输出, 或并行对照)
+function trStart(t, img, samePool) {
+  const write = TRDIR && process.env.AD_TRACE !== "0";
+  const keep = samePool && EST;   // 同一池子重锁(F10 / 画面抖动):2.0 的证据必须带过来, 否则整局的累计全丢
+  if (!write && !needV2()) { EST = null; return; }                // 既不写盘也不需要 2.0 → 完全不用记录器
+  try { const f = write ? path.join(TRDIR, `trace_${new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14)}.jsonl`) : null;
+    const old = EST; REC = new TR.Recorder(f); const head = REC.head(t, [img.w, img.h], FULL_ORDER); trBytes = 0;
+    EST = needV2() ? (keep ? old : new V2.Estimator(head)) : null;
+    if (keep && EST) { EST.refB = t.refB; EST.refS = t.refS; log("trace", `同一池子重锁, 2.0 保留已累计的证据(${EST.frames} 帧)`); }
+    log("trace", write ? `观测轨迹 → ${path.basename(f)}${EST ? " (2.0 同时在跑)" : ""}` : "观测源已开(只在内存里, 供 2.0 用)");
+  } catch (e) { REC = null; EST = null; log("trace", "开轨迹失败 " + e); } }
+/* 落盘但**不**收摊:切出去再切回来会走"棋盘回来了, 继续上一局追踪"那条路, 它不经过 tryLock。
+   在那里把记录器和 2.0 的证据清掉, 等于后半局既没有轨迹也没有 2.0。只有换局/换池子才真收。 */
+function trFlush() { if (REC) { try { REC.save(); } catch (e) { } } }
+function trStop() { trFlush(); REC = null; EST = null; }
+/* 截图额度按"为什么存"分开算, 免得一类噪声把额度吃光。正式模式沿用原来的两档(各 6 张);
+   测试模式下每一类各给 12 张, 且**半分辨率** —— 全分辨率 PNG 编码要 ~1 秒, 会把识别整个卡住,
+   半分辨率像素量 1/4, 约 250ms, 而"当时画面长什么样"这件事半分辨率完全够看。 */
+const SNAP_QUOTA = {};
+function snapshot(img, why, half) {
+  const test = TESTMODE && !["pool", "pool_mid", "reject", "manual", "retract", "draft_end"].includes(why);
+  if (test) { if ((SNAP_QUOTA[why] = (SNAP_QUOTA[why] || 0) + 1) > 12) return; }
+  else if (why === "retract" || why === "draft_end") { if (extraSnaps >= (TESTMODE ? 20 : 6)) return; extraSnaps++; }
+  else { if (snapped >= (TESTMODE ? 20 : 6)) return; snapped++; }
+  /* PNG 编码 ~1 秒(半分辨率 ~250ms), 在工作线程里做会**把识别整个卡住** ——
+     实测测试模式下 27 帧只来得及做 21 次完整识别, 等于测试模式自己干扰了它要测的东西。
+     所以这里只做像素拷贝(几毫秒), 把裸缓冲转移给主进程, 由主进程去编码落盘。 */
+  try {
+    let W = img.w, H = img.h, data;
+    if (half || test) { W = img.w >> 1; H = img.h >> 1; data = Buffer.allocUnsafe(W * H * 4);
+      for (let j = 0; j < H; j++) { const sr = (j * 2) * img.w * 4, dr = j * W * 4;
+        for (let i = 0; i < W; i++) { const s = sr + i * 8, o = dr + i * 4;
+          data[o] = img.data[s]; data[o + 1] = img.data[s + 1]; data[o + 2] = img.data[s + 2]; data[o + 3] = 255; } } }
+    else data = Buffer.from(img.data);
+    const buf = data.buffer.slice(data.byteOffset, data.byteOffset + data.length);
+    parentPort.postMessage({ type: "snapshot", why, raw: buf, w: W, h: H }, [buf]); } catch (e) { log("snap", "失败 " + e); } }
 function want(full) { wantFull = wantFull || full; parentPort.postMessage({ type: "want", full: !!full, phase }); }
 function poolSummary(t) { const by = {}; let orphan = 0;
   const extra = [];
@@ -108,9 +151,13 @@ function tryLock(img, pres) {
   t.fullOrder = FULL_ORDER; t.orderSeat = n => { const x = FULL_ORDER[Math.max(0, Math.min(n, FULL_ORDER.length - 1))]; return [x < 5 ? "L" : "R", x % 5]; };   // 第 n 手归谁
   tracker = t; phase = "active"; forceReset = false; lastSig = null; lockSig = null; fastPicks.clear(); lastCal = -999; if (!old || !old.pool || old.pool.poolHeroes.slice().sort().join() !== t.pool.poolHeroes.slice().sort().join()) endSnapped = false; lastQuick = null; lastCur = ""; lastTaken = -1; seq++; pendingNext = true;
   lastSeat = -1; pickedAtCur = false; lastAdvice = null; curCtx = null; lastS = null; turnLock = null; fastDarkPrev = null; sinceFull = 0;
-  log("pool", "池子: " + poolSummary(t)); snapshot(img, q.darkCells > 3 ? "pool_mid" : "pool"); want(true); return true;
+  const samePool = !!(old && old.pool && old.pool.poolHeroes.slice().sort().join() === t.pool.poolHeroes.slice().sort().join());
+  log("pool", "池子: " + poolSummary(t));
+  if (REC) { try { REC.save(); } catch (e) { } REC = null; }   // 只收掉轨迹文件, EST 交给 trStart 决定留不留
+  trStart(t, img, samePool);
+  snapshot(img, q.darkCells > 3 ? "pool_mid" : "pool"); want(true); return true;
 }
-function goIdle(why) { if (phase !== "idle") log("phase", "→ idle: " + why); if (POOL) POOL.cancel(); phase = "idle"; lastNd = 0; lockSig = null; lastQuick = null; cachedState = null; lastS = null; fastDarkPrev = null; seq++;
+function goIdle(why) { trFlush(); if (phase !== "idle") log("phase", "→ idle: " + why); if (POOL) POOL.cancel(); phase = "idle"; lastNd = 0; lockSig = null; lastQuick = null; cachedState = null; lastS = null; fastDarkPrev = null; seq++;
   parentPort.postMessage({ type: "clear" }); want(false); }
 /* ---- 出建议 ---- */
 /* 同一个决策点("这一局的第 j 手")永远用同一套随机数:同一局面必然算出同一结果, 局面有真变化时结果只随变化本身变。
@@ -203,6 +250,7 @@ function fastTick(img) {
   const t0 = Date.now(); const dark = R.fastDark(img, tracker.pool, tracker.boxesNow, tracker.refB); scans++; tScan += Date.now() - t0;
   if (!fastDarkPrev) { fastDarkPrev = dark; want(true); return false; }
   const hk = tracker.hoverKey(tracker.boxesNow); if (hk) { if (fastDarkPrev.has(hk)) dark.add(hk); else dark.delete(hk); }   // 鼠标停着的那格:当作没变
+  if (REC && REC.file && trBytes < TR_CAP) { try { REC.scan(dark, tracker); } catch (e) { } }   // 快扫也进轨迹:时间分辨率 4 倍
   const added = [...dark].filter(k => !fastDarkPrev.has(k)), gone = [...fastDarkPrev].filter(k => !dark.has(k));
   fastDarkPrev = dark;
   if (!added.length && !gone.length) { fastCand = null; return false; }
@@ -231,9 +279,49 @@ function fastTick(img) {
   chooseAdvice(S, startIdxOf(S, true, lastTaken), true, Date.now() - t0);
   want(true); return true;
 }
+/* 测试模式下"我关心的点位" —— 每一条都对应真机上出过的一类具体问题。
+   把这些时刻的画面存下来, 事后能把"插件当时怎么想的"和"画面当时什么样"对上。
+   (每一类各 12 张额度、半分辨率, 见 snapshot) */
+const POINTS = [
+  [/按图标认/,            "forced",   "面板多出图标但棋盘没看到变暗 → 强认(这一步没有棋盘复核, 错了不会自己撤)"],
+  [/棋盘上被选走的格子不够/, "cap",      "手数上限兜底触发 = 面板那边多认了图标"],
+  [/按时间顺序改判/,       "heromove", "英雄按时间顺序被改判(前面有一手当时没认上)"],
+  [/面板名字改判|让出/,     "heromove", "面板名字把英雄座位改了"],
+  [/不当落子/,            "suspect",  "棋盘看着变暗、但没有任何面板多东西"],
+  [/补认|按时间配/,        "rescue",   "主线配对失败, 走了兜底"],
+];
 function flushTrackLog(img) { for (; logIdx < tracker.log.length; logIdx++) { const [t, k, q, how] = tracker.log[logIdx];
   if (img && t === "hero" && how === "retract") snapshot(img, "retract");   // 英雄被撤销是罕见事件, 存下当时的画面以便排查
+  if (img && TESTMODE && how !== "retract") for (const [re, why, note] of POINTS)
+    if (re.test(how)) { snapshot(img, why); log("point", `[${why}] ${R.cn(k)} → ${q}: ${note}`); break; }
   log("track", how === "retract" ? `撤销 ${t === "hero" ? "英雄" : "技能"} ${R.cn(k)} (原归 ${q}, 格子亮回来了)` : `${t === "hero" ? "英雄" : "技能"} ${R.cn(k)} → ${q} (${how})`); } }
+/* 另外三个点位, 不走 tracker.log:
+   ① 池外高分 = 池子读错的铁证(面板里只可能出现池子里的技能) —— 轨迹里已经有每个槽的全库前二, 白拿;
+   ② 2.0 认为置信度低的归属;
+   ③ 每 10 手一张"平时长什么样"的底片, 好和出问题那几张对照。 */
+let lastOutPool = "", lastLowConf = "", lastBase = -99;
+function testPoints(img, src) {
+  try {
+    /* 判据必须够硬, 否则报的全是噪声。09-12 真机第一次跑就报了 3 次, 逐一查下来**三次全是假阳性**:
+       其中一次全库前二是"冲击波 0.7212 / 弹幕冲击 0.7176" —— 领先只有 0.004, 等于根本没认出来;
+       另一次那个槽近乎全黑(选技结束转场)。而 v1.16 那次真的铁证是 0.94/0.95/0.99。
+       所以补上最要紧的一条:**全库第一要明显领先它自己的第二名**——认不出来的图标, 前几名总是挤在一起。 */
+    const pool = new Set(REC.poolKeys || []), bad = [];
+    for (const k in src.rec.scores) { const r = src.rec.scores[k]; if (!r || !r.g || !r.g[0]) continue;
+      const g = r.g[0], g2 = r.g[1];
+      if (pool.has(g[0]) || g[1] < 0.75) continue;                      // 分数够高(v1.16 的证据是 0.94+)
+      if (!g2 || g[1] - g2[1] < 0.15) continue;                         // 且在全库里明显领先第二名 —— 这条才是关键
+      const row = src.row(k); let mx = -9; if (row) for (const v of row) if (v > mx) mx = v;
+      if (g[1] - mx >= 0.15) bad.push(`${k} 像池外的 ${R.cn(g[0])} ${g[1].toFixed(2)}(领先全库第二 ${(g[1] - g2[1]).toFixed(2)}, 池内最像才 ${mx.toFixed(2)})`); }
+    if (bad.length && bad.join() !== lastOutPool) { lastOutPool = bad.join();
+      log("point", `[outpool] 面板里出现了池子外的高分匹配 = 池子读错的铁证: ${bad.slice(0, 3).join(" | ")}`); snapshot(img, "outpool"); }
+    if (EST) { const st = EST.state();
+      const low = Object.keys(st.margin).filter(k => st.margin[k] < 0.15).map(k => `${R.cn(k)}→${st.owner[k]}(${st.margin[k].toFixed(2)})`);
+      if (low.length && low.join() !== lastLowConf) { lastLowConf = low.join();
+        log("point", `[lowconf] 2.0 说这几件归属没把握: ${low.slice(0, 4).join(" | ")}`); snapshot(img, "lowconf"); } }
+    const n = lastTaken | 0; if (n >= lastBase + 10) { lastBase = n; snapshot(img, "base" + n); }
+  } catch (e) { log("error", "点位 " + (e && e.message || e)); }
+}
 /* ---- 主循环 ---- */
 let ALL = false, PLEVEL = 0;   // ALL=团队模式(显示我方五人);PLEVEL=个人权重档 0..3(界面上叫 1~4 档), 只影响我自己的回合
 /* 个人权重四档 = 每一手最多允许让队伍胜率比最好的低多少(在这个范围里挑个人分最高的)。
@@ -242,10 +330,16 @@ let ALL = false, PLEVEL = 0;   // ALL=团队模式(显示我方五人);PLEVEL=�
 const PLEVELS = [{ name: "团队", delta: 0 }, { name: "略偏个人", delta: 0.01 }, { name: "偏个人", delta: 0.025 }, { name: "贪", delta: 0.05 }];
 parentPort.on("message", async m => {
   if (m.type === "reset") { log("key", "收到重新识别(F10/菜单): 下一帧重锁池子"); forceReset = true; presentRun = 0; retryAt = 0; want(true); return; }
+  if (m.type === "logdir") { TRDIR = m.dir; return; }
   if (m.type === "display") {   // 主进程报物理分辨率 → 按它缩放版式
     DISP = [m.w, m.h]; const r = R.rescale(m.w, m.h);
     log("disp", `屏幕 ${m.w}x${m.h} → 版式比例 ${r.scale.toFixed(4)}${r.sixteenNine ? "" : " ⚠ 非 16:9, 带鱼屏版式未经验证, 可能对不准"}`); return; }
   if (m.type !== "frame" || busy) return; busy = true; frames++; ALL = !!m.all; PLEVEL = Math.max(0, Math.min(3, m.plevel | 0));
+  { const t = !!m.test, c = m.core === "v2" ? "v2" : "1x";
+    if (t !== TESTMODE || c !== CORE) { const was = needV2(); TESTMODE = t; CORE = c;
+      log("cfg", `运行模式=${TESTMODE ? "🔬 测试(点位全截图 + 两版并行对照)" : "正式"} 状态估计内核=${CORE === "v2" ? "2.0(试验)" : "1.x(稳定)"}`);
+      /* 本来不需要 2.0、现在需要了 → 只能等下一次锁池才有观测源;反过来留着也无妨 */
+      if (!was && needV2() && tracker) log("cfg", "2.0 需要从锁池那一刻开始累计证据 → 按 F10 重新识别池子即可让它接上"); } }
   try {
     const img = { w: m.w, h: m.h, data: new Uint8Array(m.buf) };
     if (tracker) tracker.cursor = m.cursor || null;   // 鼠标位置(全分辨率坐标), 悬停那格当"看不清"
@@ -253,7 +347,7 @@ parentPort.on("message", async m => {
     if (m.snap) snapshot(img, "manual");
     const isFull = !!m.full;
     if (isFull && (!DISP || DISP[0] !== img.w || DISP[1] !== img.h)) {   // 分辨率变了(或主进程没报过)→ 按实际帧重新缩放
-      DISP = [img.w, img.h]; const r = R.rescale(img.w, img.h); tracker = null; phase = "idle"; 
+      DISP = [img.w, img.h]; const r = R.rescale(img.w, img.h); trStop(); tracker = null; phase = "idle"; 
       log("disp", `按全分辨率帧重设版式 ${img.w}x${img.h} 比例 ${r.scale.toFixed(4)}${r.sixteenNine ? "" : " ⚠ 非 16:9"}`); }
     const pres = R.quickPresence(img);
     /* 锁池前要求严(格子间隙必须暗, 免得在别的界面上乱锁);已经锁上之后只要格子还亮着就认为棋盘还在 ——
@@ -275,13 +369,13 @@ parentPort.on("message", async m => {
     if (!isFull) { want(true); parentPort.postMessage({ type: "state", phase, idle: true, pres, board: true, near: lastNd >= 40 }); return; }   // 需要全图才能继续
     /* 新一局:棋盘暗格数比已确认的已选走数少 4 个以上,且连续 2 帧 */
     if (phase === "active" && lastTaken >= 4 && pres.dark <= 2 && pres.dark <= lastTaken - 4) dropRun++; else dropRun = 0;
-    if (dropRun >= 3) { log("phase", `棋盘几乎全亮(暗格 ${pres.dark})而记账里已选走 ${lastTaken}, 连续 ${dropRun} 帧 → 新的一局`); tracker = null; phase = "idle"; presentRun = 2; retryAt = 0; seq++; dropRun = 0; parentPort.postMessage({ type: "clear" }); }
+    if (dropRun >= 3) { log("phase", `棋盘几乎全亮(暗格 ${pres.dark})而记账里已选走 ${lastTaken}, 连续 ${dropRun} 帧 → 新的一局`); trStop(); tracker = null; phase = "idle"; presentRun = 2; retryAt = 0; seq++; dropRun = 0; parentPort.postMessage({ type: "clear" }); }
     if (phase === "idle" || forceReset) {
       if (tracker && !forceReset) {   // 之前那局的棋盘回来了(切屏回来)还是换了一局?比 60 格亮度签名
         const d = R.sigDiff(R.boardSig(img, tracker.boxesNow), tracker.lastBoardSig);
         if (d < 25) { phase = "active"; lastQuick = null; pendingNext = true; tracker.allowBulk = 1;   // 离开期间可能已经选走好几件, 允许一次批量更新
           log("phase", `棋盘回来了(签名差 ${d.toFixed(0)}), 继续上一局追踪`); want(true); }
-        else { log("phase", `棋盘变了(签名差 ${d.toFixed(0)}) → 当新一局重锁`); tracker = null; presentRun = Math.max(presentRun, 2); retryAt = 0; } }
+        else { log("phase", `棋盘变了(签名差 ${d.toFixed(0)}) → 当新一局重锁`); trStop(); tracker = null; presentRun = Math.max(presentRun, 2); retryAt = 0; } }
       if ((phase !== "active" || forceReset) && presentRun >= 1 && Date.now() >= retryAt) tryLock(img, pres);   // 不再要求"看到棋盘第 2 帧":tryLock 里"连续两帧画面一样"本身就证明棋盘真在, 两条叠加会多等一帧
       if (phase !== "active") { parentPort.postMessage({ type: "state", phase, idle: true, pres, waiting: true, board: true, near: lastNd >= 40 }); return; }
     }
@@ -294,7 +388,28 @@ parentPort.on("message", async m => {
     if (tracker && frames - lastCal > 200) { const fl = R.readPanels(img, false).reduce((a, p) => a + p.filled, 0);
       if (fl >= 3) { const adj = R.calibratePanels(img, tracker.pool.skills.filter(x => !x.unknown).map(x => x.key)); lastCal = frames;
         log("cal", `技能槽贴框: 左 ${adj.L.join(",")} 右 ${adj.R.join(",")}`); } }
-    const t0 = Date.now(); const S = tracker.update(img); const ms = Date.now() - t0; heavy++; tHeavy += ms;
+    const t0 = Date.now(); let S, src = null;
+    if (REC && (!REC.file || trBytes < TR_CAP)) {   // 上限只约束写盘;只在内存里跑(给 2.0 当观测源)时不受限
+      try { src = REC.capture(img, tracker); S = tracker.update(img); }
+      finally { R.setSource(null); }
+      /* 2.0:吃同一份观测(与 1.x 逐字相同的那一份), 各自独立地得出结论 */
+      estDiff = ""; if (EST && src) { const e0 = Date.now();
+        try { EST.observe(src.rec, src);
+          if (TESTMODE) { const d = EST.diff(tracker); estDiff = d.join("; ");
+            if (d.length && d.join() !== lastDiff) { lastDiff = d.join();
+              log("v2", `两版分歧 ${d.length} 处: ${d.slice(0, 4).map(x => x.replace(/[a-z_]+_[a-z_]+/g, m => R.cn(m))).join(" | ")}`);
+              snapshot(img, "disagree"); } }
+          if (CORE === "v2") S = EST.applyTo(S, { margin: 0 });
+        } catch (e) { log("error", "2.0 " + (e && e.stack || e)); }
+        estMs = Date.now() - e0; }
+      /* 点位检查必须在 flush **之前**:flush 会把"沿用上一帧"的分数行换成一个标记(没有分数本体),
+         之后再问就取不到了 —— 池外高分那一条会静悄悄地永远不触发。 */
+      if (TESTMODE) testPoints(img, src);
+      try { REC.flush({ cur: tracker.curSeat, me: tracker.meSeat, taken: lastTaken, core: CORE, test: TESTMODE }); } catch (e) { }
+      trBytes = REC.bytes;
+      if (REC.file && trBytes >= TR_CAP) { log("trace", `轨迹到达 ${(TR_CAP / 1048576).toFixed(0)}MB 上限, 停止写盘`); REC.file = null; } }
+    else S = tracker.update(img);
+    const ms = Date.now() - t0; heavy++; tHeavy += ms;
     /* 快通道判定的落子, 完整识别要连续 2 帧 + 面板配对才确认(1~2 秒)。这段时间里局面如果把它时有时无, 推荐的计算会被打断重来 ——
        09-12 日志:落子后 0.4 秒和 1.7 秒各重来一次, 前半局每手白等 1.5~2 秒。现在:完整识别还看得到它暗着(或已确认)就一直算它已拿走;
        看到它亮回来 / 超过 6 秒没确认就放掉 */
@@ -307,10 +422,16 @@ parentPort.on("message", async m => {
     if (S.bulkMsg) log("fast", S.bulkMsg);
     if (S.flakyMsg) log("fast", S.flakyMsg);
     const curStr = `${S.current.side}${S.current.idx + 1}`, nTaken = S.skills.filter(s => s.taken).length + S.taken_heroes.length + (S.extraPicks || 0), prevTaken = lastTaken;
-    if (nTaken !== lastTaken && lastTaken >= 0) log("board", `第 ${nTaken} 手确认后的完整认定  ${tracker.snapshotLine()}`);
+    if (nTaken !== lastTaken && lastTaken >= 0) { log("board", `第 ${nTaken} 手 [1.x] ${tracker.snapshotLine()}`);
+      if (EST) { const st = EST.state(), seats = [];
+        for (const side of ["L", "R"]) for (let i = 0; i < 5; i++) { const q = side + i;
+          const h = Object.keys(st.heroOwner).find(x => st.heroOwner[x] === q);
+          const sk = Object.keys(st.owner).filter(x => st.owner[x] === q).map(x => R.cn(x) + ((st.margin[x] || 0) < 0.3 ? "?" : ""));
+          seats.push(`${side}${i + 1}:${h ? R.cn(h.slice(5)) : "-"}|${sk.join("/") || "-"}`); }
+        log("board", `第 ${nTaken} 手 [2.0] ${seats.join("  ")}   (带 ? 的是 2.0 自己说没把握的)`); } }
     if (nTaken >= 45 && !endSnapped) { endSnapped = true; snapshot(img, "draft_end"); }   // 快选完时存一张:这个分辨率下所有"被选走"格子的真实样子
     if (S.suspects && S.suspects.length && S.suspects.join() !== lastSusp) { lastSusp = S.suspects.join(); log("board", `不当落子的暗格: ${S.suspects.map(R.cn).join(", ")}`); }
-    if (curStr !== lastCur || nTaken !== lastTaken) { log("state", `当前选人 ${curStr} 我 ${S.me.side}${S.me.idx + 1} 轮到我=${S.my_turn} 已选走 ${nTaken} (技能${nTaken - S.taken_heroes.length}+英雄${S.taken_heroes.length}, 本帧黑格${S.rawDark}${S.occluded ? ` 看不清${S.occluded}` : ""}${S.pending ? " 待确认" : ""}) 对齐nd=${S.align.nd} 识别${ms}ms 画面差${diff.toFixed(0)}`); lastCur = curStr; lastTaken = nTaken; }
+    if (curStr !== lastCur || nTaken !== lastTaken) { log("state", `当前选人 ${curStr} 我 ${S.me.side}${S.me.idx + 1} 轮到我=${S.my_turn} 已选走 ${nTaken} (技能${nTaken - S.taken_heroes.length}+英雄${S.taken_heroes.length}, 本帧黑格${S.rawDark}${S.occluded ? ` 看不清${S.occluded}` : ""}${S.pending ? " 待确认" : ""}) 对齐nd=${S.align.nd} 识别${ms}ms${EST ? ` (2.0 ${estMs}ms${CORE === "v2" ? " 在驱动" : " 并行对照"}${estDiff ? ", 有分歧" : ""})` : ""} 画面差${diff.toFixed(0)}`); lastCur = curStr; lastTaken = nTaken; }
     const curSeat = seatIdx(S.current);
     if (curSeat !== lastSeat) { pickedAtCur = false; lastSeat = curSeat; }
     else if (prevTaken >= 0 && nTaken > prevTaken) pickedAtCur = true;

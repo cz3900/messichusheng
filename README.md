@@ -31,6 +31,8 @@
 main.js        托盘 / 截屏 / 覆盖层窗口 / 全局热键 / 鼠标位置
   └─ worker.js   工作线程：帧状态机、快慢双通道、锁池与重锁、调用引擎
        ├─ recog.js   全部图像识别 + 归属层（Tracker）
+       ├─ trace.js   观测轨迹：把每帧**看到了什么**记下来 / 离线回放
+       ├─ v2.js      2.0 状态估计（变点检测 + 带容量指派），托盘菜单可切换，默认不启用
        ├─ census.js  周期性全面盘点 + 指派求解（对照实现）
        └─ engine_worker.js → engine/  胜率推演（多线程）
 overlay.html   透明置顶画布，把推荐框画在游戏画面上
@@ -38,6 +40,16 @@ overlay.html   透明置顶画布，把推荐框画在游戏画面上
 
 数据流是单向的：`截屏 → 识别 → 归属 → 局面签名 → 引擎 → 覆盖层`。
 只有"有人落子"这一个事件会触发重算，这是推荐结果不抖动的前提。
+
+两个**互相独立**的运行开关（托盘菜单 / F11 / F12）：
+
+| 开关 | 选项 | 管什么 |
+|---|---|---|
+| 运行模式 | 正式 / 测试 | 只管截图和日志的详细程度，不改变任何判断 |
+| 状态估计内核 | 1.x / 2.0 | 只管"被拿走了没有 / 归谁"，其余（认图、当前选人、胜率推演）两者共用 |
+
+测试模式下两个内核并行跑，谁驱动输出由内核开关决定，另一个只在旁边算并记录分歧。
+截图的 PNG 编码放在主进程——测试模式不占识别的时间，开不开它完整识别的帧数相同。
 
 ---
 
@@ -126,10 +138,15 @@ npm run pack                   # 打 Windows 包到 dist/
 测试：
 
 ```bash
+node test/baseline.js          # 真机成绩单(22 张真实截图)，改识别层必跑
 node test/full_draft.js        # 整局 50 手模拟，改归属逻辑必跑
 SEED=3 node test/full_draft.js # 换一局
 node test/late_pair.js         # 9 种晚到/乱序配对场景
 node test/restart.js           # 验证一手只算一次
+
+TRACE_OUT=/tmp/t.jsonl node test/full_draft.js   # 记一条观测轨迹
+node test/trace_roundtrip.js /tmp/t.jsonl        # 记录↔回放 必须逐字相同
+node test/ab.js /tmp/t.jsonl                     # 1.x ↔ 2.0 同轨迹对比
 ```
 
 `test/full_draft.js` 支持一批环境变量来制造恶劣条件：`DELAYS`（面板图标晚到）、
@@ -146,7 +163,7 @@ node test/restart.js           # 验证一手只算一次
 - [docs/recognition.md](docs/recognition.md) —— 版式定位、逐格贴框、模板匹配、三态判定、空槽判定
 - [docs/attribution.md](docs/attribution.md) —— 归属层的全部步骤、门槛和它们各自治的是什么病
 - [docs/performance.md](docs/performance.md) —— 双通道、重算触发条件、引擎线程、延迟构成
-- [docs/testing.md](docs/testing.md) —— 模拟器、真机基准、以及为什么合成测试会骗人
+- [docs/testing.md](docs/testing.md) —— 模拟器、真机基准、观测轨迹与回放、以及为什么合成测试会骗人
 - [docs/design-2.0.md](docs/design-2.0.md) —— **2.0 设计**：为什么当前架构注定要一直打补丁，以及替代方案
 - [CHANGELOG.md](CHANGELOG.md) —— 每个版本修的是哪个真机问题
 
@@ -168,5 +185,8 @@ node test/restart.js           # 验证一手只算一次
 系统自己知道没把握。力气应该花在流程死角和归属层上。
 
 **归属层已经有 9 个步骤。** 每次真机出新问题就加一步，每步都有自己的门槛。
-正确的做法是收口成一张证据表（每个信号产出带置信度的观测，最后一次性解指派），
-`census.js` 是这个方向的原型，但目前只作对照实现，没有当家。
+正确的做法是收口成一张证据表（每个信号产出带置信度的观测，最后一次性解指派）。
+`v2.js` 就是这件事的完整实现（变点检测 + 带容量指派），在 14 局合成轨迹上技能归属
+555/560 对 1.x 的 550/560、英雄打平、"认定被拿走"后撤回 0 次，剩下的 5 个错全部被置信度标了出来；
+但它慢一到两帧，而且合成测试结构上测不到真机的主要错误来源，所以**还没有接管线上**。
+见 [docs/design-2.0.md](docs/design-2.0.md)。

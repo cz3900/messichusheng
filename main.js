@@ -7,7 +7,11 @@ const path = require("path"), fs = require("fs"); const { Worker } = require("wo
 const VERSION = require("./package.json").version;
 let overlay = null, tray = null, worker = null, timer = null, snapOnce = false;
 const HOTKEY = { "隐藏/显示": "F6", "切换显示模式": "F8", "暂停/继续": "F9", "重新识别": "F10", "团队/个人优先": "F7" };   // 实际注册成功的键(可能退让到 Alt+F8 等)
-const cfg = { all: false, paused: false, plevel: 0, hidden: false };   // plevel 0..3 = 界面上的 1~4 档;hidden = 一键隐藏(只藏显示, 识别/计算照常跑)
+/* 两个**互相独立**的开关:
+     test —— 运行模式。只管截图和日志的详细程度, 不改变任何判断逻辑。任何版本都能切。
+     core —— 状态估计内核, "1x"(稳定) 或 "v2"(试验)。只管谁来判断"被拿走了没有 / 归谁"。
+   两者不耦合:测试模式不会替你换内核, 换内核也不会替你改截图策略。 */
+const cfg = { all: false, paused: false, plevel: 0, hidden: false, test: false, core: "1x" };   // plevel 0..3 = 界面上的 1~4 档;hidden = 一键隐藏(只藏显示, 识别/计算照常跑)
 const PLN = ["1 团队", "2 略偏个人", "3 偏个人", "4 贪"]; let needFull = true, phase = "idle", lastStatus = "", boardSeen = false, capN = 0, capMs = 0, capMsFull = 0, capFull = 0;
 /* ---- 日志:%APPDATA%/ADAssistant/logs/ad_YYYYMMDD_HHMMSS.log,截图也放这里 ---- */
 const LOGDIR = path.join(app.getPath("userData"), "logs"); fs.mkdirSync(LOGDIR, { recursive: true });
@@ -17,7 +21,7 @@ function log(tag, msg) { const d = new Date(); const t = `${String(d.getHours())
   logBuf.push(`[${t}] ${tag.padEnd(7)} ${msg}\n`); if (!logTimer) logTimer = setTimeout(flushLog, 500); }
 function flushLog() { logTimer = null; if (!logBuf.length) return; const s = logBuf.join(""); logBuf = []; try { fs.appendFileSync(LOGFILE, s); } catch (e) { } }
 function pruneLogs() { try { const now = Date.now(); const fsz = fs.readdirSync(LOGDIR).map(f => ({ f, p: path.join(LOGDIR, f), st: fs.statSync(path.join(LOGDIR, f)) }));
-  for (const x of fsz) if (x.f.endsWith(".log") && now - x.st.mtimeMs > 7 * 86400e3) fs.unlinkSync(x.p);
+  for (const x of fsz) if ((x.f.endsWith(".log") || x.f.endsWith(".jsonl")) && now - x.st.mtimeMs > 7 * 86400e3) fs.unlinkSync(x.p);
   const pngs = fsz.filter(x => x.f.endsWith(".png")).sort((a, b) => b.st.mtimeMs - a.st.mtimeMs); for (const x of pngs.slice(12)) fs.unlinkSync(x.p); } catch (e) { } }
 /* ---- 托盘图标 ---- */
 function makeTrayIcon() { const { PNG } = require("pngjs"); const p = new PNG({ width: 16, height: 16 });
@@ -40,7 +44,7 @@ function createOverlay() {
 }
 const send = (ch, m) => { if (overlay && !overlay.isDestroyed()) overlay.webContents.send(ch, m); };
 /* scale = 识别坐标(≤2560 宽) → 覆盖窗 DIP 坐标 的比例 */
-function sendCfg() { const cs = capSize(); send("cfg", { scale: cs.w / cs.dipW, all: cfg.all, paused: cfg.paused, hidden: cfg.hidden, plevel: cfg.plevel, plname: PLN[cfg.plevel], version: VERSION, phase, hotkey: HOTKEY }); }
+function sendCfg() { const cs = capSize(); send("cfg", { scale: cs.w / cs.dipW, all: cfg.all, paused: cfg.paused, hidden: cfg.hidden, plevel: cfg.plevel, plname: PLN[cfg.plevel], version: VERSION, phase, hotkey: HOTKEY, test: cfg.test, core: cfg.core }); }
 function setVisible(v) { if (!overlay || overlay.isDestroyed()) return; if (!overlay.isVisible()) overlay.showInactive();
   if (v) overlay.setAlwaysOnTop(true, "screen-saver"); else send("clear", {}); }
 /* ---- 截屏 ----
@@ -91,11 +95,18 @@ async function grabLegacy(full) {
 }
 function startWorker() {
   worker = new Worker(path.join(__dirname, "worker.js"));
+  worker.postMessage({ type: "logdir", dir: LOGDIR });   // 观测轨迹和日志/截图放一起
   { const cs = capSize(); worker.postMessage({ type: "display", w: cs.w, h: cs.h }); }
   worker.on("message", m => {
     if (m.type === "log") return log(m.tag, m.msg);
     if (m.type === "want") { if (m.full) needFull = true; if (m.phase && m.phase !== phase) { phase = m.phase; log("cap", phase === "active" ? "选技中: 每 250ms 一张半分辨率扫描帧, 需要时补全分辨率" : "空闲: 每 1.5s 一张半分辨率"); setVisible(phase === "active"); sendCfg(); } return; }
-    if (m.type === "snapshot") { const f = path.join(LOGDIR, `snap_${stamp(new Date())}_${m.why}.png`); try { fs.writeFileSync(f, Buffer.from(m.png)); log("snap", `已存 ${f} (${m.why})`); } catch (e) { log("snap", "存失败 " + e); } return; }
+    /* 截图由工作线程送来**裸像素**(它只做一次拷贝就转移过来), PNG 编码放在这里做 ——
+       编码要几百毫秒, 放在工作线程会卡住识别, 放这里最多让截屏拍子晚一拍。 */
+    if (m.type === "snapshot") { const f = path.join(LOGDIR, `snap_${stamp(new Date())}_${m.why}.png`);
+      setImmediate(() => { try { const { PNG } = require("pngjs");
+        const p = new PNG({ width: m.w, height: m.h, deflateLevel: 1 }); p.data = Buffer.from(m.raw);
+        fs.writeFileSync(f, PNG.sync.write(p, { deflateLevel: 1 })); log("snap", `已存 ${path.basename(f)} (${m.why}, ${m.w}x${m.h})`);
+      } catch (e) { log("snap", "存失败 " + e); } }); return; }
     if (m.type === "state") { if (m.phase && m.phase !== phase) { phase = m.phase; setVisible(phase === "active"); sendCfg(); }
       if (!!m.board !== boardSeen) boardSeen = !!m.board;
       const st = m.idle ? `idle 亮${m.pres && m.pres.bright} 暗${m.pres && m.pres.dark}` : `active 当前${m.current.side}${m.current.idx + 1} 我${m.me.side}${m.me.idx + 1}`; if (st !== lastStatus) { lastStatus = st; tray && tray.setToolTip(`AD 选技助手 v${VERSION}${cfg.hidden ? " · 已隐藏" : ""} · ${st}`); } }
@@ -119,7 +130,7 @@ async function loop() {
     /* 鼠标位置(换算到识别用的全分辨率坐标):鼠标悬停的那一格游戏会弹介绍框/变样子, 识别端把它当"看不清" */
     let cursor = null; try { const cp = screen.getCursorScreenPoint(), d = screen.getPrimaryDisplay(), cs = capSize();
       cursor = [(cp.x - d.bounds.x) * cs.w / d.bounds.width, (cp.y - d.bounds.y) * cs.h / d.bounds.height]; } catch (e) { }
-    if (f && worker) { const snap = snapOnce; snapOnce = false; worker.postMessage({ type: "frame", ...f, full, all: cfg.all, plevel: cfg.plevel, snap, cursor }, [f.buf]); } }
+    if (f && worker) { const snap = snapOnce; snapOnce = false; worker.postMessage({ type: "frame", ...f, full, all: cfg.all, plevel: cfg.plevel, snap, cursor, test: cfg.test, core: cfg.core }, [f.buf]); } }
   catch (e) { needFull = needFull || full; log("error", "截屏 " + e); send("error", { msg: String(e) }); }
   finally { inflight = false; }
 }
@@ -140,10 +151,18 @@ function buildMenu() { return Menu.buildFromTemplate([
   { label: (cfg.paused ? "▶ 继续" : "⏸ 暂停") + kk("暂停/继续"), click: () => { cfg.paused = !cfg.paused; sync(); } },
   { label: "重新识别池子(一般不需要)" + kk("重新识别"), click: () => { log("key", "菜单: 重新识别"); worker && worker.postMessage({ type: "reset" }); } },
   { type: "separator" },
+  { label: "运行模式(只影响截图和日志, 不改判断)", enabled: false },
+  { label: "正式模式  (截图只在关键时刻)", type: "radio", checked: !cfg.test, click: () => { cfg.test = false; sync(); } },
+  { label: "🔬 测试模式  (关心的点位全部自动截图 + 细日志)", type: "radio", checked: cfg.test, click: () => { cfg.test = true; sync(); } },
+  { type: "separator" },
+  { label: "状态估计内核(判断被拿走了没有 / 归谁)", enabled: false },
+  { label: "1.x  稳定(一直在用的)", type: "radio", checked: cfg.core !== "v2", click: () => { cfg.core = "1x"; sync(); } },
+  { label: "2.0  试验(证据累加, 从不硬提交)", type: "radio", checked: cfg.core === "v2", click: () => { cfg.core = "v2"; sync(); } },
+  { type: "separator" },
   { label: "保存当前截图(排障用)", click: () => { snapOnce = true; log("key", "菜单: 保存截图"); } },
   { label: "打开日志文件夹", click: () => shell.openPath(LOGDIR) },
   { type: "separator" }, { label: "退出", click: () => app.quit() }]); }
-function sync() { tray.setContextMenu(buildMenu()); sendCfg(); log("cfg", `all=${cfg.all} paused=${cfg.paused} hidden=${cfg.hidden} 个人权重=${PLN[cfg.plevel]}`); }
+function sync() { tray.setContextMenu(buildMenu()); sendCfg(); log("cfg", `all=${cfg.all} paused=${cfg.paused} hidden=${cfg.hidden} 个人权重=${PLN[cfg.plevel]} 模式=${cfg.test ? "测试" : "正式"} 内核=${cfg.core}`); }
 /* 一键隐藏:覆盖层什么都不画(切换那一下闪 2 秒提示, 确认按键生效), 截屏/识别/引擎照常跑 —— 再按一次立刻显示最新结果,
    可以反复开关确认插件一直在正常工作 */
 function toggleHidden() { cfg.hidden = !cfg.hidden; sync(); tray.setToolTip(`AD 选技助手 v${VERSION}${cfg.hidden ? " · 已隐藏" : ""} · ${lastStatus}`); }
@@ -163,6 +182,8 @@ app.whenReady().then(() => {
   reg(["F9", "Alt+F9", "CommandOrControl+Alt+F9"], () => { cfg.paused = !cfg.paused; sync(); }, "暂停/继续");
   reg(["F7", "Alt+F7", "CommandOrControl+Alt+F7"], () => { cfg.plevel = (cfg.plevel + 1) % 4; sync(); }, "团队/个人优先");
   reg(["F10", "Alt+F10", "CommandOrControl+Alt+F10"], () => { log("key", "重新识别"); worker && worker.postMessage({ type: "reset" }); }, "重新识别");
+  reg(["F11", "Alt+F11", "CommandOrControl+Alt+F11"], () => { cfg.test = !cfg.test; sync(); }, "正式/测试模式");
+  reg(["F12", "Alt+F12", "CommandOrControl+Alt+F12"], () => { cfg.core = cfg.core === "v2" ? "1x" : "v2"; sync(); }, "切换内核");
   tray.setContextMenu(buildMenu());
   setInterval(flushLog, 2000);
 });

@@ -12,7 +12,9 @@ function fit(){cv.width=innerWidth;cv.height=innerHeight;}fit();addEventListener
    4-10 = 青色 中框(外黑 6px + 3px)  + 小徽章
    11+  = 不画框,只在格子底部写胜率(暗一点)
    每格底部一条:选它之后**我方**胜率 + 相对现在的增减 */
-const GOLD=['#ffcc33','#e6e9ef','#e08a4a'], MID='#5fd0ff';
+/* 前三名:金 / 银 / 铜。第一名原来是 #ffcc33(偏琥珀), 在游戏本身偏暖的背景上不够跳 —— 换成更亮的金,
+   并且单独给它更大的外发光。银(近白中性)和金(强黄, 蓝通道很低)在亮度接近时也不会混。 */
+const GOLD=['#ffe24a','#e6e9ef','#e08a4a'], MID='#5fd0ff', GLOW=[30,18,18], LW=[9,6,6];
 function bar(x,y,w,h,txt,col,fs,alpha){ctx.globalAlpha=alpha;ctx.fillStyle='#000';ctx.fillRect(x,y+h-fs-8,w,fs+8);
  ctx.globalAlpha=1;ctx.fillStyle=col;ctx.font=`bold ${fs}px "Segoe UI",system-ui`;ctx.textAlign='center';ctx.textBaseline='middle';
  ctx.fillText(txt,x+w/2,y+h-4-fs/2);}
@@ -23,9 +25,10 @@ function draw(){ctx.clearRect(0,0,cv.width,cv.height);if(cfg.hidden||!adv||!adv.
  adv.rows.forEach((r,i)=>{if(!r.box)return;const [x,y,w,h]=r.box.map(v=>v/scale);
   const txt=(100*r.p).toFixed(1)+(r.d>=0?' +':' ')+(100*r.d).toFixed(1);
   if(i<3){const col=GOLD[i];
-   ctx.save();ctx.shadowColor=col;ctx.shadowBlur=18;
-   ctx.lineWidth=10;ctx.strokeStyle='#000';ctx.strokeRect(x-5,y-5,w+10,h+10);
-   if(adv.pre==='preview')ctx.setLineDash([10,6]);ctx.lineWidth=6;ctx.strokeStyle=col;ctx.strokeRect(x-3,y-3,w+6,h+6);ctx.setLineDash([]);ctx.restore();
+   ctx.save();ctx.shadowColor=col;ctx.shadowBlur=GLOW[i];
+   const lw=LW[i], off=lw/2;   // 第一名框更粗:颜色和形状一起变才够跳, 银铜维持原样 → 名次层级反而更清楚
+   ctx.lineWidth=lw+4;ctx.strokeStyle='#000';ctx.strokeRect(x-off-2,y-off-2,w+2*off+4,h+2*off+4);
+   if(adv.pre==='preview')ctx.setLineDash([10,6]);ctx.lineWidth=lw;ctx.strokeStyle=col;ctx.strokeRect(x-off,y-off,w+2*off,h+2*off);ctx.setLineDash([]);ctx.restore();
    bar(x,y,w,h,txt,col,15,0.85);badge(x+2,y+2,14,i+1,col);
   }else if(i<10){
    ctx.lineWidth=6;ctx.strokeStyle='#000';ctx.strokeRect(x-3,y-3,w+6,h+6);
@@ -53,6 +56,11 @@ function st(){const hk=(cfg.hotkey||{}),k=n=>hk[n]?hk[n]:'托盘菜单';
  const s=[];s.push(`AD 助手 v${cfg.version||''} · `+(cfg.paused?`⏸ 已暂停(${k('暂停/继续')} 继续)`:(cfg.all?`团队模式:我方五人(${k('切换显示模式')} 切换)`:`单人模式:只看我(${k('切换显示模式')} 切换)`)+` · 个人权重 ${cfg.plname||'1 团队'}(${k('团队/个人优先')} 切换)`));
  if(lastState&&lastState.idle)s.push(lastState.waiting?'看到棋盘, 正在识别池子…':'看到棋盘, 等待完整画面…');
  else if(lastState)s.push(`识别 ${lastState.ms}ms${lastState.skipped?'(画面未变)':''} · 池子${lastState.poolOk?'OK':`未认全(${k('重新识别')})`} · 已选走 ${lastState.taken} · 当前 ${lastState.current.side}${lastState.current.idx+1}${lastState.pre?'(已选)':''} 我 ${lastState.me.side}${lastState.me.idx+1}${lastState.nextIsMe?' · 下一个是我':''}`);
+ /* 非默认状态必须在屏幕上看得见 —— 测试模式会狂存截图、2.0 内核是试验品, 忘了自己开着是很容易的事 */
+ if(cfg.test||cfg.core==='v2'){const t=[];
+  if(cfg.test)t.push(`🔬 测试模式:关心的点位自动截图 + 两版并行对照(${k('正式/测试模式')} 切回正式)`);
+  if(cfg.core==='v2')t.push(`⚗ 状态估计内核 = 2.0 试验版(${k('切换内核')} 切回 1.x)`);
+  s.push(t.join(' · '));}
  if(err)s.push('⚠ '+err);status.textContent=s.join('\n');}
 function flash(t){toast.textContent=t;toast.style.display='block';clearTimeout(toastT);toastT=setTimeout(()=>{toast.style.display='none';},2000);}
 ad.on('cfg',m=>{scale=m.scale||1;const was=cfg.hidden;cfg=m;const k=(m.hotkey||{})['隐藏/显示']||'托盘菜单';

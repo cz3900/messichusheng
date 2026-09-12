@@ -18,7 +18,10 @@ const WEAK = +(process.env.WEAK || 0.2), DARK = +(process.env.DARK || 0.1);
 const basics = H.flatMap(h => K(h).basics), ults = H.map(h => K(h).ult), need = Array.from({ length: 10 }, () => ({ hero: 1, ult: 1, basic: 3 }));
 const taken = new Set(), takenHeroes = new Set(), panels = {}, truthSkill = {}, truthHero = {}, fx = {}, pendingPanel = [], names = {}, shownHeroes = new Set();
 const HEROMISS = +(process.env.HEROMISS || 0), NAMES_ON = process.env.NAMES !== "0";   // HEROMISS=棋盘英雄卡变暗漏看的比例;NAMES=0 关掉面板名字
-const t = new R.Tracker(); t.fullOrder = ORDER; t.reset(S.render({ heroes: H, cur: ["L", 0], me: ["R", 2] }));
+const t = new R.Tracker(); t.fullOrder = ORDER;
+{ const img0 = S.render({ heroes: H, cur: ["L", 0], me: ["R", 2] }); t.reset(img0);
+  if (process.env.TRACE_OUT) { try { fs.unlinkSync(process.env.TRACE_OUT); } catch (e) { }
+    global.__REC = new (require("../trace.js").Recorder)(process.env.TRACE_OUT); global.__REC.head(t, [img0.w, img0.h], ORDER); } }
 const LG = new C.Ledger(); const CENSUS_EVERY = +(process.env.CENSUS_EVERY || 3); let incFlips = 0, incPrev = {};
 let frames = 0;
 /* 到点的面板图标全部放出(不按入队顺序:晚 5 帧的那件不能挡住后面晚 0~1 帧的) */
@@ -37,7 +40,7 @@ const frame = cur => { const img = S.render({ heroes: H, cur: seatQ(cur), me: ["
   /* BLIND:模拟插件"瞎"几秒(切出去/卡帧/被完全挡住) —— 这几帧完全不喂给增量识别, 但普查照样能在之后看出来 */
   if (blindLeft > 0) { blindLeft--; if (frames % CENSUS_EVERY === 0 && LG.taken.size) LG.addCensus(img, t.pool.skills.map(x => x.key), [...LG.taken], null); return; }
   if (BLIND && rnd() < BLIND) { blindLeft = 3 + Math.floor(rnd() * 3); return; }
-  t.update(img);
+  if (global.__REC) { global.__REC.capture(img, t); t.update(img); global.__REC.flush(); } else t.update(img);
   { const o = t.owner; for (const k in o) { const q = o[k][0] + o[k][1]; if (incPrev[k] && incPrev[k] !== q) incFlips++; incPrev[k] = q; } }   // 增量版:结论改变次数
   if (frames % CENSUS_EVERY === 0) { const st = t.state(t.prev); LG.addCensus(img, t.pool.skills.map(x => x.key), st.skills.filter(x => x.taken).map(x => x.key), null); } if (process.env.TRACE) for (const [a, k, q, how] of t.log.splice(0)) console.log(`   f${frames} [插件] ${a} ${R.cn(k)}→${q} ${how}`); };
 for (let i = 0; i < 2; i++) frame(0);
@@ -63,6 +66,13 @@ if (process.env.PEAKS) { const img = S.render({ heroes: H, cur: seatQ(0), me: ["
 let sk = 0, hs = 0; const bad = [];
 for (const k in truthSkill) { const o = t.owner[k]; if (o && q2(o) === truthSkill[k]) sk++; else bad.push(`${R.cn(k)} 真${truthSkill[k]} 记${o ? q2(o) : (t.suspect && t.suspect[k] ? "不当落子" : "无")}`); }
 for (const h in truthHero) { const o = t.heroOf[h]; if (o && q2(o) === truthHero[h]) hs++; else bad.push(`英雄${R.cn(h)} 真${truthHero[h]} 记${o ? q2(o) : "无"}`); }
+if (global.__REC) { global.__REC.save();
+  fs.writeFileSync(process.env.TRACE_OUT + ".expect.json", JSON.stringify({
+    owner: t.owner, heroOf: t.heroOf, unknownBy: (t.unknownBy || []).map(u => [u[0], u[1], u.t]),
+    suspect: Object.keys(t.suspect || {}).sort(), orphan: Object.keys(t.orphan || {}).sort(),
+    turn: t.turn, nameHero: t.nameHero || {}, stable: Object.keys(t.stable || {}).filter(k => t.stable[k]).sort(),
+    log: t.log.map(l => l.join("|")), truthSkill, truthHero }, null, 1));
+  console.log(`轨迹已写 ${process.env.TRACE_OUT} (${global.__REC.n} 帧, ${(global.__REC.bytes / 1024).toFixed(0)}KB)`); }
 console.log(`SEED=${process.env.SEED || 1} 帧${frames} | 增量版: 技能 ${sk}/40 英雄 ${hs}/10 改判${incFlips}次 | 没认出 ${(t.unknownBy || []).length}${process.env.QUIET ? "" : " | 错: " + (bad.join("; ") || "无")}`);
 { let ok2 = 0; const bad2 = [];
   for (const k in truthSkill) { const q = LG.owner[k]; const want = truthSkill[k][0] + (+truthSkill[k].slice(1)); if (q === want) ok2++; else bad2.push(`${R.cn(k)} 真${truthSkill[k]} 记${q || "无"}`); }
