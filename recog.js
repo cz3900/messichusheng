@@ -304,10 +304,17 @@ function readPool(img) {
        · 占位的"未知"格:全库最像的 ≥ FILL_MIN 就认它;
        · 已按英雄配上的格:全库最像的明显更好(高出 FILL_GAP 且本身 ≥ FILL_ABS)才改判 ——
          分数接近时仍信"同一行属同一英雄"的约束, 它能纠正相似图标的误认。 */
-  const FILL_MIN = 0.55, FILL_GAP = 0.2, FILL_ABS = 0.6, usedKeys = new Set(skills.filter(r => !r.unknown).map(r => r.key));
-  const gbest = j => { const a = S[j]; let bi = 0, bv = -9; for (let i = 0; i < a.length; i++) if (a[i] > bv) { bv = a[i]; bi = i; } return [LIB.keys[bi], bv]; };
-  for (const r of skills) { const [gk, gv] = gbest(r.cell); if (usedKeys.has(gk) && gk !== r.key) continue;
-    if (r.unknown ? gv >= FILL_MIN : (gk !== r.key && gv >= FILL_ABS && gv - r.s1 >= FILL_GAP)) {
+  /* FILL_LEAD:要**覆盖行约束**的改判, 全库第一还必须明显领先它自己的第二名。
+     没有这一条时的真机事故(09-12, 两台机器同一局):同一格 x 机贴框贴到 72×62 认出 超负荷 0.84,
+     y 机贴到 84×78(把边框裁了进来)→ 全库第一翻成 真空 0.73, 改判覆盖了行约束 —— 两人池子不同,
+     推荐随之全不一样。而那个 0.73 在全库里只领先第二名 0.088, 根本就是"没认出来"。
+     真机 14 次改判实测分得很开:合法补位(原本是未知格)领先 0.408~0.590, 覆盖 OMG 变体的 0.207/0.293,
+     而五次错误改判全在 0.012~0.088。门槛取 0.15。
+     只卡"覆盖"这一支 —— 原本就是未知格的补位没有竞争对手, 不受这条约束。 */
+  const FILL_MIN = 0.55, FILL_GAP = 0.2, FILL_ABS = 0.6, FILL_LEAD = 0.15, usedKeys = new Set(skills.filter(r => !r.unknown).map(r => r.key));
+  const gbest = j => { const a = S[j]; let bi = 0, bv = -9, sv = -9; for (let i = 0; i < a.length; i++) { if (a[i] > bv) { sv = bv; bv = a[i]; bi = i; } else if (a[i] > sv) sv = a[i]; } return [LIB.keys[bi], bv, sv]; };
+  for (const r of skills) { const [gk, gv, gv2] = gbest(r.cell); if (usedKeys.has(gk) && gk !== r.key) continue;
+    if (r.unknown ? gv >= FILL_MIN : (gk !== r.key && gv >= FILL_ABS && gv - r.s1 >= FILL_GAP && gv - gv2 >= FILL_LEAD)) {
       if (!r.unknown) usedKeys.delete(r.key);
       r.was = r.unknown ? '未知' : r.key; r.key = gk; r.s1 = gv; r.unknown = false; r.filler = true; usedKeys.add(gk); } }
   const heroBoxes = cells.map((c, j) => c.role === 'hero' ? { cell: j, box: boxes[j] } : null).filter(Boolean);

@@ -1514,7 +1514,7 @@
     "heroes": 12,
     "margin": 0.19,
     "dark": 1,
-    "ratio": 1.34,
+    "ratio": 1.38,
     "ok": true
    },
    "heroes": [
@@ -1606,9 +1606,9 @@
     },
     {
      "c": 13,
-     "k": "leshrac_diabolic_edict",
-     "s": 0.67,
-     "f": "补位"
+     "k": "oracle_fortunes_end",
+     "s": 0.59,
+     "f": ""
     },
     {
      "c": 14,
@@ -1823,7 +1823,7 @@
    ],
    "unknown": 0,
    "rescued": 0,
-   "filler": 3,
+   "filler": 2,
    "panels": [
     {
      "seat": "L1",
@@ -3052,7 +3052,7 @@
     "heroes": 12,
     "margin": 0.26,
     "dark": 3,
-    "ratio": 1.33,
+    "ratio": 1.34,
     "ok": true
    },
    "heroes": [
@@ -3144,9 +3144,9 @@
     },
     {
      "c": 13,
-     "k": "leshrac_diabolic_edict",
-     "s": 0.73,
-     "f": "补位"
+     "k": "witch_doctor_paralyzing_cask",
+     "s": 0.72,
+     "f": ""
     },
     {
      "c": 14,
@@ -3361,7 +3361,7 @@
    ],
    "unknown": 0,
    "rescued": 0,
-   "filler": 2,
+   "filler": 1,
    "panels": [
     {
      "seat": "L1",
@@ -4044,7 +4044,7 @@
     "heroes": 12,
     "margin": 0.24,
     "dark": 7,
-    "ratio": 1.33,
+    "ratio": 1.34,
     "ok": true
    },
    "heroes": [
@@ -4166,9 +4166,9 @@
     },
     {
      "c": 18,
-     "k": "keeper_of_the_light_blinding_light",
-     "s": 0.67,
-     "f": "补位"
+     "k": "pugna_nether_ward",
+     "s": 0.68,
+     "f": ""
     },
     {
      "c": 21,
@@ -4353,7 +4353,7 @@
    ],
    "unknown": 0,
    "rescued": 0,
-   "filler": 1,
+   "filler": 0,
    "panels": [
     {
      "seat": "L1",
@@ -9544,9 +9544,9 @@
     },
     {
      "c": 5,
-     "k": "?unk:5",
-     "s": 0,
-     "f": "大+未知"
+     "k": "riki_smoke_screen",
+     "s": 0.66,
+     "f": "大+补位"
     },
     {
      "c": 6,
@@ -9592,9 +9592,9 @@
     },
     {
      "c": 17,
-     "k": "riki_smoke_screen",
-     "s": 0.66,
-     "f": "补位"
+     "k": "invoker_chaos_meteor_ad",
+     "s": 0.43,
+     "f": ""
     },
     {
      "c": 18,
@@ -9675,7 +9675,7 @@
      "f": ""
     }
    ],
-   "unknown": 10,
+   "unknown": 9,
    "rescued": 0,
    "filler": 1,
    "panels": [
@@ -9774,8 +9774,8 @@
      "filled": 4,
      "slots": [
       {
-       "k": "riki_smoke_screen",
-       "s": 0.42,
+       "k": "invoker_chaos_meteor_ad",
+       "s": 0.47,
        "g": "night_stalker_crippling_fear",
        "gs": 0.74
       },
@@ -9804,8 +9804,8 @@
      "filled": 4,
      "slots": [
       {
-       "k": "invoker_ice_wall_ad",
-       "s": 0.37,
+       "k": "invoker_chaos_meteor_ad",
+       "s": 0.38,
        "g": "lion_impale",
        "gs": 0.5
       },
@@ -10050,8 +10050,8 @@
      "j": 0,
      "g": "night_stalker_crippling_fear",
      "gs": 0.74,
-     "p": "riki_smoke_screen",
-     "ps": 0.42
+     "p": "invoker_chaos_meteor_ad",
+     "ps": 0.47
     },
     {
      "seat": "L4",
@@ -12143,7 +12143,7 @@
   "frames": 22,
   "lockOk": 17,
   "unknown": 2,
-  "filler": 16,
+  "filler": 13,
   "rescued": 2,
   "outOfPool": 3,
   "slots": 29,

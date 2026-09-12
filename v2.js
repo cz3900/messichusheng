@@ -73,7 +73,11 @@ function assign(W, caps, n, nSeat) {
     while (q.length) { const u = q.shift(); inq[u] = 0;
       for (let e = head[u]; e >= 0; e = nx[e]) { if (cap[e] <= 0) continue; const v = to[e];
         if (dist[u] + cost[e] < dist[v] - 1e-12) { dist[v] = dist[u] + cost[e]; pre[v] = e; if (!inq[v]) { inq[v] = 1; q.push(v); } } } }
-    if (!isFinite(dist[T]) || dist[T] >= -1e-12) break;          // 再增广只会变差 → 停(允许不满流)
+    /* 只有"再增广会变差"才停。**不能**把"收益恰好为 0"也当成停 ——
+       一件完全没有面板证据的东西整行都是 0, 那一步的收益就是 0, 于是它永远留在原地不被分配。
+       09-12 真机 x844 那局就是这么丢的:右1 连英雄都没分到, 6 件技能全是"无归属"。
+       每个座位的容量本来就是硬上限(1 英雄 + 4 技能), 满了自然停, 不需要靠收益为正来兜底。 */
+    if (!isFinite(dist[T]) || dist[T] > 1e-9) break;
     let f = Infinity; for (let v = T; v !== S; v = to[pre[v] ^ 1]) f = Math.min(f, cap[pre[v]]);
     for (let v = T; v !== S; v = to[pre[v] ^ 1]) { cap[pre[v]] -= f; cap[pre[v] ^ 1] += f; }
     flow += f; tot += f * dist[T];
