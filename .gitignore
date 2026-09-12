@@ -1,0 +1,32 @@
+# ---- 依赖与构建产物 ----
+node_modules/
+dist/
+*.zip
+
+# ---- 体积大且可重新生成的模板库 ----
+# lib.bin 是全精度模板库(24MB), 运行时并不加载, 打包时也被排除;
+# 线上用的是量化后的 lib_i8.bin。需要时由 tools/ 下的脚本重新生成。
+data/lib.bin
+
+# ---- 真机截图与日志 ----
+# 里面有其他玩家的昵称和账号 ID, 不进仓库。
+# 缺这些文件时, 依赖它们的测试会跳过, 其余测试照常跑。
+test/fixtures/*.png
+realframes/
+*.log
+logs/
+
+# ---- 运行时状态 ----
+var/
+*.key
+config.json
+track_state.json
+
+# ---- 临时文件 ----
+.DS_Store
+Thumbs.db
+*.bak
+*.v0[0-9]
+.cache/
+__pycache__/
+*.pyc

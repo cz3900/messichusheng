@@ -1,0 +1,62 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+html,body{margin:0;background:transparent;overflow:hidden;width:100%;height:100%}
+canvas{position:absolute;left:0;top:0}
+#toast{position:absolute;left:50%;top:140px;transform:translateX(-50%);font:bold 18px/1.4 "Microsoft YaHei",system-ui,sans-serif;color:#ffcc33;background:rgba(0,0,0,.85);border:2px solid #ffcc33;padding:6px 16px;pointer-events:none;white-space:pre;display:none}
+#status{position:absolute;left:12px;top:8px;font:13px/1.4 "Microsoft YaHei",system-ui,sans-serif;color:#ffd76a;text-shadow:0 0 4px #000,0 0 2px #000;pointer-events:none;white-space:pre}
+</style></head><body><canvas id="c"></canvas><div id="status"></div><div id="toast"></div><script>
+const cv=document.getElementById('c'),ctx=cv.getContext('2d'),status=document.getElementById('status'),toast=document.getElementById('toast');let toastT=null;
+let scale=1,cfg={all:false,paused:false},lastState=null,adv=null,err='',busy=false;
+function fit(){cv.width=innerWidth;cv.height=innerHeight;}fit();addEventListener('resize',fit);
+/* 画法(游戏画面本身很鲜艳,所以每条亮边外面都套一圈黑边,靠明暗对比而不是颜色取胜):
+   前三 = 金/银/铜 粗框(外黑 10px + 亮色 6px + 外发光) + 左上角大号名次徽章
+   4-10 = 青色 中框(外黑 6px + 3px)  + 小徽章
+   11+  = 不画框,只在格子底部写胜率(暗一点)
+   每格底部一条:选它之后**我方**胜率 + 相对现在的增减 */
+const GOLD=['#ffcc33','#e6e9ef','#e08a4a'], MID='#5fd0ff';
+function bar(x,y,w,h,txt,col,fs,alpha){ctx.globalAlpha=alpha;ctx.fillStyle='#000';ctx.fillRect(x,y+h-fs-8,w,fs+8);
+ ctx.globalAlpha=1;ctx.fillStyle=col;ctx.font=`bold ${fs}px "Segoe UI",system-ui`;ctx.textAlign='center';ctx.textBaseline='middle';
+ ctx.fillText(txt,x+w/2,y+h-4-fs/2);}
+function badge(x,y,r,n,col){ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.fillStyle='#000';ctx.fill();
+ ctx.lineWidth=2;ctx.strokeStyle=col;ctx.stroke();ctx.fillStyle=col;ctx.font=`bold ${Math.round(r*1.35)}px "Segoe UI",system-ui`;
+ ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(String(n),x,y+1);}
+function draw(){ctx.clearRect(0,0,cv.width,cv.height);if(cfg.hidden||!adv||!adv.rows)return;
+ adv.rows.forEach((r,i)=>{if(!r.box)return;const [x,y,w,h]=r.box.map(v=>v/scale);
+  const txt=(100*r.p).toFixed(1)+(r.d>=0?' +':' ')+(100*r.d).toFixed(1);
+  if(i<3){const col=GOLD[i];
+   ctx.save();ctx.shadowColor=col;ctx.shadowBlur=18;
+   ctx.lineWidth=10;ctx.strokeStyle='#000';ctx.strokeRect(x-5,y-5,w+10,h+10);
+   if(adv.pre==='preview')ctx.setLineDash([10,6]);ctx.lineWidth=6;ctx.strokeStyle=col;ctx.strokeRect(x-3,y-3,w+6,h+6);ctx.setLineDash([]);ctx.restore();
+   bar(x,y,w,h,txt,col,15,0.85);badge(x+2,y+2,14,i+1,col);
+  }else if(i<10){
+   ctx.lineWidth=6;ctx.strokeStyle='#000';ctx.strokeRect(x-3,y-3,w+6,h+6);
+   ctx.lineWidth=3;ctx.strokeStyle=MID;ctx.strokeRect(x-1,y-1,w+2,h+2);
+   bar(x,y,w,h,txt,MID,13,0.8);badge(x+1,y+1,10,i+1,MID);
+  }else{bar(x,y,w,h,txt,'#c9d1d9',11,0.6);}
+  if(adv.personal&&i<10&&r.pm!=null){const t2=`个${r.pm>=0?'+':''}${r.pm.toFixed(1)}`;ctx.font='bold 11px "Segoe UI",system-ui';
+   const tw2=ctx.measureText(t2).width+8,bx=x+w-tw2+2,by=y-2;ctx.fillStyle='rgba(0,0,0,.85)';ctx.fillRect(bx,by,tw2,15);
+   ctx.fillStyle=r.pm>0.05?'#7ee0a8':(r.pm<-0.05?'#f0908b':'#c9d1d9');ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(t2,bx+tw2/2,by+8);}});
+ /* 顶部一行 */
+ const nm=`${adv.side==='L'?'左':'右'}${(adv.seat%5)+1}${adv.my_turn?'(我)':'(队友)'}`;
+ const who=adv.pre==='preview'?`${nm} 下一手 · 预估(前面还有 ${adv.ahead} 手, 每有人选都会更新)`:`${nm}${adv.pre?' 马上轮到':' 正在选 · 已锁定'}`;
+ const top=adv.rows.slice(0,3).map((r,i)=>['①','②','③'][i]+r.name+' '+(100*r.p).toFixed(1)).join('  ');
+ const mode=adv.personal?`【${adv.plname}】`:'';
+ const t=`${mode}${who}   我方 ${(100*adv.base).toFixed(1)}%   推荐: ${top}`+(busy?'   (有新选择, 更新中…)':'');
+ ctx.font='bold 20px "Microsoft YaHei",system-ui';ctx.textAlign='center';ctx.textBaseline='middle';
+ const tw=ctx.measureText(t).width,bx=cv.width/2-tw/2-16,by=84/scale;
+ ctx.fillStyle='rgba(0,0,0,.82)';ctx.fillRect(bx,by,tw+32,36);
+ ctx.lineWidth=2;ctx.strokeStyle='#ffcc33';ctx.strokeRect(bx,by,tw+32,36);
+ ctx.fillStyle='#ffcc33';ctx.fillText(t,cv.width/2,by+18);}
+function st(){const hk=(cfg.hotkey||{}),k=n=>hk[n]?hk[n]:'托盘菜单';
+ /* 只在选技时显示:锁上池子(active)才画;没锁上时只有"真看到了棋盘"(检出格≥40, near)才提示正在识别 ——
+    游戏里的画面常被粗检当成像棋盘, 以前会一直挂着"看到棋盘, 正在识别池子…"。隐藏时什么都不画 */
+ if(cfg.hidden||!lastState||(lastState.idle&&!(lastState.board&&lastState.near))){status.textContent='';return;}
+ const s=[];s.push(`AD 助手 v${cfg.version||''} · `+(cfg.paused?`⏸ 已暂停(${k('暂停/继续')} 继续)`:(cfg.all?`团队模式:我方五人(${k('切换显示模式')} 切换)`:`单人模式:只看我(${k('切换显示模式')} 切换)`)+` · 个人权重 ${cfg.plname||'1 团队'}(${k('团队/个人优先')} 切换)`));
+ if(lastState&&lastState.idle)s.push(lastState.waiting?'看到棋盘, 正在识别池子…':'看到棋盘, 等待完整画面…');
+ else if(lastState)s.push(`识别 ${lastState.ms}ms${lastState.skipped?'(画面未变)':''} · 池子${lastState.poolOk?'OK':`未认全(${k('重新识别')})`} · 已选走 ${lastState.taken} · 当前 ${lastState.current.side}${lastState.current.idx+1}${lastState.pre?'(已选)':''} 我 ${lastState.me.side}${lastState.me.idx+1}${lastState.nextIsMe?' · 下一个是我':''}`);
+ if(err)s.push('⚠ '+err);status.textContent=s.join('\n');}
+function flash(t){toast.textContent=t;toast.style.display='block';clearTimeout(toastT);toastT=setTimeout(()=>{toast.style.display='none';},2000);}
+ad.on('cfg',m=>{scale=m.scale||1;const was=cfg.hidden;cfg=m;const k=(m.hotkey||{})['隐藏/显示']||'托盘菜单';
+ if(was!==undefined&&was!==m.hidden)flash(m.hidden?`AD 助手已隐藏 · 识别照常运行(${k} 恢复显示)`:`AD 助手恢复显示(${k} 隐藏)`);
+ st();draw();});ad.on('state',m=>{lastState=m;err='';st();});
+ad.on('advice',m=>{adv=m;busy=false;draw();});ad.on('computing',m=>{busy=true;draw();});ad.on('clear',()=>{adv=null;draw();});ad.on('error',m=>{err=(m.msg||'').slice(0,160);st();});
+</script></body></html>

@@ -1,0 +1,26 @@
+<!doctype html><meta charset="utf-8"><title>cap</title><script>
+/* 常驻屏幕视频流(和 OBS/Discord 同一条路:getDisplayMedia)。
+   主进程要一帧时才 drawImage 到指定大小的画布上读回像素 —— 缩放在 GPU 上做,读回的只有需要的那点像素。
+   对比旧办法:每次 desktopCapturer.getSources() 都要重新枚举屏幕+整屏拷贝,实测一次 235ms。 */
+let video = null, cv = null, ctx = null, ready = false;
+const say = (ch, m) => cap.send(ch, m);
+async function start() {
+  const stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 10, max: 15 } }, audio: false });
+  video = document.createElement("video"); video.srcObject = stream; video.muted = true; video.playsInline = true;
+  await video.play();
+  if (!video.videoWidth) await new Promise(r => { video.onloadedmetadata = r; setTimeout(r, 3000); });
+  cv = document.createElement("canvas"); ctx = cv.getContext("2d", { willReadFrequently: true, alpha: false });
+  ready = true; say("cap-ready", { w: video.videoWidth, h: video.videoHeight });
+  stream.getVideoTracks()[0].addEventListener("ended", () => { ready = false; say("cap-fail", { msg: "视频流被结束(可能是分辨率切换或权限变化)" }); });
+}
+cap.on("cap-grab", m => {
+  try {
+    if (!ready) return say("cap-fail", { id: m.id, msg: "流未就绪" });
+    if (cv.width !== m.w || cv.height !== m.h) { cv.width = m.w; cv.height = m.h; }
+    ctx.drawImage(video, 0, 0, m.w, m.h);
+    const d = ctx.getImageData(0, 0, m.w, m.h);
+    say("cap-frame", { id: m.id, w: m.w, h: m.h, buf: d.data.buffer });
+  } catch (e) { say("cap-fail", { id: m.id, msg: String(e) }); }
+});
+start().catch(e => say("cap-fail", { msg: "getDisplayMedia 失败: " + e }));
+</script>

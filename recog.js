@@ -1,0 +1,752 @@
+"use strict";
+/* AD 选技读屏识别(纯 JS,Node 与浏览器通用)。移植自 plugin/state.py + tracker.py,算法逐条对应。
+   图像统一为 {w,h,data:RGBA Uint8}。库数据(lib.bin/names.bin/meta.json/layout)由 init() 传入。 */
+const T = 64;
+let LIB = null;   // {keys, q:Int8Array(n*12288), scale:Float32Array(n), D}  —— int8 量化(见 tools/quantize_lib.py),25MB → 6.3MB
+let NAMES = null; // {tpl:{heroKey:[{size,w,h,off}]}, bin:Uint8Array}
+let META = null;  // {heroes:[{key,basics,ult}], cn:{hero,ab}}
+let LAYOUT = null, LAYOUT0 = null, SC = 1;   // SC = 屏幕/设计(2560×1440)的比例;LAYOUT0 保留设计坐标(英雄名模板是按设计尺寸渲染的)
+let BRIGHT = {};   // {key: 库图标(6% 内边距裁剪)的平均亮度},参考帧格子已变黑时的回退基准
+let HBRIGHT = {};  // {heroKey: 英雄卡(横版原画中间正方形)平均亮度},同上用于英雄卡
+let OWNER = {}, HERO_SKILLS = {}, HAS_ULT = {}, KIDX = {};
+function init(o) {
+  LIB = o.lib; LIB.D = LIB.q.length / LIB.keys.length; NAMES = o.names; META = o.meta; LAYOUT = o.layout; LAYOUT0 = JSON.parse(JSON.stringify(o.layout)); SC = 1; BRIGHT = o.bright || {}; HBRIGHT = o.heroBright || {};
+  LIB.keys.forEach((k, i) => KIDX[k] = i);
+  for (const h of META.heroes) { HERO_SKILLS[h.key] = h.basics.concat(h.ult ? [h.ult] : []); HAS_ULT[h.key] = !!h.ult;
+    for (const a of h.basics) OWNER[a] = h.key; if (h.ult) OWNER[h.ult] = h.key; }
+}
+const cn = k => (k && k[0] === '?' ? '未知技能' : (META.cn.hero[k] || META.cn.ab[k] || k));
+const sc = px => Math.round(px * 1.28 * SC);
+/* 版式模板按 2560×1440 标定。别的分辨率按宽度等比缩放(16:9 才准);
+   英雄名是位图模板不能缩放 —— 改成把标题区按设计尺寸重采样再匹配, 见 readHeroName。 */
+function rescale(W, H) {
+  /* 一律按**高度**定比例(游戏 UI 竖直方向等比), 水平方向:棋盘居中对齐, 左/右面板各自贴边。
+     16:9 时这与"按宽度等比缩放"完全等价;带鱼屏(如 2560×1080)则是正确的模型 —— 但没有带鱼屏截图验证过,
+     真要用请截一张开局图重新标定。 */
+  const [W0, H0] = LAYOUT0.res, r = H / H0, ok = Math.abs(W / H - W0 / H0) < 0.02;
+  SC = r; LAYOUT = JSON.parse(JSON.stringify(LAYOUT0)); LAYOUT.res = [W, H];
+  const mapx = x => W / 2 + (x - W0 / 2) * r;
+  for (const c of LAYOUT.board) { c.cx = mapx(c.cx); c.cy *= r; c.w *= r; }
+  for (const side of ["L", "R"]) { const P = LAYOUT.panels[side];
+    P.x0 = side === "L" ? Math.round(P.x0 * r) : Math.round(W - (W0 - P.x0) * r);
+    P.y_top = Math.round(P.y_top * r); P.pitch = Math.round(P.pitch * r);
+    P.slots = P.slots.map(([x, y, w]) => [Math.round(x * r), Math.round(y * r), Math.round(w * r)]);
+    P.hero = P.hero.map(v => Math.round(v * r)); }
+  TILE_PARAMS = null; PW = Math.round(419 * r); EB = Math.max(2, Math.round(6 * r)); SLOT_ADJ = { L: [0, 0, 0], R: [0, 0, 0] };
+  return { scale: r, sixteenNine: ok };
+}
+let PW = 419, EB = 6;   // 面板宽 / 边框条宽(按分辨率缩放)
+/* 技能槽的框和真实图标差一两像素、且普遍偏小(实测左侧 -2,0 右侧 -1,+1, 两侧都要放大 4):
+   不校准平均匹配只有 0.62, 校准后 0.92 —— 之前那些"认不准"(0.2~0.5)基本都是这个造成的。
+   面板是平的 UI, 同一侧所有槽偏移一样, 标定一次用一整局。 */
+let SLOT_ADJ = { L: [0, 0, 0], R: [0, 0, 0] };
+function slotBox(P, px0, py0, sx, sy, sw, side) { const a = SLOT_ADJ[side]; return [px0 + sx + a[0], py0 + sy + a[1], sw + a[2], sw + a[2]]; }
+/* 用面板里已经认出的图标把偏移标定出来:在 ±3 像素 / 三种大小里找总分最高的一组 */
+function calibratePanels(img, cands) {
+  for (const side of ['L', 'R']) { const P = LAYOUT.panels[side], cells = [];
+    for (let i = 0; i < 5; i++) { const px0 = P.x0, py0 = P.y_top + P.pitch * i;
+      for (const [sx, sy, sw] of P.slots) { const b = [px0 + sx, py0 + sy, sw, sw];
+        if (!slotFilled(img, b)) continue;
+        const r = matchSkill(img, b, cands); cells.push({ px0, py0, sx, sy, sw, key: r.key, s: r.s1 }); } }
+    /* 只拿认得最准的几个槽来标定, 而且只比它自己那一件 —— 全部槽 × 全部候选要 7 秒, 这样 0.3 秒 */
+    const use = cells.filter(c => c.key && c.s > 0.35).sort((x, y) => y.s - x.s).slice(0, 5);
+    if (use.length < 2) continue;
+    let best = -9, bo = SLOT_ADJ[side];
+    /* 粗搜一遍再在最优点附近细搜:范围比原来宽(尺寸原来只能往大调 0~6, 实测真值常在 8 上,
+       而棋盘那边量出来"图标比框小"也是常事, 所以两头都得留), 次数反而比原来少 */
+    const tryAdj = (dx, dy, ds) => { let sum = 0; for (const c of use) sum += matchSkill(img, [c.px0 + c.sx + dx, c.py0 + c.sy + dy, c.sw + ds, c.sw + ds], [c.key]).s1;
+      if (sum > best) { best = sum; bo = [dx, dy, ds]; } };
+    for (let dx = -4; dx <= 4; dx += 2) for (let dy = -4; dy <= 4; dy += 2) for (const ds of [-4, 0, 4, 8, 12]) tryAdj(dx, dy, ds);
+    const c0 = bo.slice();
+    for (let dx = c0[0] - 1; dx <= c0[0] + 1; dx++) for (let dy = c0[1] - 1; dy <= c0[1] + 1; dy++) for (const ds of [c0[2] - 2, c0[2], c0[2] + 2]) tryAdj(dx, dy, ds);
+    SLOT_ADJ[side] = bo; }
+  return SLOT_ADJ;
+}
+/* ---- 像素工具 ---- */
+function cropResize(img, x, y, w, h, tw, th) {   // 面积平均缩放 → Float32 RGB
+  const out = new Float32Array(tw * th * 3), d = img.data, W = img.w;
+  for (let j = 0; j < th; j++) { const y0 = y + Math.floor(j * h / th), y1 = Math.max(y0 + 1, y + Math.floor((j + 1) * h / th));
+    for (let i = 0; i < tw; i++) { const x0 = x + Math.floor(i * w / tw), x1 = Math.max(x0 + 1, x + Math.floor((i + 1) * w / tw));
+      let r = 0, g = 0, b = 0, n = 0;
+      for (let yy = y0; yy < y1; yy++) for (let xx = x0; xx < x1; xx++) { const p = (yy * W + xx) * 4; r += d[p]; g += d[p + 1]; b += d[p + 2]; n++; }
+      const o = (j * tw + i) * 3; out[o] = r / n; out[o + 1] = g / n; out[o + 2] = b / n; } }
+  return out;
+}
+function normVec(v) {   // 每通道去均值 + 整体单位化(与 python norm 一致)
+  const n = v.length / 3; let mr = 0, mg = 0, mb = 0;
+  for (let i = 0; i < n; i++) { mr += v[i * 3]; mg += v[i * 3 + 1]; mb += v[i * 3 + 2]; } mr /= n; mg /= n; mb /= n;
+  let ss = 0; for (let i = 0; i < n; i++) { v[i * 3] -= mr; v[i * 3 + 1] -= mg; v[i * 3 + 2] -= mb; ss += v[i * 3] ** 2 + v[i * 3 + 1] ** 2 + v[i * 3 + 2] ** 2; }
+  const inv = 1 / (Math.sqrt(ss) + 1e-6); for (let i = 0; i < v.length; i++) v[i] *= inv; return v;
+}
+const cellVec = (img, b) => { const m = Math.floor(Math.min(b[2], b[3]) * 0.06); return normVec(cropResize(img, b[0] + m, b[1] + m, b[2] - 2 * m, b[3] - 2 * m, T, T)); };
+function scoreAll(vec) { const n = LIB.keys.length, out = new Float32Array(n), Q = LIB.q, SC2 = LIB.scale, D = LIB.D;
+  for (let k = 0; k < n; k++) { let s = 0; const o = k * D; for (let i = 0; i < D; i++) s += Q[o + i] * vec[i]; out[k] = s * SC2[k]; } return out; }
+const dot1 = (vec, i) => { const Q = LIB.q, D = LIB.D, o = i * D; let s = 0; for (let t = 0; t < D; t++) s += Q[o + t] * vec[t]; return s * LIB.scale[i]; };
+function regionStats(img, x, y, w, h) {   // 均值(灰)/饱和度均值/拉普拉斯方差
+  const d = img.data, W = img.w; let sum = 0, sat = 0, n = 0; const g = new Float64Array(w * h);
+  for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) { const p = ((y + j) * W + x + i) * 4, r = d[p], gg = d[p + 1], b = d[p + 2];
+    const mx = Math.max(r, gg, b), mn = Math.min(r, gg, b); sat += mx ? 255 * (mx - mn) / mx : 0; const gr = 0.299 * r + 0.587 * gg + 0.114 * b; g[j * w + i] = gr; sum += (r + gg + b) / 3; n++; }
+  let ls = 0, ls2 = 0, ln = 0;
+  for (let j = 1; j < h - 1; j++) for (let i = 1; i < w - 1; i++) { const v = g[(j - 1) * w + i] + g[(j + 1) * w + i] + g[j * w + i - 1] + g[j * w + i + 1] - 4 * g[j * w + i]; ls += v; ls2 += v * v; ln++; }
+  const lm = ls / ln; return { mean: sum / n, sat: sat / n, lap: ls2 / ln - lm * lm };
+}
+function meanBGR(img, x, y, w, h) { const d = img.data, W = img.w; let r = 0, g = 0, b = 0, n = 0;
+  for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) { const p = ((y + j) * W + x + i) * 4; r += d[p]; g += d[p + 1]; b += d[p + 2]; n++; } return [r / n, g / n, b / n]; }
+/* ---- 格子粗检(HSV 阈值 + 闭/开运算 + 连通域) ---- */
+function morph(mask, w, h, r, isMax) { const tmp = new Uint8Array(w * h), out = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { let v = isMax ? 0 : 255; for (let k = -r; k <= r; k++) { const xx = x + k; if (xx < 0 || xx >= w) continue; const m = mask[y * w + xx]; v = isMax ? (m > v ? m : v) : (m < v ? m : v); } tmp[y * w + x] = v; }
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { let v = isMax ? 0 : 255; for (let k = -r; k <= r; k++) { const yy = y + k; if (yy < 0 || yy >= h) continue; const m = tmp[yy * w + x]; v = isMax ? (m > v ? m : v) : (m < v ? m : v); } out[y * w + x] = v; }
+  return out; }
+let TILE_PARAMS = null;   // 上一次成功的 (ts,tv,ko),后续帧先试它
+let LAST_SEARCH = 0;   // 上次做 27 组参数网格搜索的时间;没有棋盘时每帧都搜是 v0.1 风扇狂转的主因之一
+function findTiles(img, region, lo = 55, hi = 130, allowSearch = true) {
+  /* 在 1/2 分辨率上做阈值+形态学+连通域(像素量 1/4,半径减半),框再放大回原图坐标 */
+  const [X0, Y0, X1, Y1] = region, w = (X1 - X0) >> 1, h = (Y1 - Y0) >> 1, d = img.data, W = img.w;
+  const S = new Uint8Array(w * h), V = new Uint8Array(w * h);
+  for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) { let r = 0, g = 0, b = 0;
+    for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++) { const p = ((Y0 + 2 * j + dy) * W + X0 + 2 * i + dx) * 4; r += d[p]; g += d[p + 1]; b += d[p + 2]; }
+    r >>= 2; g >>= 2; b >>= 2; const mx = Math.max(r, g, b), mn = Math.min(r, g, b); V[j * w + i] = mx; S[j * w + i] = mx ? Math.round(255 * (mx - mn) / mx) : 0; }
+  const run = (ts, tv, ko) => {
+    let m = new Uint8Array(w * h); for (let i = 0; i < w * h; i++) m[i] = (S[i] > ts || V[i] > tv) ? 255 : 0;
+    const r1 = 2, r2 = Math.max(1, Math.round((ko - 1) / 4));
+    m = morph(morph(m, w, h, r1, true), w, h, r1, false); m = morph(morph(m, w, h, r2, false), w, h, r2, true);
+    const out = [], seen = new Uint8Array(w * h), st = new Int32Array(w * h);
+    for (let s0 = 0; s0 < w * h; s0++) { if (!m[s0] || seen[s0]) continue; let sp = 0; st[sp++] = s0; seen[s0] = 1; let bx0 = w, by0 = h, bx1 = 0, by1 = 0, a = 0;
+      while (sp) { const q = st[--sp], qx = q % w, qy = (q / w) | 0; a++; if (qx < bx0) bx0 = qx; if (qx > bx1) bx1 = qx; if (qy < by0) by0 = qy; if (qy > by1) by1 = qy;
+        if (qx + 1 < w) { const ni = q + 1; if (m[ni] && !seen[ni]) { seen[ni] = 1; st[sp++] = ni; } }
+        if (qx > 0) { const ni = q - 1; if (m[ni] && !seen[ni]) { seen[ni] = 1; st[sp++] = ni; } }
+        if (qy + 1 < h) { const ni = q + w; if (m[ni] && !seen[ni]) { seen[ni] = 1; st[sp++] = ni; } }
+        if (qy > 0) { const ni = q - w; if (m[ni] && !seen[ni]) { seen[ni] = 1; st[sp++] = ni; } } }
+      const bw = (bx1 - bx0 + 1) * 2, bh = (by1 - by0 + 1) * 2;
+      if (bw >= lo && bw <= hi && bh >= lo && bh <= hi && a * 4 > 0.55 * bw * bh && bw / bh >= 0.8 && bw / bh <= 1.25) out.push([bx0 * 2 + X0, by0 * 2 + Y0, bw, bh]); }
+    return out; };
+  let cachedOut = null;
+  if (TILE_PARAMS) { cachedOut = run(...TILE_PARAMS); if (cachedOut.length >= 52 && cachedOut.length <= 62) return cachedOut; }
+  if (cachedOut && (!allowSearch || Date.now() - LAST_SEARCH < 3000)) return cachedOut;   // 不许搜/刚搜过:就用缓存参数的结果
+  LAST_SEARCH = Date.now();
+  let best = null, bp = null;
+  for (const ts of [50, 70, 90]) for (const tv of [100, 130, 160]) for (const ko of [15, 21, 27]) { const out = run(ts, tv, ko);
+    if (!best || Math.abs(out.length - 60) < Math.abs(best.length - 60)) { best = out; bp = [ts, tv, ko]; } }
+  TILE_PARAMS = bp; return best;
+}
+function alignBoard(img, allowSearch = true) {
+  const det = findTiles(img, [Math.round(img.w * 0.28), sc(140), Math.round(img.w * 0.72), sc(900)], Math.round(55 * SC), Math.round(130 * SC), allowSearch), cells = LAYOUT.board, boxes = {}, dx = [], dy = [];
+  for (const [x, y, w, h] of det) { const cx = x + w / 2, cy = y + h / 2; let j = -1, bd = 1e9;
+    cells.forEach((c, i) => { const dd = Math.abs(c.cx - cx) + Math.abs(c.cy - cy); if (dd < bd) { bd = dd; j = i; } });
+    /* 检出的框明显过大 = 格子和旁边的亮装饰连成了一块:实测 1080p 开局帧 74×90 / 72×88(格子 62×62, 最长边 1.4 倍以上),
+       拿它当格子框 → 图标匹配 0.12(挪回正位 0.89)—— 时间结界/燃烧枷锁就是这样认不出的。这种只当没检出, 用版式位置 + 整体偏移补。
+       注意:正常格子本来就不是正方形(3D 棋盘透视, 实测高只有版式宽的 0.81~0.91), 所以只拦过大的(最长边 >1.3 倍), 别按正方形卡 */
+    const cw = cells[j] && cells[j].w, okSize = cw && Math.max(w, h) <= 1.3 * cw;
+    if (j >= 0 && okSize && Math.abs(cells[j].cx - cx) < 30 * SC && Math.abs(cells[j].cy - cy) < 30 * SC) { boxes[j] = [x, y, w, h]; dx.push(cx - cells[j].cx); dy.push(cy - cells[j].cy); } }
+  const med = a => { if (!a.length) return 0; const s = a.slice().sort((p, q) => p - q); return s[(s.length / 2) | 0]; }; const ox = med(dx), oy = med(dy);
+  cells.forEach((c, j) => { if (!boxes[j]) { const w = c.w; boxes[j] = [Math.round(c.cx + ox - w / 2), Math.round(c.cy + oy - w / 2), Math.round(w), Math.round(w)]; } });
+  return { boxes, ox, oy, nd: det.length };
+}
+/* ---- 廉价检测(每帧都跑,不做对齐/匹配) ---- */
+const cellBright = (img, b) => { const m = Math.floor(b[2] * 0.2); const [r, g, bb] = meanBGR(img, b[0] + m, b[1] + m, b[2] - 2 * m, b[3] - 2 * m); return (r + g + bb) / 3; };
+/* 把格子内圈切成九宫格,返回 {mean, max=最亮的那一格}。
+   关键区别:**被选走的格子是整块均匀变暗**,九格全暗;而鼠标/提示框只挡住一部分,剩下的格子还是亮的 →
+   只看平均值会被挡一半的格子骗过去,看"最亮的那一格"就骗不过去。 */
+function cellStats(img, b) {
+  const m = Math.floor(b[2] * 0.2), x = b[0] + m, y = b[1] + m, w = b[2] - 2 * m, h = b[3] - 2 * m;
+  if (w < 3 || h < 3) { const v = cellBright(img, b); return { mean: v, max: v, sat: 0 }; }
+  const d = img.data, W = img.w; let sum = 0, n = 0, mx = 0, sat = 0, ns = 0;
+  for (let by = 0; by < 3; by++) for (let bx = 0; bx < 3; bx++) {
+    const x0 = x + Math.floor(bx * w / 3), x1 = x + Math.floor((bx + 1) * w / 3), y0 = y + Math.floor(by * h / 3), y1 = y + Math.floor((by + 1) * h / 3);
+    let s = 0, c = 0;
+    for (let yy = y0; yy < y1; yy++) for (let xx = x0; xx < x1; xx++) { const p = (yy * W + xx) * 4, r = d[p], g = d[p + 1], bl = d[p + 2]; s += (r + g + bl) / 3; c++;
+      const hi = r > g ? (r > bl ? r : bl) : (g > bl ? g : bl), lo = r < g ? (r < bl ? r : bl) : (g < bl ? g : bl); if (hi >= 20) { sat += (hi - lo) / hi; ns++; } }
+    if (!c) continue; const v = s / c; if (v > mx) mx = v; sum += s; n += c; }
+  return { mean: n ? sum / n : 0, max: mx, sat: ns ? sat / ns : 0 };
+}
+/* 面板槽里到底有没有图标 —— 以前只看"九宫格里最亮的一格 <24 就算空"。
+   问题:空槽底板本身带渐变和高光, 画面一亮(转场/技能特效/翻牌动画)就会亮到 30~45,
+   整排空槽被当成图标、再硬配成池子里的技能(实测 720 个真空槽里误判 102 个, 分数能到 0.56),
+   这就是日志里"右边 4 个面板凭空各多 4 个图标、一口气记了 16 手"的根。
+   空底板是**平的**, 图标有细节, 所以改成看纹理(拉普拉斯标准差):
+     · 门槛取 10 —— 图库 513 个图标换算到游戏里(实测游戏里的纹理是图库的 1.35~1.58 倍, 取 1.35 保守)最低就是 10, 一个不漏;
+     · 真空槽误收从 102 降到 11, 剩下的集中在一帧转场画面, 另有"手数不能多于棋盘暗格数+1"兜底。
+   很亮的槽(均值 60+, 空槽实测最高才 45)不用看纹理 —— 免得大片纯色的图标(如风暴之拳)被当成空的。 */
+function slotFilled(img, b) {
+  const m = Math.floor(b[2] * 0.2), x = b[0] + m, y = b[1] + m, w = b[2] - 2 * m, h = b[3] - 2 * m;
+  if (w < 5 || h < 5) return cellBright(img, b) >= 30;
+  const d = img.data, W = img.w, g = new Float64Array(w * h); let sum = 0;
+  for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) { const p = ((y + j) * W + x + i) * 4, r = d[p], gg = d[p + 1], bl = d[p + 2];
+    g[j * w + i] = 0.299 * r + 0.587 * gg + 0.114 * bl; sum += (r + gg + bl) / 3; }
+  if (sum / (w * h) >= 60) return true;
+  let ls = 0, ls2 = 0, ln = 0;
+  for (let j = 1; j < h - 1; j++) for (let i = 1; i < w - 1; i++) {
+    const v = g[(j - 1) * w + i] + g[(j + 1) * w + i] + g[j * w + i - 1] + g[j * w + i + 1] - 4 * g[j * w + i]; ls += v; ls2 += v * v; ln++; }
+  return ln ? Math.sqrt(Math.max(0, ls2 / ln - (ls / ln) ** 2)) >= 10 : false;
+}
+/* 判格子状态 —— **跟它自己开局时的样子比**, 三选一(用户的思路:被选走后的样子是固定的):
+     'N' 没变:亮度还在参考的 0.6 倍以上
+     'T' 被选走:技能 = 同一张图去色压暗(实测 风暴之拳 亮度 0.14×、饱和度 0.27→0.12);英雄卡 = 直接变黑(斯温卡 0.08×)。
+         要求整格均匀(九宫格最亮一格也暗), 技能格还要求"颜色被抽掉"(饱和度掉到参考的 0.65 以下;参考本来就灰的图标不看这条)
+     'O' 看不清:两头都不像 —— 半透明技能介绍框(实测只暗到 0.62~0.9 倍、颜色还在)、鼠标挡一角、转场动画……
+         **维持原判, 不改任何状态**。以前遮挡只能靠"同一帧多黑好几格"去猜, 现在遮挡本身就被认成"看不清"。 */
+function cellState(img, box, ref, refSat, isHero) {
+  const st = cellStats(img, box), r = st.mean / Math.max(ref, 8), mr = st.max / Math.max(ref, 8);
+  if (st.mean < 10 && st.max < 20) return 'T';                                          // 纯黑:只会是被选走(英雄卡)
+  /* 带反光的"被选走":棋盘是 3D 的, 左下角那几格(实测 09-11 1080p 截图 格 44/52 英雄卡、37/45/53 技能)选走后是一块**有高光的光面黑**,
+     平均亮度 35~67 —— 影魔原画本来就暗(~46), 选走后反而更"亮", 按亮度永远判成"没变", 整局一直推荐已被选走的影魔。
+     能认出它的只有**颜色没了**:饱和度 0.03~0.12(影魔原画 0.54、英雄原画实测最灰的也有 0.18);纹理不行(高光边缘本身就是纹理, 实测 6.1→5.7 没降)。
+     半透明介绍框底下颜色还在(实测只暗到 0.62~0.9×、颜色保留), 白字会把最亮一格顶上去 —— 所以要"颜色掉到参考的 35% 以下 + 不亮 + 没有亮块"。 */
+  if (refSat >= (isHero ? 0.15 : 0.25) && st.sat < 0.15 && st.sat < (isHero ? 0.5 : 0.35) * refSat && st.mean < 120 && st.max < 150 && r < 1.8) return 'T';
+  /* 英雄卡"近乎全黑":1080p 下选走的卡不像 1440p 那样纯黑(斯温卡 4/8), 实测 亮 10~24 / 最亮一格 14~35 / 饱和 0.09~0.21。
+     原画暗的英雄(参考亮度 ~50)按比例 r<0.22 过不了。英雄原画实测最暗的也有 31/51 且颜色很浓(潮汐猎人 饱和 0.91) */
+  if (isHero && st.mean < 26 && st.max < 40 && st.sat < 0.25) return 'T';
+  if (r >= 0.6) return 'N';
+  if (isHero) return (r < 0.22 && mr < 0.4) ? 'T' : 'O';
+  const desat = refSat < 0.2 || st.sat < 0.65 * refSat;
+  /* 很暗且均匀(平均 <0.2×、最亮一格 <0.3×)直接算选走:这么暗时饱和度只剩噪声 —— 锚击/恐怖波动本身是淡色图标(饱和 0.24~0.26),
+     选走后 1080p 实测 0.14×/0.18× 但饱和还读 0.19~0.20, 过不了"颜色掉到 0.65×"那条, 一直"看不清"。锚击因此开局没记上, 引出莉娜/复仇之魂对调。
+     介绍框底下只暗到 0.62~0.9×, 鼠标只挡一角(最亮一格还亮), 都进不了这条 */
+  return ((r < 0.32 && mr < 0.5 && desat) || (r < 0.2 && mr < 0.3)) ? 'T' : 'O';
+}
+/* 快通道(1/8 小图)只看亮度+均匀度:小图上颜色会被平均掉, 饱和度不可靠;完整识别那一路会用上饱和度复核 */
+const isDarkCell = (img, box, ref) => { const st = cellStats(img, box); const r = st.mean / Math.max(ref, 8), mr = st.max / Math.max(ref, 8);
+  return (st.mean < 10 && st.max < 20) || (r < 0.32 && mr < 0.5); };
+/* 棋盘在不在:按版式格子中心 40% 区域取亮度(容忍 ±20px 位移),格子间隙应是暗背景。img 可以是缩小图(按宽度比例缩放坐标)。
+   返回 {bright:亮格数(>30), dark:暗格数, gapDark:间隙暗的比例, k:缩放}。有棋盘判据:bright>=8 且 gapDark>=0.75;新一局靠暗格数骤降/棋盘签名变化判,不靠绝对亮格数(有的图标本身就暗)。 */
+function quickPresence(img) {
+  const k = img.w / LAYOUT.res[0]; let bright = 0, dark = 0, gapOk = 0, gapN = 0;
+  for (const c of LAYOUT.board) { const w = c.w * k, x = Math.round((c.cx - c.w * 0.2) * k), y = Math.round((c.cy - c.w * 0.2) * k), s = Math.max(2, Math.round(w * 0.4));
+    if (x < 0 || y < 0 || x + s >= img.w || y + s >= img.h) continue;
+    const [r, g, b] = meanBGR(img, x, y, s, s); const v = (r + g + b) / 3; if (v > 30) bright++; else dark++;
+    if (c.col > 0) { const gx = Math.round((c.cx - c.w / 2 - 12 * SC) * k), gy = Math.round((c.cy - c.w * 0.2) * k), gw = Math.max(1, Math.round(EB * k));   // 左边间隙
+      if (gx >= 0 && gy + s < img.h) { const [r2, g2, b2] = meanBGR(img, gx, gy, gw, s); gapN++; if ((r2 + g2 + b2) / 3 < 70) gapOk++; } } }
+  return { bright, dark, gapDark: gapN ? gapOk / gapN : 0, k };
+}
+/* 帧签名:60 格亮度 + 10 面板边框亮度 + 40 面板槽亮度。两帧签名接近 → 画面对我们关心的部分没变,跳过重识别 */
+function quickSig(img, boxes) {
+  const out = new Float32Array(60 + 10 + 40); let n = 0;
+  LAYOUT.board.forEach((c, j) => { const b = boxes && boxes[j] ? boxes[j] : [Math.round(c.cx - c.w / 2), Math.round(c.cy - c.w / 2), Math.round(c.w), Math.round(c.w)]; out[n++] = cellBright(img, b); });
+  for (const side of ['L', 'R']) { const P = LAYOUT.panels[side];
+    for (let i = 0; i < 5; i++) { const px0 = P.x0, py0 = P.y_top + P.pitch * i, pw = PW, ph = P.pitch;
+      const t = meanBGR(img, px0, py0, pw, EB), l = meanBGR(img, px0, py0, EB, ph); out[n++] = (t[0] + t[1] + t[2] + l[0] + l[1] + l[2]) / 6;
+      for (const [sx, sy, sw] of P.slots) { const m = meanBGR(img, px0 + sx, py0 + sy, sw, sw); out[n++] = (m[0] + m[1] + m[2]) / 3; } } }
+  return out;
+}
+const boardSig = (img, boxes) => quickSig(img, boxes).slice(0, 60);
+/* 快通道:只量 60 格亮度判"谁被选走了"。img 可以是半分辨率(按宽度比例缩放 boxes),refB 是开局参考亮度(亮度与缩放无关)。
+   返回 {dark:Set(已黑的 key/hero:英雄), n} —— 不做对齐、不做图标匹配,一帧几毫秒。 */
+function fastDark(img, pool, boxes, refB) {
+  const k = img.w / LAYOUT.res[0], dark = new Set();
+  const at = (b, ref) => { const x = Math.round(b[0] * k), y = Math.round(b[1] * k), w = Math.round(b[2] * k), h = Math.round(b[3] * k);
+    if (x < 0 || y < 0 || x + w >= img.w || y + h >= img.h || w < 6 || h < 6) return false; return isDarkCell(img, [x, y, w, h], ref); };
+  for (const r of pool.skills) if (at(boxes[r.cell], refB[r.cell])) dark.add(r.key);
+  for (const hb of pool.heroBoxes) if (at(boxes[hb.cell], refB[hb.cell])) dark.add('hero:' + hb.hero);
+  return dark;
+}
+function sigDiff(a, b) { if (!a || !b || a.length !== b.length) return 999; let m = 0; for (let i = 0; i < a.length; i++) { const d = Math.abs(a[i] - b[i]); if (d > m) m = d; } return m; }
+/* ---- 池子:按行认英雄 ---- */
+function permutations(m, n) { const out = []; const rec = (cur, used) => { if (cur.length === n) { out.push(cur.slice()); return; } for (let i = 0; i < m; i++) if (!used[i]) { used[i] = 1; cur.push(i); rec(cur, used); cur.pop(); used[i] = 0; } }; rec([], new Array(m).fill(0)); return out; }
+const PERM = {};
+/* 已知技能不足 3 个的英雄(比如新版本加了技能而我们数据里没有的水晶室女),那一行第 3 格记为"未知技能",
+   给一个中性分 UNK —— 介于"认对"(~0.7)和"认错"(~0.1~0.3)之间。
+   以前是硬凑满 3 个(把大招塞进普通技能格, 相关系数 -0.26), 结果和另一个认错的英雄同分, 两台机器各认各的。 */
+const UNK = 0.35, ULT_MIN = 0.25;
+function readPool(img) {
+  const { boxes, ox, oy, nd } = alignBoard(img), cells = LAYOUT.board, S = {};
+  cells.forEach((c, j) => { S[j] = scoreAll(cellVec(img, boxes[j])); });
+  const groups = {};
+  cells.forEach((c, j) => { if (c.role === 'skill') { const g = c.row + (c.col < 4 ? 'L' : 'R'); (groups[g] = groups[g] || []).push(j); } });
+  const rowres = [];
+  for (const g in groups) { const js = groups[g], cand = [];
+    for (const h in HERO_SKILLS) {
+      /* 行里只能是普通技能 —— 以前把大招也放进候选排列里, 等于允许"大招出现在普通技能格" */
+      const sk = HERO_SKILLS[h].filter(k => k in KIDX && k !== (HAS_ULT[h] ? HERO_SKILLS[h][HERO_SKILLS[h].length - 1] : null));
+      if (sk.length < 2) continue;
+      let bt = -9, bks = null;
+      if (sk.length >= 3) { const perms = PERM[sk.length] = PERM[sk.length] || permutations(sk.length, 3);
+        for (const p of perms) { let t = 0; for (let i = 0; i < 3; i++) t += S[js[i]][KIDX[sk[p[i]]]]; if (t > bt) { bt = t; bks = p.map(i => sk[i]); } } }
+      else {   // 只认得 2 个:枚举哪一格是未知 × 两个技能的摆法
+        for (let u = 0; u < 3; u++) { const o = [0, 1, 2].filter(i => i !== u);
+          for (const [a, b] of [[0, 1], [1, 0]]) { const t = S[js[o[0]]][KIDX[sk[a]]] + S[js[o[1]]][KIDX[sk[b]]] + UNK;
+            if (t > bt) { bt = t; bks = []; bks[o[0]] = sk[a]; bks[o[1]] = sk[b]; bks[u] = null; } } } }
+      cand.push([bt, h, bks]); }
+    cand.sort((a, b) => b[0] - a[0]); rowres.push({ js, best: cand[0], second: cand[1] }); }
+  rowres.sort((a, b) => b.best[0] - a.best[0]);
+  const poolHeroes = [], skills = [], used = new Set();
+  for (const r of rowres) { const [t, h, ks] = r.best; if (used.has(h)) continue; used.add(h); poolHeroes.push(h);
+    r.js.forEach((j, i) => skills.push(ks[i] ? { cell: j, box: boxes[j], key: ks[i], hero: h, s1: S[j][KIDX[ks[i]]], rowScore: t / 3, rowMargin: (t - r.second[0]) / 3 }
+                                             : { cell: j, box: boxes[j], key: '?unk:' + j, hero: h, unknown: true, s1: UNK, rowScore: t / 3, rowMargin: (t - r.second[0]) / 3 })); }
+  const ultIds = cells.map((c, j) => c.role === 'ult' ? j : -1).filter(j => j >= 0), takenKeys = new Set(skills.map(r => r.key)), pairs = [];
+  for (const j of ultIds) for (const h of poolHeroes) { const opts = HAS_ULT[h] ? [HERO_SKILLS[h][HERO_SKILLS[h].length - 1]] : HERO_SKILLS[h].filter(k => !takenKeys.has(k));
+    for (const k of opts) if (k in KIDX) pairs.push([S[j][KIDX[k]], j, h, k]); }
+  pairs.sort((a, b) => b[0] - a[0]); const dj = new Set(), dh = new Set();
+  for (const [sc1, j, h, k] of pairs) { if (dj.has(j) || dh.has(h) || sc1 < ULT_MIN) continue; dj.add(j); dh.add(h); skills.push({ cell: j, box: boxes[j], key: k, hero: h, s1: sc1, ultslot: true }); }
+  /* 剩下的大招格, 按排除法配给剩下的"有大招"的英雄:12 个大招格就是池子里 12 个英雄的大招(除非某英雄在 AD 里没有大招, 那时格子是别人的技能补位)。
+     09-11 1080p 那局虚空假面/影魔/魅惑魔女三个大招格分数都 <0.25 没配上, 其中一格还被当成狙击手"暗杀"补位 ——
+     结果时间结界/不可侵犯被拿走时引擎不知道是什么。现在:分数再低, 只要不明显更像别的图标(全库最像的领先不到 0.3), 就按排除法配上。 */
+  const gbest0 = j => { const a = S[j]; let bv = -9; for (let i = 0; i < a.length; i++) if (a[i] > bv) bv = a[i]; return bv; };
+  for (const [sc1, j, h, k] of pairs) { if (dj.has(j) || dh.has(h) || !HAS_ULT[h] || sc1 < 0.05 || gbest0(j) - sc1 >= 0.3) continue;
+    dj.add(j); dh.add(h); skills.push({ cell: j, box: boxes[j], key: k, hero: h, s1: sc1, ultslot: true, byElim: true }); }
+  /* 棋盘上每一格都要跟踪明暗(有人拿走"未知技能"也是一手, 漏数会把选人顺序整体带歪), 认不出的格子记占位符 */
+  for (const j of ultIds) if (!dj.has(j)) skills.push({ cell: j, box: boxes[j], key: '?unk:' + j, hero: null, unknown: true, s1: 0, ultslot: true });
+  /* **以图标为准**:技能不够的英雄会由别的英雄的技能补位(实测水晶室女第 3 格 = 天穹守望者的"磁场" 0.78,
+     大招区两个空位 = 敌法师"法力虚空" 0.92 / 克林克兹"骨隐步" 0.71)。所以每格都拿全库最像的那张图标来核:
+       · 占位的"未知"格:全库最像的 ≥ FILL_MIN 就认它;
+       · 已按英雄配上的格:全库最像的明显更好(高出 FILL_GAP 且本身 ≥ FILL_ABS)才改判 ——
+         分数接近时仍信"同一行属同一英雄"的约束, 它能纠正相似图标的误认。 */
+  const FILL_MIN = 0.55, FILL_GAP = 0.2, FILL_ABS = 0.6, usedKeys = new Set(skills.filter(r => !r.unknown).map(r => r.key));
+  const gbest = j => { const a = S[j]; let bi = 0, bv = -9; for (let i = 0; i < a.length; i++) if (a[i] > bv) { bv = a[i]; bi = i; } return [LIB.keys[bi], bv]; };
+  for (const r of skills) { const [gk, gv] = gbest(r.cell); if (usedKeys.has(gk) && gk !== r.key) continue;
+    if (r.unknown ? gv >= FILL_MIN : (gk !== r.key && gv >= FILL_ABS && gv - r.s1 >= FILL_GAP)) {
+      if (!r.unknown) usedKeys.delete(r.key);
+      r.was = r.unknown ? '未知' : r.key; r.key = gk; r.s1 = gv; r.unknown = false; r.filler = true; usedKeys.add(gk); } }
+  const heroBoxes = cells.map((c, j) => c.role === 'hero' ? { cell: j, box: boxes[j] } : null).filter(Boolean);
+  // 英雄卡身份:同一行技能是谁的
+  for (const hb of heroBoxes) { const c = cells[hb.cell]; const side = c.col < 4 ? 'L' : 'R'; const r = skills.find(s => !s.ultslot && cells[s.cell].row === c.row && ((cells[s.cell].col < 4 ? 'L' : 'R') === side)); hb.hero = r ? r.hero : null; }
+  return { poolHeroes, skills, heroBoxes, align: { ox, oy, nd } };
+}
+/* 锁池时把每个格子的框"贴"到图标上:棋盘是 3D 梯形, 格子不是正方形, 各行大小/位置都不同,
+   固定版式框会连边框和背景一起裁进来 —— 实测平均匹配 0.77, 逐格贴准后 0.88(最差的 0.15→0.64)。
+   棋盘整局不动, 所以只在锁池时算一次, 之后每帧按相同的偏移量用。
+   办法:拿这一格已经认出的图标当模板, 先粗搜(±4 像素 / 三种大小), 再在最好那点附近细搜 ±1。 */
+function refineBoxes(img, pool) {
+  const adj = {};
+  for (const r of pool.skills) { if (r.unknown || !(r.key in KIDX) || r.s1 >= 0.85) continue; const b = r.box;   // 本来就贴得准的跳过
+    let best = -9, bo = [0, 0, 0, 0];
+    const tryBox = (dx, dy, dw, dh) => { const v = matchSkill(img, [b[0] + dx, b[1] + dy, b[2] + dw, b[3] + dh], [r.key]).s1;
+      if (v > best) { best = v; bo = [dx, dy, dw, dh]; } };
+    for (let dx = -4; dx <= 4; dx += 4) for (let dy = -4; dy <= 4; dy += 4) for (const d of [0, 4]) tryBox(dx, dy, d, d);
+    const c = bo.slice();
+    for (let dx = c[0] - 2; dx <= c[0] + 2; dx += 2) for (let dy = c[1] - 2; dy <= c[1] + 2; dy += 2)
+      for (const dw of [c[2] - 2, c[2], c[2] + 2]) for (const dh of [c[3] - 2, c[3], c[3] + 2]) tryBox(dx, dy, dw, dh);
+    if (best > r.s1) { adj[r.cell] = bo; r.box = [b[0] + bo[0], b[1] + bo[1], b[2] + bo[2], b[3] + bo[3]]; r.s1 = best; } }
+  /* 英雄卡没有模板可对, 借同一行技能格的偏移(同一行透视一样) */
+  const rows = {}; for (const r of pool.skills) if (adj[r.cell]) { const row = LAYOUT.board[r.cell].row; (rows[row] = rows[row] || []).push(adj[r.cell]); }
+  const med = a => a.slice().sort((x, y) => x - y)[a.length >> 1];
+  for (const hb of pool.heroBoxes) { const row = LAYOUT.board[hb.cell].row, g = rows[row]; if (!g || !g.length) continue;
+    const o = [0, 1, 2, 3].map(i => med(g.map(v => v[i]))); adj[hb.cell] = o;
+    hb.box = [hb.box[0] + o[0], hb.box[1] + o[1], hb.box[2] + o[2], hb.box[3] + o[3]]; }
+  return adj;
+}
+function takenFlags(imgNow, refB, pool, boxesNow, refS) {
+  const out = {}, S = refS || {};
+  for (const r of pool.skills) out[r.key] = cellState(imgNow, boxesNow[r.cell], refB[r.cell], S[r.cell] || 0, false);
+  for (const hb of pool.heroBoxes) hb.state = cellState(imgNow, boxesNow[hb.cell], refB[hb.cell], S[hb.cell] || 0, true);
+  return out;
+}
+/* 参考亮度表(每格"没被选走时应有多亮")。
+   新局面(暗格 ≤8, 选技刚开始/准备阶段):
+     · 纯黑(平均<30 且 最亮一格<48)= 开局前就被选走了(实测:斯温卡 4/8, 被选技能 19~27/36~42)→ 直接记已选走;
+     · 其余暗格 = 原画本来就暗 或 被提示框挡着(实测:潮汐猎人卡 31/51, 美杜莎卡 51/73)→ 用它**自己**的亮度当基准,
+       以后看到它变亮就往上学。以前是换成"图标库估计亮度", 但库里的图比游戏卡面亮, 暗色原画因此被当成"已选走" ——
+       美杜莎被凭空记成已选(再被名字匹配塞给 1 楼)、潮汐猎人来回"选走/亮回来"导致建议跳, 都是这个原因。
+   中途加入(暗格 >8):那些多半是真被选走的, 仍按图标库估计亮度判。 */
+const isBlack = st => st.mean < 30 && st.max < 48;
+function refBrightness(imgRef, pool) {
+  const refB = {}, ratios = [], hratios = [], stats = {}; let darkCells = 0;
+  const all = pool.skills.map(r => [r.key, r.cell, false]).concat(pool.heroBoxes.map(h => ['hero:' + h.hero, h.cell, true]));
+  const gone = {};
+  for (const [k, cell, isHero] of all) { const st = cellStats(imgRef, (pool.skills.find(r => r.cell === cell) || pool.heroBoxes.find(h => h.cell === cell)).box);
+    stats[cell] = st; refB[cell] = st.mean;
+    /* 英雄卡没了颜色(饱和度 <0.08;英雄原画实测最灰的也有 0.18)= 开局前就被选走、且是带反光的那种(不黑, 亮度 60+) */
+    gone[cell] = isBlack(st) || (isHero && st.sat < 0.08 && st.mean < 120 && st.max < 150);
+    if (st.mean < 60 || gone[cell]) darkCells++; }
+  for (const r of pool.skills) if (refB[r.cell] >= 60 && BRIGHT[r.key]) ratios.push(refB[r.cell] / BRIGHT[r.key]);
+  for (const hb of pool.heroBoxes) if (refB[hb.cell] >= 60 && HBRIGHT[hb.hero]) hratios.push(refB[hb.cell] / HBRIGHT[hb.hero]);
+  const med = a => { if (!a.length) return null; const x = a.slice().sort((p, q) => p - q); return x[(x.length / 2) | 0]; };
+  const ratio = med(ratios) || 1.0, hratio = med(hratios) || ratio, darkKeys = [], preTaken = [], learn = [];
+  const libEst = (k, isHero) => Math.max(60, isHero ? (HBRIGHT[k.slice(5)] || 90) * hratio : (BRIGHT[k] || 90) * ratio);
+  const fresh = darkCells <= 8;
+  const refS = {}; for (const [, cell] of all) refS[cell] = stats[cell].sat;
+  for (const [k, cell, isHero] of all) { if (refB[cell] >= 60 && !gone[cell]) continue; darkKeys.push(k);
+    /* 看着已经被选走的格子:没有"没选走时"的样子可比, 饱和度基准填一个典型原画的值, 让 cellState 的"颜色没了"那条能成立 */
+    if (gone[cell] && isHero) refS[cell] = Math.max(refS[cell], 0.4);
+    if (!fresh) { refB[cell] = libEst(k, isHero); continue; }                          // 中途加入:暗格多半真被选了
+    if (gone[cell]) { preTaken.push(k); refB[cell] = libEst(k, isHero); }              // 纯黑/无色反光:开局前就被选走
+    else { refB[cell] = Math.max(12, refB[cell]); learn.push(cell); } }               // 暗色原画/被挡:用自己当基准, 以后往上学
+  return { refB, refS, ratio, darkCells, darkKeys, preTaken, learn, fresh };
+}
+/* ---- 面板 ---- */
+function matchSkill(img, box, cands) {
+  const v = cellVec(img, box); let b1 = -9, k1 = null, b2 = -9, k2 = null;
+  /* 只对候选算点积。原来不管候选多少都先 scoreAll 全部 513 个(每个 12288 维),面板 40 个槽位就是 2.5 亿次乘法 —— 白烧 */
+  const list = cands ? cands.map(k => KIDX[k]).filter(i => i != null) : null;
+  if (list) { for (const i of list) { const s = dot1(v, i);
+      if (s > b1) { b2 = b1; k2 = k1; b1 = s; k1 = LIB.keys[i]; } else if (s > b2) { b2 = s; k2 = LIB.keys[i]; } }
+    return { key: k1, s1: b1, key2: k2, s2: b2 }; }
+  const s = scoreAll(v);
+  for (let i = 0; i < LIB.keys.length; i++) { if (s[i] > b1) { b2 = b1; k2 = k1; b1 = s[i]; k1 = LIB.keys[i]; } else if (s[i] > b2) { b2 = s[i]; k2 = LIB.keys[i]; } }
+  return { key: k1, s1: b1, key2: k2, s2: b2 };
+}
+function readPanels(img, candKeys) {
+  const panels = [];
+  for (const side of ['L', 'R']) { const P = LAYOUT.panels[side];
+    for (let i = 0; i < 5; i++) { const px0 = P.x0, py0 = P.y_top + P.pitch * i, pw = PW, ph = P.pitch;
+      /* 边框亮度只量上/下两条 + 技能那一侧的竖条;英雄原画那一侧(L 面板左边、R 面板右边)会被原画本身顶亮,不能算 */
+      const top = meanBGR(img, px0, py0, pw, EB), bot = meanBGR(img, px0, py0 + ph - EB, pw, EB), sid = side === 'L' ? meanBGR(img, px0 + pw - EB, py0, EB, ph) : meanBGR(img, px0, py0, EB, ph);
+      const bm = [0, 1, 2].map(c => (top[c] * pw * EB + bot[c] * pw * EB + sid[c] * EB * ph) / (2 * pw * EB + EB * ph));
+      const skills = [];
+      const boxes4 = [];
+      /* 空槽 = 近乎纯黑:内圈九宫格最亮一格 <24(实测 1080p/1440p 空槽 0~13, 高亮面板的空槽也 ≤13;最暗的图标"感染"最亮一格也有 36)。
+         以前按整格平均 <40 判空 —— 暗色图标(红色恶魔脸之类)平均只有 28~43, 被当成空槽:面板"没多东西" → 棋盘那格被判"不当落子"(09-11 日志 魔王降临/混沌之军/狂怒…) */
+      for (const [sx, sy, sw] of P.slots) { const b = slotBox(P, px0, py0, sx, sy, sw, side); boxes4.push(b); if (!slotFilled(img, b)) { skills.push(null); continue; }
+        if (candKeys === false) { skills.push({ key: '?', s: 0 }); continue; }   // 只数格子, 不认图标
+        const r = candKeys && candKeys.length ? matchSkill(img, b, candKeys) : matchSkill(img, b, null); skills.push(r.s1 >= 0.3 ? { key: r.key, s: r.s1 } : { key: '?', s: r.s1 }); }
+      const [ax0, ay0, ax1, ay1] = (side === 'L' ? [10, 100, 130, 215] : [290, 100, 410, 215]).map(v => Math.round(v * SC)); const st = regionStats(img, px0 + ax0, py0 + ay0, ax1 - ax0, ay1 - ay0);
+      panels.push({ side, idx: i, skills, slotBoxes: boxes4, filled: skills.filter(Boolean).length, borderBright: (bm[0] + bm[1] + bm[2]) / 3, borderRGB: bm, faceSat: st.sat, faceTex: st.lap, hasFace: st.sat < 185 && st.lap > 2000 }); } }
+  return panels;
+}
+function readHeroName(img, side, idx, cands, sizeHint, anchor) {   // anchor = {x, y, r}:只在上次找到的位置附近 ±r 找(L 面板按左边缘、R 面板按右边缘对齐), 快几十倍   // 归一化相关(TM_CCOEFF_NORMED)滑窗;积分图求窗口均值/能量,只剩 num 逐像素
+  const P = LAYOUT.panels[side], px0 = P.x0, py0 = P.y_top + P.pitch * idx; const [tx0, ty0, tx1, ty1] = side === 'L' ? [60, 0, 330, 50] : [130, 0, 410, 50];
+  /* 名字模板是按设计分辨率渲染的位图 —— 把标题区按设计尺寸重采样(SC≠1 时相当于缩回 1440p 再匹配) */
+  const rw = tx1 - tx0, rh = ty1 - ty0, G = new Float32Array(rw * rh), d = img.data, W = img.w;
+  for (let j = 0; j < rh; j++) for (let i = 0; i < rw; i++) {
+    const sx = px0 + Math.round((tx0 + i) * SC), sy = py0 + Math.round((ty0 + j) * SC);
+    if (sx < 0 || sy < 0 || sx >= W || sy >= img.h) { G[j * rw + i] = 0; continue; }
+    const p = (sy * W + sx) * 4; G[j * rw + i] = 0.299 * d[p] + 0.587 * d[p + 1] + 0.114 * d[p + 2]; }
+  const IW = rw + 1, I1 = new Float64Array(IW * (rh + 1)), I2 = new Float64Array(IW * (rh + 1));   // 积分图
+  for (let j = 1; j <= rh; j++) { let r1 = 0, r2 = 0; for (let i = 1; i <= rw; i++) { const g = G[(j - 1) * rw + i - 1]; r1 += g; r2 += g * g; I1[j * IW + i] = I1[(j - 1) * IW + i] + r1; I2[j * IW + i] = I2[(j - 1) * IW + i] + r2; } }
+  const box = (I, x, y, w, h) => I[(y + h) * IW + x + w] - I[y * IW + x + w] - I[(y + h) * IW + x] + I[y * IW + x];
+  const out = [];
+  for (const h of cands) { let tpls = NAMES.tpl[h === null ? '__none' : h] || []; if (sizeHint) { const f = tpls.filter(t => Math.abs(t.size - sizeHint) <= 1); if (f.length) tpls = f; } let best = -1, bestSize = 0, bx = 0, by = 0, bw = 0;
+    for (const t of tpls) { if (t.h > rh || t.w > rw) continue; const n = t.w * t.h, tv = new Float32Array(n); let tm = 0; for (let i = 0; i < n; i++) { tv[i] = NAMES.bin[t.off + i]; tm += tv[i]; } tm /= n; let tn = 0; for (let i = 0; i < n; i++) { tv[i] -= tm; tn += tv[i] * tv[i]; } tn = Math.sqrt(tn) + 1e-6;
+      let ya = 0, yb = rh - t.h, xa = 0, xb = rw - t.w;
+      if (anchor) { const ax = side === 'L' ? anchor.x : anchor.x - t.w; ya = Math.max(0, anchor.y - anchor.r); yb = Math.min(yb, anchor.y + anchor.r); xa = Math.max(0, ax - anchor.r); xb = Math.min(xb, ax + anchor.r); }
+      for (let y = ya; y <= yb; y++) for (let x = xa; x <= xb; x++) { const s1 = box(I1, x, y, t.w, t.h), s2 = box(I2, x, y, t.w, t.h); const den = s2 - s1 * s1 / n; if (den < 1e-3) continue;
+        let num = 0; for (let j = 0; j < t.h; j++) { const gr = (y + j) * rw + x, tr = j * t.w; for (let i = 0; i < t.w; i++) num += G[gr + i] * tv[tr + i]; }   // Σ g·(t-tm) = Σ (g-m)(t-tm) 因 Σ(t-tm)=0
+        const c = num / (Math.sqrt(den) * tn + 1e-6); if (c > best) { best = c; bestSize = t.size; bx = x; by = y; bw = t.w; } } }
+    out.push([best, h, bestSize, bx, by, bw]); }
+  return out.sort((a, b) => b[0] - a[0]);
+}
+/* ---- 逐帧追踪 ---- */
+class Tracker {
+  constructor() { this.ref = null; this.pool = null; this.prev = null; this.owner = {}; this.heroOf = {}; this.log = []; this.quality = null;
+    this.bhist = {}; this.curSeat = null; this.curCand = null; this.curCandRun = 0; this.darkRun = {}; this.brightRun = {}; this.stable = {}; this.nameSize = 0; this.nameTried = {}; this.frameNo = 0; this.allowBulk = 1; this.bulkLog = null; this.hold = {}; this.flips = {}; this.flaky = {}; this.flakyLog = null; }
+  /* 用这一帧当开局参考:读池子 + 参考亮度。返回质量 {nd, heroes, minMargin, darkCells, ratio};调用方据此决定接不接受 */
+  reset(img) { this.ref = img; this.pool = readPool(img); this.boxAdj = refineBoxes(img, this.pool); this.keys = this.pool.skills.map(r => r.key); this.owner = {}; this.heroOf = {}; this.prev = null; this.log = [];
+    this.bhist = {}; this.curSeat = null; this.curCand = null; this.curCandRun = 0; this.darkRun = {}; this.brightRun = {}; this.stable = {}; this.nameTried = {}; this.allowBulk = 1; this.bulkLog = null; this.hold = {}; this.flips = {}; this.flaky = {}; this.flakyLog = null;
+    const rb = refBrightness(img, this.pool); this.refB = rb.refB; this.refS = rb.refS; this.learn = new Set(rb.learn); this.preTaken = rb.preTaken;
+    /* 新局面:只有纯黑格算开局前已被选走(直接记账), 其余暗格不算;不允许"一次多出好几件" */
+    if (rb.fresh) { this.allowBulk = 0; for (const k of rb.preTaken) { this.stable[k] = true; this.darkRun[k] = 2; } }
+    this.firstT = {}; for (const k of rb.preTaken) this.firstT[k] = 0;   // 锁池前就被选走的:时间记 0(英雄按时间排座位时它们排最前)
+    const margins = this.pool.skills.filter(r => !r.ultslot && r.rowMargin != null).map(r => r.rowMargin); const minMargin = margins.length ? Math.min(...margins) : 0;
+    this.quality = { nd: this.pool.align.nd, heroes: this.pool.poolHeroes.length, minMargin, darkCells: rb.darkCells, ratio: rb.ratio }; return this.quality; }
+  /* 当前选人:边框亮度取最近 3 次识别的峰值(真正的高亮框会呼吸闪动,静态亮边框不会),换人要连续 2 次确认 */
+  pickCurrent(panels) { const pid = p => p.side + p.idx; let best = null, bs = -1;
+    for (const p of panels) { let h = this.bhist[pid(p)] = (this.bhist[pid(p)] || []).concat([p.borderBright]).slice(-3);
+      /* 当前选人的边框连续 2 帧掉到峰值 7 成以下 = 高亮撤了(轮到别人),忘掉它的峰值,别再靠旧峰值霸着 */
+      if (this.curSeat && p.side === this.curSeat[0] && p.idx === this.curSeat[1] && h.length >= 2 && h[h.length - 1] < 0.7 * Math.max(...h) && h[h.length - 2] < 0.7 * Math.max(...h)) h = this.bhist[pid(p)] = [p.borderBright];
+      const sc = Math.max(...h) + 0.01 * p.borderBright; if (sc > bs) { bs = sc; best = p; } }
+    const c = [best.side, best.idx];
+    if (!this.curSeat) { this.curSeat = c; return c; }
+    if (c[0] === this.curSeat[0] && c[1] === this.curSeat[1]) { this.curCand = null; this.curCandRun = 0; return this.curSeat; }
+    if (this.curCand && c[0] === this.curCand[0] && c[1] === this.curCand[1]) this.curCandRun++; else { this.curCand = c; this.curCandRun = 1; }
+    if (this.curCandRun >= 2) { this.curSeat = c; this.curCand = null; this.curCandRun = 0; }
+    return this.curSeat; }
+  observe(img) { const { boxes } = alignBoard(img, false); const A = this.boxAdj || {};
+    for (const c in A) if (boxes[c]) boxes[c] = [boxes[c][0] + A[c][0], boxes[c][1] + A[c][1], boxes[c][2] + A[c][2], boxes[c][3] + A[c][3]];   // 锁池时贴准的偏移, 每帧照用
+    this.boxesNow = boxes;
+    /* 锁池时暗着(被挡/原画暗)的格子:一旦看到它更亮, 就把基准往上调 —— 提示框移开后就能学到真实亮度 */
+    if (this.learn && this.learn.size) for (const cell of this.learn) { const st = cellStats(img, boxes[cell]);
+      if (st.mean > this.refB[cell]) { this.refB[cell] = st.mean; this.refS[cell] = Math.max(this.refS[cell] || 0, st.sat); } }
+    const rawTaken = takenFlags(img, this.refB, this.pool, boxes, this.refS);   // 每格 'T' 被选走 / 'N' 没变 / 'O' 看不清
+    /* 鼠标正停在上面的格子:游戏会弹介绍框、被选走的卡还会把原画亮出来 —— 一律"看不清", 不改任何状态 */
+    const hk = this.hoverKey(boxes); if (hk) { if (hk.startsWith('hero:')) { const hb = this.pool.heroBoxes.find(h => 'hero:' + h.hero === hk); if (hb) hb.state = 'O'; } else rawTaken[hk] = 'O'; }
+    /* 铁律:一手只选走一件。所以"这一帧新变黑的格子 ≥2 个"必定不是选人 —— 是半透明的提示框/弹窗盖住了一片,
+       整批丢弃(实测有一次盖黑 30 格, 被当成 12 件已选走, 还连累"新的一局"误判)。
+       只有刚锁定池子/刚从后台回来那几帧允许批量(那时确实可能一次看到很多件已被选走)。 */
+    const rawList = [];
+    for (const r of this.pool.skills) rawList.push([r.key, rawTaken[r.key]]);
+    for (const hb of this.pool.heroBoxes) rawList.push(['hero:' + hb.hero, hb.state]);
+    /* 同一帧里 ≥2 个格子"新变黑" = 多半是遮挡(一手只选一件)。以前的做法是整批丢弃并把计数清零 ——
+       结果真被选走的格子只要跟一个闪烁格同帧出现, 就会被一直拖着永远认不上(实测食人魔魔法师整局没被认出, 最后一轮还在推荐它);
+       而"同一批连续 N 次都黑就接受"又把停着看技能介绍时框底下的 8 格一次收了进来(已选数 6→14, 40 秒后才撤销)。
+       现在:这种格子逐个标记"要等更久"(连续 5 次都暗才认), 各算各的, 互不牵连;不再有"整批接受"。
+       只有刚锁池/刚从后台回来那一帧(allowBulk)允许一次认很多(那时确实可能已经被选了好几件)。 */
+    const fresh = rawList.filter(([k, d]) => d === 'T' && !this.stable[k] && !this.darkRun[k]);
+    let bulk = false; this.hold = this.hold || {};
+    if (fresh.length >= 2 && !this.allowBulk) { bulk = true; for (const [k] of fresh) this.hold[k] = true;
+      this.bulkLog = `${fresh.length} 格同时变黑 → 当遮挡嫌疑, 这几格要连续 5 次都暗才认`; }
+    for (const [k, d] of rawList) if (d === 'N') delete this.hold[k];
+    if (this.allowBulk > 0) this.allowBulk--;
+    const rawMap = Object.fromEntries(rawList);
+    /* 已选走去抖:连续 N 次都黑才算,连续 N 次都亮才撤。
+       N 平时是 2;某个格子一旦被发现"翻来覆去地闪"(实测赛前准备阶段有格子每半秒明暗一次),
+       就把它标成 flaky 并把 N 提到 6 —— 真选走了会一直黑,闪的那种撑不过 6 次。 */
+    const taken = {}; let pending = bulk;
+    const step = (k, st3) => {
+      if (st3 === 'O') return !!this.stable[k];   // 看不清(被挡):什么都不改, 连计数都不动
+      /* 确认被选走、并且**连续暗满 12 次**完整识别(十几秒)就锁定, 以后看到它"亮了"也不撤 —— 游戏里被选走的东西不会回来。
+         按"连续暗了多久"而不是"确认了多久":误判(暗图标/遮挡)通常暗几帧就亮回来, 那种要照常撤销。
+         09-11 那局:左2 第一手拿了美杜莎(认对了), 两分钟后左2 自己回合用鼠标在这张卡上晃, 卡面短暂"亮回来" → 被撤销、
+         还把美杜莎推荐给左2, 随后美杜莎被当成右1 选的, 两人英雄对调。撤销只该用来纠正刚认错的(提示框瞬间盖黑之类), 那都在几秒内 */
+      if (this.stable[k] && (this.darkRun[k] || 0) >= 12) { if (st3 === 'T') this.darkRun[k]++; return true; }
+      const d = st3 === 'T';
+      this.darkRun[k] = d ? (this.darkRun[k] || 0) + 1 : 0; this.brightRun[k] = d ? 0 : (this.brightRun[k] || 0) + 1;
+      this.firstT = this.firstT || {}; if (d && this.darkRun[k] === 1 && !this.stable[k]) this.firstT[k] = this.frameNo;   // 这一格开始变暗的时刻(英雄按时间顺序排座位用)
+      /* 认"被选走"要连续 need 次;**撤销要连续 6 次清清楚楚"没变"**(看不清的帧不算)——
+         游戏里被选走的东西永远不会回来, 所以撤销只可能是我们之前认错了, 必须证据确凿才撤(以前 2 次就撤, 撤了又认、认了又撤就是抖动) */
+      const need = this.flaky[k] ? 6 : (this.hold && this.hold[k]) ? 5 : 2, was = !!this.stable[k];
+      if (this.darkRun[k] >= need) this.stable[k] = true; if (this.brightRun[k] >= 6) this.stable[k] = false;
+      if (was !== !!this.stable[k]) { this.flips[k] = (this.flips[k] || 0) + 1;
+        if (this.flips[k] >= 3 && !this.flaky[k]) { this.flaky[k] = true; this.flakyLog = (this.flakyLog || []).concat([k]);
+          this.stable[k] = false; this.darkRun[k] = 0; } }   // 判定为闪烁的一刻先当"没被选走"(真选走了会一直黑, 6 次后自然认回来)
+      /* 还在确认中(暗了但还没认 / 亮了但还没撤)就要求下一帧必须完整识别 —— 否则画面一模一样时会被"画面未变"跳过,
+         要连续 5 次才认的格子计数会永远卡在 2 */
+      if ((d && !this.stable[k]) || (!d && this.stable[k])) pending = true;
+      return !!this.stable[k]; };
+    for (const r of this.pool.skills) taken[r.key] = step(r.key, rawMap[r.key]);
+    for (const hb of this.pool.heroBoxes) hb.takenStable = step('hero:' + hb.hero, rawMap['hero:' + hb.hero]);
+    const takenHeroes = this.pool.heroBoxes.filter(h => h.takenStable).map(h => h.hero); const takenKeys = Object.keys(taken).filter(k => taken[k]);
+    const panels = readPanels(img, false);
+    const gsc = q => q.borderRGB[1] - Math.max(q.borderRGB[0], q.borderRGB[2]);
+    let me = panels[0]; for (const p of panels) if (gsc(p) > gsc(me)) me = p;
+    /* "我"的绿框有记忆:只在某面板明显发绿(绿-max(红,蓝) > 25)时更新;轮到我时高亮可能盖掉绿框,此时沿用上次的座位 */
+    if (gsc(me) > 25 || !this.meSeat) this.meSeat = [me.side, me.idx];
+    const cur = this.pickCurrent(panels);
+    /* pending = 还有待确认的变化(已选走去抖中 / 换人待二次确认)。worker 据此强制下一帧做完整识别,
+       否则画面一模一样时会被"画面未变"跳过,二次确认永远等不到。 */
+    const bulkMsg = this.bulkLog; this.bulkLog = null;
+    const flakyMsg = this.flakyLog && this.flakyLog.length ? `${this.flakyLog.map(k => cn(k.replace(/^hero:/, ''))).join("/")} 这几格明暗来回跳(不是选人), 以后要连续 6 次才认` : null; this.flakyLog = null;
+    const nO = rawList.filter(([, d]) => d === 'O').length;
+    return { taken, takenHeroes, panels, rawState: Object.fromEntries(rawList), current: cur.slice(), me: this.meSeat.slice(), pending: pending || this.curCandRun > 0, bulkMsg, flakyMsg, occluded: nO, rawDark: rawList.filter(([, d]) => d === 'T').length };
+  }
+  /* ================= 归属:配对式(v1.5) =================
+     每落一手, 画面上**同时**有两个变化:① 棋盘某格变成"被选走"的样子 ② 某个人的面板多了东西。
+     技能:面板技能槽"有没有图标"极其干净(实测空槽 0~20, 有图标 78~155, 正在选的人面板变亮时空槽也只有 7~12),
+          所以 "这一格变暗 + 那个面板多了一个图标" = 那个人选了这件。图标只在"刚变暗的那一两件"里核对, 不用在 47 个里挑。
+          · 棋盘变暗、但没有任何面板多东西(实测"感染":本来就很暗的图标)→ 不算落子;
+          · 面板多了、棋盘没看到(实测蓝胖的卡整局没认上)→ 在还没被选的东西里认, 高分才收, 否则记"他选了一件没认出的";
+          · 正在选的人自己的面板多出来、棋盘没变 → 可能是悬停预览, 等他回合结束还在才算。
+     英雄:面板上没有可靠信号(实测标题一高亮就变白、头像是半透明的), 按回合填空:40 手技能每一手都被面板精确锚定"这是谁的第几手",
+          英雄只落在两个锚点之间的空当里;再加硬约束:一个人只能有一个英雄。
+     以前是"按计数推"——错一手后面全错(09-10 那局日志:英雄 10 个对 1~3 个, 选完时插件眼里左方 67~70%, 真实 19%)。 */
+  attribute(img, ob, pq, same) {
+    const F = this.frameNo, seatKey = q => q[0] + q[1], ORDER = this.fullOrder || [];
+    this.pc = this.pc || {}; this.pcRaw = this.pcRaw || {}; this.pcRun = this.pcRun || {}; this.incs = this.incs || [];
+    this.known = this.known || new Set(); this.suspect = this.suspect || {}; this.pend = this.pend || {}; this.orphan = this.orphan || {};
+    if (this.turn == null) this.turn = 0;
+    const cur = ob.current;
+    /* A. 面板格子数去抖(同一个数连续 2 帧才算)。
+       判据是 **"面板图标数 − 已经记在他名下的件数" = 多出来的几个**, 而不是"图标数增加了没有":
+       有人会拖动自己的技能换位置 —— 拖起来那一格会空一下、放下又回来;按"增加"算会把放下当成一次新落子(然后认错一件或计数多一手),
+       按"多出来"算:放下后图标数 = 已记件数, 什么都不会发生。图标数暂时比已记件数少(正在拖)也不处理。 */
+    const first = !this.pcInit;
+    for (const p of ob.panels) { const k = seatKey([p.side, p.idx]);
+      if (first) { this.pc[k] = p.filled; continue; }
+      if (p.filled === this.pcRaw[k]) this.pcRun[k] = (this.pcRun[k] || 0) + 1; else { this.pcRaw[k] = p.filled; this.pcRun[k] = 1; }
+      if (this.pcRun[k] >= 2) this.pc[k] = p.filled; }
+    const hasHero = q => Object.values(this.heroOf).some(o => same(o, q));
+    const attributed = q => Object.values(this.owner).filter(o => same(o, q)).length + (this.unknownBy || []).filter(o => same(o, q)).length;
+    const surplus = q => Math.max(0, (this.pc[seatKey(q)] || 0) - attributed(q));
+    /* noBack:晚认出来的旧落子(面板图标晚到、事后按图标补认)只能让回合往前走, 不能往回拉 ——
+       压力测试:第 38 手时才补认出第 34 手的技能, 回合被拉回到 34, 接下来两个英雄"附近的人都有英雄了"直接丢了座位 */
+    const anchor = (q, noBack) => { const s = (q[0] === 'L' ? 0 : 5) + q[1]; let best = -1, bd = 1e9;
+      for (let i = 0; i < ORDER.length; i++) if (ORDER[i] === s) { const d = Math.abs(i - this.turn); if (d < bd) { bd = d; best = i; } }
+      if (best >= 0 && !(noBack && best + 1 < this.turn)) this.turn = best + 1; };
+    const seatAt = i => { const x = ORDER[Math.max(0, Math.min(i, ORDER.length - 1))]; return x == null ? cur : [x < 5 ? 'L' : 'R', x % 5]; };
+    const seats = ob.panels.map(p => [p.side, p.idx]);
+    /* 开局第一帧:已经在面板里的技能按图标一次配完(中途才打开插件的情况);回合数 = 面板里的图标总数 + 已经变黑的英雄卡数 */
+    const skillsTaken = Object.keys(ob.taken).filter(k => ob.taken[k]);
+    if (first) { this.pcInit = true;
+      const cands = skillsTaken.filter(k => k[0] !== '?');
+      for (const p of ob.panels) if (p.filled) { const pp = readPanels(img, cands).find(x => x.side === p.side && x.idx === p.idx);
+        for (const sl of pp.skills) if (sl && sl.key !== '?' && sl.s >= 0.45 && !this.known.has(sl.key)) { this.owner[sl.key] = [p.side, p.idx]; this.known.add(sl.key); this.pickT = this.pickT || {}; this.pickT[sl.key] = 0; this.log.push(['skill', sl.key, pq([p.side, p.idx]), `开局已在面板里 ${sl.s.toFixed(2)}`]); } }
+      this.turn = ob.panels.reduce((a, p) => a + p.filled, 0) + ob.takenHeroes.length; }
+    /* 多出来的状态从哪一帧开始(C 步要等它持续一阵子) */
+    this.surSince = this.surSince || {};
+    for (const q of seats) { const k = seatKey(q); if (surplus(q) > 0) { if (this.surSince[k] == null) this.surSince[k] = F; } else delete this.surSince[k]; }
+    /* B. 棋盘上新变成"被选走"的技能:到"图标比已记件数多"的面板里找它, 以图标为准配对 */
+    const newSk = skillsTaken.filter(k => !this.known.has(k));
+    /* 某人面板里"这几件里最像的那格有多像"—— 只看他**还没解释的**格子:更像他已记下那几件的格子跳过。
+       以前把他已有的格子也算进去:压力测试里 灵能之刃 对右5 已有的"粘性燃油"那格 0.48, 就被配给了右5, 之后连锁错 5 手 */
+    const openScore = (q, keys) => { const pp = readPanels(img, keys).find(x => x.side === q[0] && x.idx === q[1]), mine = Object.keys(this.owner).filter(x => same(this.owner[x], q));
+      let m = -1; for (let j = 0; j < 4; j++) { const x = pp.skills[j]; if (!x || x.s <= m) continue; if (mine.length && matchSkill(img, pp.slotBoxes[j], mine).s1 >= x.s) continue; m = x.s; } return m; };
+    const newHero = ob.takenHeroes.filter(h => !this.known.has('hero:' + h));
+    for (const k of newSk) {
+      const open = seats.filter(q => surplus(q) > 0);
+      let best = null, bs = -9;
+      if (k[0] === '?') { best = open.sort((x, y) => (this.surSince[seatKey(y)] || 0) - (this.surSince[seatKey(x)] || 0))[0] || null; bs = best ? 0.5 : -9; }   // 认不出图标的格子:配最近多出来的那个面板
+      else for (const q of open) { const sc = openScore(q, [k]); if (sc > bs) { bs = sc; best = q; } }
+      /* 只有一个面板多出来、棋盘也只有这一格刚变暗:时间上的巧合本身就是证据, 图标只要不明显矛盾(≥0.2)就配;有多个候选才要 ≥0.45 挑最像的。
+         "巧合"必须是真的同时:那个面板多出来的时刻不能早于这格变暗前 1 帧 —— 早就多出来的是更早那一手留下的
+         (整局压力测试:右1 的图标晚 5 帧才出现, 恰好这时左3 落子, 左3 的技能被 0.32 配给了右1, 后面连锁错) */
+      const tk = (this.firstT || {})[k], fresh = best && tk != null && (this.surSince[seatKey(best)] != null ? this.surSince[seatKey(best)] : F) >= tk - 1;
+      const need = (open.length === 1 && newSk.length === 1 && fresh) ? 0.2 : 0.45;
+      /* 那个面板多出来的图标, 如果另一格还没配上的暗格(不当落子的 / 同样在等配对的)更像, 就不是这一手的 —— 先等等。
+         (压力测试:右4 晚到的"死亡契约"图标刚好在右3 落子时出现, 右3 的"深海重击"以 0.29 被配给了右4, 而那个图标对死亡契约是 0.8) */
+      if (best && bs >= need) { const rivals = Object.keys(this.suspect).concat(Object.keys(this.pend), newSk).filter(x => x !== k && x[0] !== '?' && !this.owner[x]);
+        if (rivals.length && openScore(best, rivals) > bs) best = null; }
+      if (best && bs >= need) { this.owner[k] = best.slice(); this.known.add(k); delete this.pend[k]; anchor(best);
+        this.log.push(['skill', k, pq(best), `配对:棋盘变暗 + 他面板里多出这个图标(吻合 ${bs.toFixed(2)})`]); continue; }
+      this.pend[k] = (this.pend[k] || 0) + 1;
+      if (this.pend[k] >= 4) { this.suspect[k] = true; this.known.add(k); delete this.pend[k];
+        this.log.push(['note', k, '', `棋盘上看着像被选走, 但 4 帧里没有哪个面板多出它${best ? `(最像的面板吻合只有 ${bs.toFixed(2)})` : ''} → 不当落子`]); } }
+    /* 门槛只有 0.3 的补认要多一道保险:这一格在全库里明显更像另一件(高出 0.1)就不认 —— 那多半是一件真没认出的补位技能, 不是这格暗格。
+       0.1 的依据:真实 1080p 截图里认不准的面板图标, 真答案离全库第一最多差 0.04;而整局压力测试里错配的那次, 真图标高出 0.19 */
+    const looksElse = (box, key, s) => { const g = matchSkill(img, box, null); return g.key !== key && g.s1 >= s + 0.1; };
+    /* 反过来:这一格在全库 500 多张图里最像的就是它 → 分数低一点(≥0.2)也认。压力测试里认不准的面板图标 0.28、而且就是全库第一, 卡在 0.3 门槛外 */
+    const topIs = (box, key) => matchSkill(img, box, null).key === key;
+    /* C. 面板多出来、但棋盘上一直没有对应的变暗(持续 ≥4 帧):在还没归属的技能里认(≥0.6 且领先 0.1), 否则记"他选了一件没认出的"。
+       正在选的人自己的面板先不管 —— 多出来的可能是悬停预览, 等他回合过去还在才算。 */
+    for (const q of seats) { const k = seatKey(q), n = surplus(q); if (!n || F - (this.surSince[k] || F) < 4 || same(cur, q)) continue;
+      const pool = this.pool.skills.filter(r => !r.unknown && !this.owner[r.key]).map(r => r.key);
+      const pp = readPanels(img, pool).find(x => x.side === q[0] && x.idx === q[1]);
+      const mine = new Set(Object.keys(this.owner).filter(x => same(this.owner[x], q)));
+      const cands = []; for (let j = 0; j < 4; j++) { if (!pp.skills[j]) continue; const r = matchSkill(img, pp.slotBoxes[j], pool);
+        const rMine = mine.size ? matchSkill(img, pp.slotBoxes[j], [...mine]) : { s1: -1 };
+        if (rMine.s1 >= r.s1) continue;                                // 这一格是他本来就有的那件(换了位置而已)
+        if (r.s1 >= 0.6 && r.s1 - r.s2 >= 0.1) { cands.push({ key: r.key, s: r.s1, gap: r.s1 - r.s2 }); continue; }
+        /* 认不准时, 先看"棋盘上已经变暗、但当时没配上面板"的那几格(不当落子的暗格):候选只有两三个, 吻合 ≥0.3 就认 ——
+           09-11 那局左1 的锚击就是这样:面板图标在 1080p 只认到 0.47, 被记成"没认出";棋盘那格晚了几秒才确认变暗, 又被判"不当落子" */
+        const susp = Object.keys(this.suspect).filter(x => x[0] !== '?' && !this.owner[x]);
+        if (susp.length) { const rs = matchSkill(img, pp.slotBoxes[j], susp);
+          const okS = (rs.s1 >= 0.3 && !looksElse(pp.slotBoxes[j], rs.key, rs.s1)) || (rs.s1 >= 0.2 && topIs(pp.slotBoxes[j], rs.key));
+          if (okS && !cands.some(c => c.key === rs.key)) cands.push({ key: rs.key, s: rs.s1, gap: rs.s1 - rs.s2, susp: true }); } }
+      cands.sort((x, y) => y.s - x.s);
+      /* 数目上限:每落一手棋盘上必有一格变暗, 所以记下的手数不能明显多于棋盘上被选走的格子数(最多多 1 手, 容忍一格没看出变暗)。
+         09-12 日志:右边 4 个面板同一刻被认成各多 4 个图标(棋盘上一个暗格都没有), 一口气记了 16 手"没认出", 接着误判成新的一局 */
+      const recorded = () => Object.keys(this.owner).length + (this.unknownBy || []).length + Object.keys(this.heroOf).length + Object.keys(this.orphan || {}).filter(x => x.startsWith('hero:')).length;
+      for (let m = 0; m < n; m++) { const c = cands[m];
+        if (!(c && c.susp) && recorded() >= (ob.rawDark || 0) + 1) { if (!this.capLogged) this.log.push(['note', '', pq(q), `面板多出图标, 但棋盘上被选走的格子不够(${ob.rawDark}) → 不当落子`]); this.capLogged = true; break; }
+        if (c && !this.owner[c.key]) { this.owner[c.key] = q.slice(); this.known.add(c.key); delete this.pend[c.key]; delete this.suspect[c.key];
+          if (!c.susp) { this.forced = this.forced || {}; this.forced[c.key] = true; this.pickT = this.pickT || {}; this.pickT[c.key] = this.surSince[k] != null ? this.surSince[k] : F; }   // 棋盘确认过变暗的不算"强认", 格子亮回来照常撤销
+          this.log.push(['skill', c.key, pq(q), c.susp ? `面板多出图标 = 棋盘上那格没配上的暗格(吻合 ${c.s.toFixed(2)})` : `面板多出图标但棋盘没看到变暗 → 按图标认 ${c.s.toFixed(2)}(领先 ${c.gap.toFixed(2)})`]); }
+        else { const u = q.slice(); u.t = this.surSince[k] != null ? this.surSince[k] : F; (this.unknownBy = this.unknownBy || []).push(u); this.log.push(['note', '', pq(q), '面板多出一个图标, 认不出是哪件(计数照记)']); }
+        anchor(q, true); } }
+    /* C2. 反方向补认:面板那件先被记成"没认出"(占位), 棋盘那格晚几秒才确认变暗、因为已经没有面板多东西而被判"不当落子"。
+       两边其实是同一手 —— 到有占位的面板里找这格的图标(≥0.3, 挑最像的), 找到就把占位换成它。 */
+    if ((this.unknownBy || []).length) for (const k of Object.keys(this.suspect)) { if (k[0] === '?' || this.owner[k]) continue;
+      const holders = seats.filter(q => this.unknownBy.some(u => same(u, q))); let best = null, bs = -9; const P = readPanels(img, [k]);
+      for (const q of holders) { const pp = P.find(x => x.side === q[0] && x.idx === q[1]), mine = Object.keys(this.owner).filter(x => same(this.owner[x], q));
+        for (let j = 0; j < 4; j++) { const x = pp.skills[j]; if (!x || x.s + 0.1 <= bs) continue;
+          if (mine.length && matchSkill(img, pp.slotBoxes[j], mine).s1 >= x.s) continue;   // 这一格更像他已经记下的那件, 不是占位那件
+          if (looksElse(pp.slotBoxes[j], k, x.s)) continue;
+          const eff = topIs(pp.slotBoxes[j], k) ? x.s + 0.1 : x.s;   // 全库第一就是它:0.2 也够
+          if (eff > bs) { bs = eff; best = q; } } }
+      if (best && bs >= 0.3) { this.unknownBy.splice(this.unknownBy.findIndex(u => same(u, best)), 1); this.owner[k] = best.slice(); delete this.suspect[k];
+        this.log.push(['skill', k, pq(best), `补认:他面板之前"没认出"的那件 = 棋盘上这格(吻合 ${bs.toFixed(2)})`]); } }
+    /* C3. 图标实在认不出时按时间配:只剩一格没配上的暗格 + 只剩一个"没认出"占位, 两者出现时间相差 ≤6 帧 → 就是同一手
+       (压力测试:面板图标糊到 0.27、全库第一是别的图标 0.28, 按图标怎么都配不上;但时间上就是同一手)。图标明显像别的(高出 0.2)就不配 */
+    { const sus = Object.keys(this.suspect).filter(k => k[0] !== '?' && !this.owner[k] && this.solidDark(k)), ub = this.unknownBy || [];
+      if (sus.length === 1 && ub.length === 1 && ub[0].t != null && Math.abs(ub[0].t - this.firstT[sus[0]]) <= 6) { const k = sus[0], q = ub[0];
+        const pp = readPanels(img, [k]).find(x => x.side === q[0] && x.idx === q[1]), mine = Object.keys(this.owner).filter(x => same(this.owner[x], q));
+        let ok = false, sc = 0; for (let j = 0; j < 4; j++) { const x = pp.skills[j]; if (!x) continue;
+          if (mine.length && matchSkill(img, pp.slotBoxes[j], mine).s1 >= x.s) continue;
+          const g = matchSkill(img, pp.slotBoxes[j], null); if (g.key !== k && g.s1 >= x.s + 0.2) continue; ok = true; sc = Math.max(sc, x.s); }
+        if (ok) { this.unknownBy.splice(0, 1); this.owner[k] = [q[0], q[1]]; delete this.suspect[k];
+          this.log.push(['skill', k, pq(q), `按时间配:只剩这一格暗格和他那一个"没认出", 时间相差 ${Math.abs(q.t - this.firstT[k])} 帧(图标吻合 ${sc.toFixed(2)})`]); } } }
+    /* D. 英雄:按回合填空 —— 当前回合是 turn(被技能配对不断重新锚定);该座位已有英雄就试前后一手 */
+    for (const h of newHero) { let q = null;
+      for (const d of [0, 1, -1, 2]) { const c = seatAt(this.turn + d); if (!hasHero(c)) { q = c; if (d) this.turn += d; break; } }
+      this.known.add('hero:' + h);
+      if (!q) { this.orphan['hero:' + h] = true; this.log.push(['hero', h, '', '附近几手的人都已有英雄, 只记"被拿走"']); continue; }
+      this.heroOf[h] = q; this.turn++;
+      this.log.push(['hero', h, pq(q), `按回合填空(第 ${this.turn} 手, 高亮在 ${pq(cur)}${same(cur, q) ? ' 一致' : ''})`]); }
+    /* D2. 按时间顺序复核英雄座位。D 是"当时的回合数"填空, 一旦前面有一手当时没认上(09-11:左1 第 1 手的锚击判"看不清"),
+       紧接着秒选的英雄就会被填到前一个人头上, 而且以后永不回头 —— 莉娜被记给左1、复仇之魂又被挤到右1, 就是这样来的。
+       这里每帧把所有落子按"格子开始变暗的时刻"排好, 重走一遍顺序表:认出主人的技能重新锚定位置, 还没配上的暗格占一手, 英雄落在空当里。
+       与当前座位不同就改判。只用**已确认**的落子(配上主人的技能 + "没认出"占位):还在等面板配对的暗格不算 ——
+       它可能被判"不当落子"又被补认, 算进来英雄会来回改判。
+       不做的情况:中途加入(有不知道时间的落子);英雄和别的落子同一帧变暗(分不出先后, 维持原判)。 */
+    { const T0 = this.firstT || {}, PT = this.pickT || {}, z = t => (t != null && t <= (this.lockFrame || 1) ? 0 : t);   // 锁池后第一帧就已经暗着的 = 锁池前的落子, 记 0
+      const tOf = k => z(T0[k] != null ? T0[k] : PT[k]); const ev = []; let ok = true;
+      for (const k of Object.keys(this.owner)) { const t = tOf(k); if (t == null) { ok = false; break; } ev.push({ t, seat: this.owner[k] }); }
+      for (const u of this.unknownBy || []) { if (u.t == null) { ok = false; break; } ev.push({ t: z(u.t), seat: u }); }
+      /* 追踪中亲眼看到变暗、但一直没配上面板的暗格:多半是一手真落子(只是看不见面板图标), 占一手但不知道是谁 ——
+         不占的话后面的英雄全部错一位(压力测试:面板图标暗到认不出的那一手之后, 4 个英雄全错)。
+         等配对中的(pend)不算:它 4 帧内就会变成已配对或不当落子, 算进来英雄会来回改判 */
+      for (const k of Object.keys(this.suspect)) { if (this.owner[k] || k[0] === '?') continue; if (this.solidDark(k)) ev.push({ t: T0[k], seat: null }); }
+      const namedH = new Set(Object.values(this.nameHero || {}));
+      for (const h of Object.keys(this.heroOf)) { const t = z(T0['hero:' + h] != null ? T0['hero:' + h] : PT['hero:' + h]); if (t == null) { ok = false; break; }
+        ev.push(namedH.has(h) ? { t, seat: this.heroOf[h] } : { t, hero: h }); }   // 面板名字确认过的:座位已知, 当锚点
+      /* 当时"附近几手的人都已有英雄"只记了被拿走的英雄, 也放进来排:排得出座位就补上 */
+      const orph = Object.keys(this.orphan || {}).filter(k => k.startsWith('hero:')).map(k => k.slice(5));
+      for (const h of orph) { const t = z(T0['hero:' + h]); if (t != null) ev.push({ t, hero: h, orphan: true }); }
+      if (ok && (Object.keys(this.heroOf).length || orph.length)) {
+        ev.sort((a, b) => a.t - b.t || (a.hero ? 1 : 0) - (b.hero ? 1 : 0));
+        const sIdx = q => (q[0] === 'L' ? 0 : 5) + q[1], walk = {}, has = new Set();
+        /* 时间 0 = 锁池前就有的落子(晚锁池/中途加入):先后不知道, 不排, 只占手数 —— 与 D 开局时"已有几手"的算法一致;
+           锁池前就有的英雄保持原座位并占住那个座位 */
+        let p = ev.filter(e => e.t === 0).length;
+        for (const e of ev) if (e.t === 0 && e.hero && this.heroOf[e.hero]) { walk[e.hero] = this.heroOf[e.hero]; has.add(sIdx(this.heroOf[e.hero])); }
+        for (const h of namedH) if (this.heroOf[h]) has.add(sIdx(this.heroOf[h]));   // 名字确认过的座位已有英雄, 别人排不进去
+        for (const e of ev) { if (e.t === 0) continue;
+          if (e.hero) { let pick = -1; for (const d of [0, 1, -1, 2]) { const i = p + d; if (i >= 0 && i < ORDER.length && !has.has(ORDER[i])) { pick = i; break; } }
+            if (pick >= 0) { has.add(ORDER[pick]); walk[e.hero] = seatAt(pick); p = pick + 1; } else p++; }
+          else if (e.seat) { const s = sIdx(e.seat); let best = -1, bd = 1e9; for (let i = 0; i < ORDER.length; i++) if (ORDER[i] === s && Math.abs(i - p) < bd) { bd = Math.abs(i - p); best = i; } p = best >= 0 ? best + 1 : p + 1; }
+          else p++; }
+        const next = {}, moved = [];
+        for (const h of Object.keys(this.heroOf).concat(orph)) { const q = walk[h], o = this.heroOf[h], th = z(T0['hero:' + h]), solo = ev.filter(e => e.t === th).length === 1;
+          if (q && (!o || !same(q, o)) && solo && th !== 0) { next[h] = q; moved.push(h); } else if (o) next[h] = o; }   // 同一帧还有别的落子:先后分不出, 不改
+        /* 改完必须一人一个英雄;有冲突(某个英雄没处可去还占着座位)就这一帧整体不改 */
+        const seatsTaken = Object.values(next).map(q => q[0] + q[1]);
+        if (moved.length && new Set(seatsTaken).size === seatsTaken.length)
+          for (const h of moved) { const o = this.heroOf[h]; this.heroOf[h] = next[h]; delete this.orphan['hero:' + h];
+            this.log.push(['hero', h, pq(next[h]), o ? `按时间顺序改判(原 ${pq(o)}):前面有一手当时没认上, 现在补上了` : '按时间顺序补上座位(当时附近的人都已有英雄, 只记了被拿走)']); } } }
+    /* F. 面板英雄名 —— 英雄的第二个信号(技能有"棋盘变暗 + 面板多图标"两个信号互相核对, 英雄以前只有"棋盘卡变暗"一个, 归给谁全靠推算第几手)。
+       每个人面板顶上的标题从"无英雄"变成英雄名:只在本局 12 个英雄 + "无英雄"里认, 实测 2560/1080 共 20 个面板认对 19 个,
+       认错那个(1080 高亮面板)分数只有 0.17。连续两次读到同一个名字(分数 ≥0.40、领先 ≥0.10)才算确认;
+       确认后以名字为准:推算错了的座位改过来, 棋盘卡没看出变暗的也补上, 之后不撤销、不按时间顺序挪。
+       每帧读 3 个面板(正在选的人、上一手的人、再轮一个), 已确认的不再读;名字位置固定, 只在左边缘 x≈50 / 右边缘 x≈181、y≈7 附近 ±5 找 */
+    if (!process.env.AD_NONAME) { this.nameRun = this.nameRun || {}; this.nameHero = this.nameHero || {}; this.nameRR = this.nameRR || 0;
+      const named = new Set(Object.values(this.nameHero)), want = [];
+      const addS = q => { if (q && !this.nameHero[seatKey(q)] && !want.some(x => same(x, q))) want.push(q); };
+      addS(cur); addS(seatAt(this.turn - 1)); for (let n = 0; n < 10 && want.length < 3; n++) addS(seats[(this.nameRR++) % 10]);
+      const cands = this.pool.poolHeroes.filter(h => !named.has(h)).concat([null]);
+      for (const q of want) { const k = seatKey(q), r = readHeroName(img, q[0], q[1], cands, 29, { x: q[0] === 'L' ? 50 : 181, y: 7, r: 5 });
+        const [sc, h] = r[0], lead = sc - (r[1] ? r[1][0] : -1);
+        /* 棋盘上这张卡已经暗了(被拿走)→ 0.40 就信;卡还亮着 → 名字要 ≥0.50, 或 ≥0.40 且领先第二名 ≥0.15 才信。
+           实测:候选里恰好没有真答案时(池子读漏), "蝙蝠骑士"会被认成字形相近的"混沌骑士" 0.44;认对的名字 0.46~0.62 */
+        const cardDark = h && ob.takenHeroes.includes(h);
+        const okName = h && (cardDark ? (sc >= 0.40 && lead >= 0.10) : ((sc >= 0.50 && lead >= 0.10) || (sc >= 0.40 && lead >= 0.15)));   // 卡还亮着:分数够高, 或者领先得够多(认错那次领先只有 0.10)
+        if (okName) { const e = this.nameRun[k]; this.nameRun[k] = e && e.h === h ? { h, n: e.n + 1, t: e.t } : { h, n: 1, t: F }; } else delete this.nameRun[k];
+        if (!(this.nameRun[k] && this.nameRun[k].n >= 2)) continue;
+        const nh = this.nameRun[k].h, t0 = this.nameRun[k].t; this.nameHero[k] = nh; delete this.nameRun[k];
+        const o = this.heroOf[nh];
+        for (const x of Object.keys(this.heroOf)) if (x !== nh && same(this.heroOf[x], q)) { delete this.heroOf[x]; this.orphan['hero:' + x] = true;   // 这个座位原来按推算放的别的英雄:让出来, 交给按时间顺序重排
+          this.log.push(['hero', x, '', `让出 ${pq(q)}:面板名字显示 ${pq(q)} 是 ${cn(nh)}`]); }
+        this.heroOf[nh] = q.slice(); this.known.add('hero:' + nh); delete this.orphan['hero:' + nh];
+        if (!(this.firstT || {})['hero:' + nh]) { this.pickT = this.pickT || {}; this.pickT['hero:' + nh] = t0; }   // 棋盘卡没看出变暗:用第一次读到名字的时刻当落子时刻
+        this.log.push(['hero', nh, pq(q), o ? (same(o, q) ? `面板名字确认(${sc.toFixed(2)})` : `面板名字改判(原 ${pq(o)}, ${sc.toFixed(2)})`) : `面板名字认出(棋盘卡没看出变暗, ${sc.toFixed(2)})`]); } }
+    /* E. 撤销:确认过的技能连续 6 次清清楚楚"没变"才撤(被选走的东西不会回来, 撤只可能是之前认错) */
+    for (const k of Object.keys(this.owner)) if (!ob.taken[k] && !(this.forced && this.forced[k])) { this.log.push(['skill', k, pq(this.owner[k]), 'retract']); delete this.owner[k]; this.known.delete(k); }
+    for (const h of Object.keys(this.heroOf)) if (!ob.takenHeroes.includes(h) && !Object.values(this.nameHero || {}).includes(h)) { this.log.push(['hero', h, pq(this.heroOf[h]), 'retract']); delete this.heroOf[h]; this.known.delete('hero:' + h); }
+    for (const k of Object.keys(this.suspect)) if (!ob.taken[k]) { delete this.suspect[k]; this.known.delete(k); }
+  }
+  update(img) {
+    if (!this.ref) this.reset(img); this.frameNo++;
+    const ob = this.observe(img), pid = p => p.side + (p.idx + 1), pq = q => q[0] + (q[1] + 1), same = (a, b) => a[0] === b[0] && a[1] === b[1];
+    this.attribute(img, ob, pq, same);
+    this.prev = ob; return this.state(ob);
+  }
+  /* 给引擎的局面:**只算配对确认过的**。光棋盘变暗、还在等面板配对的不算(一两帧内就会配上);被判"不是落子"的暗图标不算;
+     认不出图标的那一手占住那个人的名额(占位 key '?pick', 引擎不评它但会扣掉那个座位一个空槽)。 */
+  state(ob) {
+    const pk = this.pickedKeys(); const unk = this.unknownBy || [];
+    const panels = ob.panels.map(p => { const q = [p.side, p.idx]; let hero = null; for (const h in this.heroOf) if (this.heroOf[h][0] === q[0] && this.heroOf[h][1] === q[1]) hero = h;
+      const sk = Object.keys(this.owner).filter(k => this.owner[k][0] === q[0] && this.owner[k][1] === q[1]).map(k => ({ key: k }));
+      for (const u of unk) if (u[0] === q[0] && u[1] === q[1]) sk.push({ key: '?pick' });
+      return { side: p.side, idx: p.idx, hero, skills: sk, filled: p.filled }; });
+    const takenHeroes = Object.keys(this.heroOf).concat(Object.keys(this.orphan || {}).filter(k => k.startsWith('hero:')).map(k => k.slice(5)));
+    return { pool_heroes: this.pool.poolHeroes, skills: this.pool.skills.map(r => ({ key: r.key, taken: pk.has(r.key), ultslot: !!r.ultslot })), taken_heroes: takenHeroes, panels,
+      extraPicks: unk.length, pendingPair: Object.keys(this.pend || {}).length, suspects: Object.keys(this.suspect || {}), turn: this.turn,
+      current: { side: ob.current[0], idx: ob.current[1] }, me: { side: ob.me[0], idx: ob.me[1] }, my_turn: ob.current[0] === ob.me[0] && ob.current[1] === ob.me[1], boxes: this.boxesNow, align: this.pool.align,
+      pending: ob.pending || Object.keys(this.pend || {}).length > 0 || Object.keys(this.surSince || {}).length > 0, bulkMsg: ob.bulkMsg, flakyMsg: ob.flakyMsg, occluded: ob.occluded, rawDark: ob.rawDark }; }
+  /* 引擎看到的"已被拿走" = 配对确认的 + 正在等面板配对的(一两帧内就会确认, 先算上免得局面来回变);被判"不是落子"的不算 */
+  /* 另外:追踪中亲眼看到从亮变暗、但没配上面板的暗格(不当落子)也算"已被拿走"—— 棋盘"被选走"的判定现在很可靠(遮挡会判"看不清"),
+     不算进去引擎就可能推荐一件已经没了的技能。锁池时就暗着的(例如本来就很暗的"感染")照旧不算。 */
+  /* 鼠标所在的那一格(框四周各放宽 15%);cursor 由 worker 每帧给出, 全分辨率坐标 */
+  hoverKey(boxes) { const c = this.cursor; if (!c || !boxes) return null; const inside = b => { const m = b[2] * 0.15; return c[0] >= b[0] - m && c[0] <= b[0] + b[2] + m && c[1] >= b[1] - m && c[1] <= b[1] + b[3] + m; };
+    for (const r of this.pool.skills) if (boxes[r.cell] && inside(boxes[r.cell])) return r.key;
+    for (const hb of this.pool.heroBoxes) if (boxes[hb.cell] && inside(boxes[hb.cell])) return 'hero:' + hb.hero;
+    return null; }
+  pickedKeys() { return new Set(Object.keys(this.owner).concat(Object.keys(this.pend || {}), Object.keys(this.suspect || {}).filter(k => this.solidDark(k)))); }
+  /* "实打实被选走了":追踪中看到它从亮变暗(不是锁池时就暗着的), 之后**连续 6 次**都是"被选走"的样子, 而且不是会闪的格子。
+     赛前准备阶段有格子每半秒明暗一次、鼠标提示框会瞬间盖黑一片 —— 这些连续暗不到 6 次, 不会被当成落子 */
+  solidDark(k) { const t = (this.firstT || {})[k]; return t != null && t > (this.lockFrame || 1) && (this.darkRun[k] || 0) >= 6 && !this.flaky[k]; }
+  /* 当前完整认定(每确认一手写一行日志, 事后能逐手对照真实阵容) */
+  snapshotLine() { const seats = []; for (const side of ['L', 'R']) for (let i = 0; i < 5; i++) { const q = [side, i];
+      const h = Object.keys(this.heroOf).find(x => this.heroOf[x][0] === side && this.heroOf[x][1] === i);
+      const sk = Object.keys(this.owner).filter(k => this.owner[k][0] === side && this.owner[k][1] === i).map(cn);
+      const u = (this.unknownBy || []).filter(x => x[0] === side && x[1] === i).length; for (let j = 0; j < u; j++) sk.push('(没认出)');
+      seats.push(`${side}${i + 1}:${h ? cn(h) : '-'}|${sk.join('/') || '-'}`); }
+    return seats.join('  '); }
+}
+module.exports = { _scoreCell: (img, b) => scoreAll(cellVec(img, b)), init, rescale, SCALE: () => SC, readPool, alignBoard, takenFlags, refBrightness, readPanels, matchSkill, calibratePanels, readHeroName, quickPresence, quickSig, boardSig, fastDark, sigDiff, cellBright, cellStats, isDarkCell, Tracker, cn, OWNER: () => OWNER, LAYOUT: () => LAYOUT };

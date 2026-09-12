@@ -1,0 +1,19 @@
+{
+  "name": "ad-assistant",
+  "productName": "ADAssistant",
+  "version": "1.16.0",
+  "description": "Dota 2 Ability Draft pick assistant: screen capture + model win-rate overlay",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-packager . ADAssistant --platform=win32 --arch=x64 --out=dist --overwrite --asar=false --prune=true --ignore='^/dist' --ignore='^/test($|/)' --ignore='^/test_.*' --ignore='^/prof\\.js' --ignore='^/old($|/)' --ignore='^/data/lib\\.bin$' --ignore='^/tools($|/)' --ignore='\\.v0[0-9]$' --ignore='\\.bak$'"
+  },
+  "devDependencies": {
+    "electron": "31.7.7",
+    "@electron/packager": "18.3.6"
+  },
+  "dependencies": {
+    "pngjs": "7.0.0"
+  }
+}
