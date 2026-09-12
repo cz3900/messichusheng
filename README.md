@@ -147,6 +147,7 @@ node test/restart.js           # 验证一手只算一次
 - [docs/attribution.md](docs/attribution.md) —— 归属层的全部步骤、门槛和它们各自治的是什么病
 - [docs/performance.md](docs/performance.md) —— 双通道、重算触发条件、引擎线程、延迟构成
 - [docs/testing.md](docs/testing.md) —— 模拟器、真机基准、以及为什么合成测试会骗人
+- [docs/design-2.0.md](docs/design-2.0.md) —— **2.0 设计**：为什么当前架构注定要一直打补丁，以及替代方案
 - [CHANGELOG.md](CHANGELOG.md) —— 每个版本修的是哪个真机问题
 
 ---
