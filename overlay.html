@@ -22,7 +22,7 @@ function badge(x,y,r,n,col){ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.fillS
  ctx.lineWidth=2;ctx.strokeStyle=col;ctx.stroke();ctx.fillStyle=col;ctx.font=`bold ${Math.round(r*1.35)}px "Segoe UI",system-ui`;
  ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(String(n),x,y+1);}
 function drawPlayers(){
- if(!lastState||lastState.phase!=='active'||lastState.idle)return;
+ if(cfg.showPlayerScores===false||!lastState||lastState.phase!=='active'||lastState.idle)return;
  for(const p of lastState.playerScores||[]){
   const [x,y,w,h]=p.box.map(v=>v/scale),unit=h/176,fs=Math.max(9,12*unit),pad=6*unit;
   ctx.fillStyle='rgba(0,0,0,.84)';ctx.fillRect(x,y,w,h);
@@ -42,7 +42,7 @@ function drawPlayers(){
   line(`技能${p.skillCount}/4${p.unknown?' 待认':''}`,undefined,7);
  }
 }
-function draw(){ctx.clearRect(0,0,cv.width,cv.height);if(cfg.hidden)return;
+function draw(){ctx.clearRect(0,0,cv.width,cv.height);if(cfg.hidden||(cfg.phase&&cfg.phase!=='active'))return;
  drawPlayers();if(!lastState||lastState.phase!=='active'||lastState.idle||!adv||!adv.rows)return;
  adv.rows.forEach((r,i)=>{if(!r.box)return;const [x,y,w,h]=r.box.map(v=>v/scale);
   const txt=(100*r.p).toFixed(1)+(r.d>=0?' +':' ')+(100*r.d).toFixed(1);
