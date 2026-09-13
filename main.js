@@ -32,8 +32,8 @@ function makeTrayIcon() { const { PNG } = require("pngjs"); const p = new PNG({ 
    不需要显示时画空内容即可,一个全透明窗口几乎不花钱。 */
 function createOverlay() {
   const d = screen.getPrimaryDisplay(); const b = d.bounds;
-  /* 覆盖上方 85%：第五位玩家的评分条位于昵称与技能之间，底部约在 83%。 */
-  const ovH = Math.round(b.height * 0.85);
+  /* 覆盖上方 90%：第五位玩家旁的竖向评分明细底部约在 89%。 */
+  const ovH = Math.round(b.height * 0.9);
   overlay = new BrowserWindow({ x: b.x, y: b.y, width: b.width, height: ovH, frame: false, transparent: true, alwaysOnTop: true, skipTaskbar: true, hasShadow: false, resizable: false, focusable: false, show: false, paintWhenInitiallyHidden: true,
     webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true, nodeIntegration: false, backgroundThrottling: false } });
   overlay.setAlwaysOnTop(true, "screen-saver"); overlay.setIgnoreMouseEvents(true); overlay.setContentProtection(true);   // 不出现在截屏里;不要 forward:true

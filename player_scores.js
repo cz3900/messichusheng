@@ -28,9 +28,13 @@ function createPlayerScorer() {
     const score = win.ADScore.evaluate(seats);
     return rows.map((row, i) => {
       const p = layout.panels[row.side], r = layout.res[1] / 1440;
-      // 第五人的条带也位于覆盖窗的上方 85% 内；与英雄名、技能图标错开。
-      const box = [p.x0 + (row.side === "L" ? 140 * r : 0), p.y_top + row.idx * p.pitch + 78 * r, 280 * r, 26 * r];
-      return { ...row, total: seats[i].length ? score.seats[i].total : null, box };
+      // 放在面板朝棋盘的一侧，避开英雄、昵称和技能图标。
+      const width = 112 * r;
+      const box = [row.side === "L" ? p.x0 + 429 * r : p.x0 - width - 10 * r,
+        p.y_top + row.idx * p.pitch + 12 * r, width, 176 * r];
+      const v = score.seats[i], hasItems = seats[i].length > 0;
+      const parts = hasItems ? { main: v.main2, synergy: v.syn2, team: v.cross, counter: v.ctr } : null;
+      return { ...row, total: hasItems ? v.total : null, parts, box };
     });
   };
 }

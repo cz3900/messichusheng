@@ -21,7 +21,7 @@ for (const name of files) {
     for (const row of rows) {
       assert.ok(row.total === null || Number.isFinite(row.total));
       assert.ok(row.box[0] >= 0 && row.box[0] + row.box[2] <= head.res[0]);
-      assert.ok(row.box[1] + row.box[3] <= head.res[1] * .85);
+      assert.ok(row.box[1] + row.box[3] <= head.res[1] * .9);
       const panel = state.panels.find(p => p.side === row.side && p.idx === row.idx);
       if (!panel?.hero && !panel?.skills?.length) assert.equal(row.total, null);
     }

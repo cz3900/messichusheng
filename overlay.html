@@ -24,12 +24,22 @@ function badge(x,y,r,n,col){ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.fillS
 function drawPlayers(){
  if(!lastState||lastState.phase!=='active'||lastState.idle)return;
  for(const p of lastState.playerScores||[]){
-  const [x,y,w,h]=p.box.map(v=>v/scale),fs=Math.max(10,Math.min(14,h*0.55));
-  const value=p.total==null?'—':(p.total>=0?'+':'')+p.total.toFixed(2);
-  const txt=`组合 ${value} · 英雄${p.heroKnown?'✓':'—'} 技能${p.skillCount}/4${p.unknown?' · 待识别':''}`;
-  ctx.fillStyle='rgba(0,0,0,.82)';ctx.fillRect(x,y,w,h);
-  ctx.fillStyle=p.unknown?'#ffd76a':'#dce8f2';ctx.font=`bold ${fs}px "Microsoft YaHei",system-ui`;
-  ctx.textAlign='left';ctx.textBaseline='middle';ctx.fillText(txt,x+5,y+h/2,w-10);
+  const [x,y,w,h]=p.box.map(v=>v/scale),unit=h/176,fs=Math.max(9,12*unit),pad=6*unit;
+  ctx.fillStyle='rgba(0,0,0,.84)';ctx.fillRect(x,y,w,h);
+  ctx.font=`bold ${fs}px "Microsoft YaHei",system-ui`;ctx.textBaseline='middle';
+  const line=(label,value,index)=>{
+   const yy=y+(16+index*20)*unit;
+   ctx.textAlign='left';ctx.fillStyle='#dce8f2';ctx.fillText(label,x+pad,yy,w-2*pad);
+   if(value===undefined)return;
+   const n=value==null?null:Math.round(value*100)/100;
+   ctx.fillStyle=n>0?'#7ee0a8':n<0?'#ff8585':'#dce8f2';ctx.textAlign='right';
+   ctx.fillText(n==null?'—':(n>0?'+':'')+n.toFixed(2),x+w-pad,yy,w*.53);
+  };
+  line('组合明细',undefined,0);
+  for(const [i,label,key] of [[1,'基础','main'],[2,'配合','synergy'],[3,'队友','team'],[4,'克制','counter']])line(label,p.parts?.[key]??null,i);
+  line('合计',p.total,5);
+  line(`英雄${p.heroKnown?'✓':'—'}`,undefined,6);
+  line(`技能${p.skillCount}/4${p.unknown?' 待认':''}`,undefined,7);
  }
 }
 function draw(){ctx.clearRect(0,0,cv.width,cv.height);if(cfg.hidden)return;
