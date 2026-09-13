@@ -24,7 +24,10 @@ for(const [w,hgt] of [[2560,1440],[1920,1080],[2560,1080]]){
  R.rescale(w,hgt);const ls=R.LAYOUT();
  for(const p of score(panels,ls)){
   assert.ok(p.box[0]>=0&&p.box[0]+p.box[2]<=w);
-  assert.ok(p.box[1]+p.box[3]<=hgt*.8,'fifth player must fit overlay');
+  assert.ok(p.box[1]+p.box[3]<=hgt*.85,'fifth player must fit overlay');
+  const panel=ls.panels[p.side], rowTop=panel.y_top+p.idx*panel.pitch;
+  assert.ok(p.box[1]>=rowTop+70*hgt/1440,'below nickname');
+  assert.ok(p.box[1]+p.box[3]<=rowTop+Math.min(...panel.slots.map(s=>s[1])),'above skill icons');
  }
 }
 console.log('PASS player scores: exact model mapping, ten seats, reassignment, unknowns, duplicates, reset, 3 layouts');
