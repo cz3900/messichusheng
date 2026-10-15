@@ -11,7 +11,7 @@ app.commandLine.appendSwitch("force_high_performance_gpu");
 let overlay = null, tray = null, worker = null, timer = null, snapOnce = false, uploader = null, panelWin = null;
 const overlayState = require("./overlay_state.js").create();
 const ADFrames = require("./frames.js");   // 推荐框配色/范围/粗细(和覆盖层、设置面板共用)
-const HOTKEY = { "隐藏/显示": "F6", "切换显示模式": "F8", "暂停/继续": "F9", "重新识别": "F10", "团队/个人优先": "F7" };   // 实际注册成功的键(可能退让到 Alt+F8 等)
+const HOTKEY = { "隐藏/显示": "F6", "切换显示模式": "F8", "暂停/继续": "F9", "恢复本局": "F10", "团队/个人优先": "F7" };   // 实际注册成功的键(可能退让到 Alt+F8 等)
 /* 两个**互相独立**的开关:
      test —— 运行模式。只管截图和日志的详细程度, 不改变任何判断逻辑。任何版本都能切。
      core —— 状态估计内核, "1x"(稳定) 或 "v2"(试验)。只管谁来判断"被拿走了没有 / 归谁"。
@@ -323,6 +323,17 @@ async function grabLegacy(full) {
   return { w: sz.width, h: sz.height, buf: buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.length), bgra: true };
 }
 let workerRestarts = [], quitting = false, workerMsgAt = 0;
+let manualRecovery = false, recoveryNotice = "";
+function draftAction(type, source) {
+  if (cfg.paused || liveWaiting || stoppingRecognition || !worker || quitting) {
+    recoveryNotice = cfg.paused ? "识别已暂停，请先继续识别" : "识别线程尚未就绪，请等待游戏连接后重试";
+    log("key", recoveryNotice); sendPanel(); return false;
+  }
+  try { worker.postMessage({ type }); }
+  catch (e) { recoveryNotice = "请求未送达，保留现状，请稍后重试"; log("error", recoveryNotice + ": " + e.message); sendPanel(); return false; }
+  if (type === "recover") { setHidden(false, source); sync(); }
+  needFull = true; log("key", `${source}: ${type}`); return true;
+}
 function startWorker() {
   if (liveWaiting || quitting || worker) return;
   if(stoppingRecognition)return;
@@ -342,7 +353,10 @@ function startWorker() {
         const p = new PNG({ width: m.w, height: m.h, deflateLevel: 1 }); p.data = Buffer.from(m.raw);
         fs.writeFileSync(f, PNG.sync.write(p, { deflateLevel: 1 })); log("snap", `已存 ${path.basename(f)} (${m.why}, ${m.w}x${m.h})`);
       } catch (e) { log("snap", "存失败 " + e); } }); return; }
-    if (m.type === "state") { const near = !!(m.idle && m.board && m.near); if (near !== recognitionNotice) { recognitionNotice = near; setVisible(phase === "active"); } if (m.phase && m.phase !== phase) { phase = m.phase; uploader.onPhase(phase); setVisible(phase === "active"); sendCfg(); }
+    if (m.type === "state") { const recoveryChanged = manualRecovery !== !!m.manualRecovery || recoveryNotice !== (m.notice || "");
+      manualRecovery = !!m.manualRecovery; recoveryNotice = m.notice || "";
+      if (recoveryChanged) { sendPanel(); tray && tray.setContextMenu(buildMenu()); }
+      const near = !!(m.idle && m.board && m.near); if (near !== recognitionNotice) { recognitionNotice = near; setVisible(phase === "active"); } if (m.phase && m.phase !== phase) { phase = m.phase; uploader.onPhase(phase); setVisible(phase === "active"); sendCfg(); }
       if (!m.idle) { const ms = m.me ? `${m.me.side === "L" ? "左" : "右"}${m.me.idx + 1}` : null; if (ms !== meShown) { meShown = ms; tray && tray.setContextMenu(buildMenu()); } }
       if (!!m.board !== boardSeen) boardSeen = !!m.board;
       const st = m.idle ? `idle 亮${m.pres && m.pres.bright} 暗${m.pres && m.pres.dark}` : `active 当前${m.current.side}${m.current.idx + 1} 我${m.me ? m.me.side + (m.me.idx + 1) + (m.meSource === "manual" ? "(手动)" : "") : "未确定"}`; if (st !== lastStatus) { lastStatus = st; tray && tray.setToolTip(`AD 选技助手 v${VERSION}${cfg.hidden ? " · 已隐藏" : ""} · ${st}`); sendPanel(); } }
@@ -399,6 +413,7 @@ function openPanel() {
 }
 function sendPanel() { if (!panelWin || panelWin.isDestroyed()) return;
   panelWin.webContents.send("panel", { all: cfg.all, paused: cfg.paused, hidden: cfg.hidden, showPlayerScores: cfg.showPlayerScores, plevel: cfg.plevel, plname: PLN[cfg.plevel], version: VERSION, phase, hotkey: HOTKEY,
+    manualRecovery, recoveryNotice,
     test: cfg.test, core: cfg.core, meSeat: cfg.meSeat, look: settings.look, uploadLogs: settings.uploadLogs, arrive: !!settings.arrive, aimode: AIModes.normalize(settings.aimode), combo: { K: settings.comboK || 8, R: settings.comboR || 16, sec: settings.comboSec || 8, refine: settings.comboRefine !== false }, allowCapture: settings.allowCapture, live: liveInfo(), meShown, status: lastStatus, upd: updater.state(), gpuPrio, shareOpt: !!settings.shareOpt }); }
 ipcMain.on("panel-ready", () => sendPanel());
 ipcMain.on("panel-set", (e, m) => { if (!m || typeof m !== "object") return; const { k, v } = m;
@@ -419,7 +434,8 @@ ipcMain.on("panel-set", (e, m) => { if (!m || typeof m !== "object") return; con
   log("panel", `设置面板改 ${k}=${k === "look" ? JSON.stringify(settings.look) : v}`); sync();
   if (k === "hidden") tray.setToolTip(`AD 选技助手 v${VERSION}${cfg.hidden ? " · 已隐藏" : ""} · ${lastStatus}`); });
 ipcMain.on("panel-act", (e, m) => { const name = m && m.name;
-  if (name === "reset") { log("key", "面板: 重新识别"); worker && worker.postMessage({ type: "reset" }); }
+  if (name === "recover" || name === "auto-end") draftAction(name, "面板");
+  else if (name === "reset") draftAction("relock", "面板");
   else if (name === "snap") { snapOnce = true; log("key", "面板: 保存截图"); }
   else if (name === "logs") shell.openPath(LOGDIR);
   else if (name === "upload") uploader.now();
@@ -443,7 +459,9 @@ function buildMenu() { return Menu.buildFromTemplate([
   { label: "个人权重(只影响你自己的回合)" + kk("团队/个人优先"), enabled: false },
   ...PLN.map((n, i) => ({ label: n + ["  (现在的算法)", "  (每手最多让队伍少 1 个百分点)", "  (最多少 2.5 个百分点)", "  (最多少 5 个百分点)"][i], type: "radio", checked: cfg.plevel === i, click: () => { cfg.plevel = i; sync(); } })),
   { label: (cfg.paused ? "▶ 继续" : "⏸ 暂停") + kk("暂停/继续"), click: () => { cfg.paused = !cfg.paused; sync(); } },
-  { label: "重新识别池子(一般不需要)" + kk("重新识别"), click: () => { log("key", "菜单: 重新识别"); worker && worker.postMessage({ type: "reset" }); } },
+  { label: "恢复本局（保留池子）" + kk("恢复本局"), click: () => draftAction("recover", "菜单") },
+  { label: "恢复自动结束判断", enabled: manualRecovery, click: () => draftAction("auto-end", "菜单") },
+  { label: "重新识别池子(一般不需要)", click: () => draftAction("relock", "菜单") },
   { type: "separator" },
   { label: "运行模式(只影响截图和日志, 不改判断)", enabled: false },
   { label: "正式模式  (截图只在关键时刻)", type: "radio", checked: !cfg.test, click: () => { cfg.test = false; sync(); } },
@@ -520,7 +538,7 @@ app.whenReady().then(() => {
   reg(["F8", "Alt+F8", "CommandOrControl+Alt+F8"], () => { cfg.all = !cfg.all; sync(); }, "切换显示模式");
   reg(["F9", "Alt+F9", "CommandOrControl+Alt+F9"], () => { cfg.paused = !cfg.paused; sync(); }, "暂停/继续");
   reg(["F7", "Alt+F7", "CommandOrControl+Alt+F7"], () => { cfg.plevel = (cfg.plevel + 1) % 4; sync(); }, "团队/个人优先");
-  reg(["F10", "Alt+F10", "CommandOrControl+Alt+F10"], () => { log("key", "重新识别"); worker && worker.postMessage({ type: "reset" }); }, "重新识别");
+  reg(["F10", "Alt+F10", "CommandOrControl+Alt+F10"], () => draftAction("recover", "hotkey"), "恢复本局");
   reg(["F11", "Alt+F11", "CommandOrControl+Alt+F11"], () => { cfg.test = !cfg.test; sync(); }, "正式/测试模式");
   reg(["F12", "Alt+F12", "CommandOrControl+Alt+F12"], () => { cfg.core = cfg.core === "v2" ? "1x" : "v2"; sync(); }, "切换内核");
   tray.setContextMenu(buildMenu());

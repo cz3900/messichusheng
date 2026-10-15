@@ -551,6 +551,27 @@ function matchSkillRaw(img, box, cands) {
   for (let i = 0; i < LIB.keys.length; i++) { if (s[i] > b1) { b2 = b1; k2 = k1; b1 = s[i]; k1 = LIB.keys[i]; } else if (s[i] > b2) { b2 = s[i]; k2 = LIB.keys[i]; } }
   return { key: k1, s1: b1, key2: k2, s2: b2 };
 }
+// Manual recovery ignores end-stage text, but must still see this pool's icons.
+// Late drafts can prove the board through confirmed panel ownership instead of
+// needing forty unpicked cells. Correlation is normalized against brightness.
+function recoveryEvidence(img, tracker) {
+  const skills = tracker.pool.skills.filter(s => s.key && !s.unknown), keys = skills.map(s => s.key);
+  const rows = new Set(); let hits = 0;
+  const candidates = skills.filter(s => tracker.boxesNow[s.cell]).map(s => ({s,mean:cellStats(img, tracker.boxesNow[s.cell]).mean})).sort((a,b)=>b.mean-a.mean).slice(0,12);
+  for (const {s} of candidates) {
+    const r = matchSkillRaw(img, tracker.boxesNow[s.cell], keys);
+    if (r.key === s.key && r.s1 >= .55 && r.s1 - r.s2 >= .05) { hits++; rows.add(Math.floor(s.cell / 6)); }
+    if (hits >= 3 && rows.size >= 2) return true;
+  }
+  const seen = new Set(), seats = new Set();
+  for (const p of readPanels(img, false)) for (let i=0;i<p.slotBoxes.length;i++) {
+    if (!p.skills[i]) continue;
+    const r = matchSkillRaw(img, p.slotBoxes[i], keys), q = tracker.owner[r.key];
+    if (q && q[0] === p.side && q[1] === p.idx && r.s1 >= .55 && r.s1-r.s2 >= .05) { seen.add(r.key); seats.add(p.side+p.idx); }
+    if (seen.size >= 3 && seats.size >= 2) return true;
+  }
+  return false;
+}
 /* 本人面板的亮绿框(v1.22)。游戏给本人面板画一圈亮绿线, 最清楚的是**英雄头像那一侧**的竖边(L 面板左边、R 面板右边)。
    以前的"我"量的是上下两条 + 技能那一侧, 那三条边上根本没有这条线 —— 10 个面板绿度最高只有 6~11, 从来没过 25 的门槛,
    于是一直拿锁池第一帧"最绿"的面板当自己:2560 碰巧常对;1080p 每次都落到 R2(09-14 那局本人是 R5, 整局推荐都给了别人)。
@@ -1058,4 +1079,4 @@ class Tracker {
       seats.push(`${side}${i + 1}:${h ? cn(h) : '-'}|${sk.join('/') || '-'}`); }
     return seats.join('  '); }
 }
-module.exports = { GEO: () => GEO, boxesFor, setSource, cellState, iconScore, skillVerdict, maskedVec, selfScore, heroVerdict, slotFilled, slotSignal, cellVec, _scoreCell: (img, b) => scoreAll(cellVec(img, b)), init, rescale, SCALE: () => SC, readPool, alignBoard, takenFlags, refBrightness, readPanels, matchSkill, calibratePanels, readHeroName, quickPresence, draftBoardEvidence, pickedCount, quickSig, boardSig, fastDark, sigDiff, cellBright, cellStats, isDarkCell, Tracker, cn, OWNER: () => OWNER, LAYOUT: () => LAYOUT };
+module.exports = { GEO: () => GEO, boxesFor, setSource, cellState, iconScore, skillVerdict, maskedVec, selfScore, heroVerdict, slotFilled, slotSignal, cellVec, _scoreCell: (img, b) => scoreAll(cellVec(img, b)), init, rescale, SCALE: () => SC, readPool, alignBoard, takenFlags, refBrightness, readPanels, matchSkill, calibratePanels, readHeroName, quickPresence, draftBoardEvidence, recoveryEvidence, pickedCount, quickSig, boardSig, fastDark, sigDiff, cellBright, cellStats, isDarkCell, Tracker, cn, OWNER: () => OWNER, LAYOUT: () => LAYOUT };

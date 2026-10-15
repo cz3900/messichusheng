@@ -86,9 +86,9 @@ async function send(id, advance=1000, extra={}) {
   assert.equal(get('lastNd'),19);
   // Validate the real success boundary too: a stable board + twelve heroes + margin.
   candidate={...tracker,pool:{...tracker.pool,align:{}},reset:()=>({heroes:12,minMargin:.1,nd:60,darkCells:0,ratio:1}),updateMe(){}};
-  alignment=60;
+  alignment=60;get("lifecycle.manual=true");
   await handle({type:'reset'});await send('D78');assert.equal(get('tracker'),tracker,'one unstable lock sample cannot replace a pool');
-  await handle({type:'reset'});await send('D78');assert.equal(get('tracker'),candidate);
+  await handle({type:'reset'});await send('D78');assert.equal(get('tracker'),candidate);assert.equal(get('lifecycle.manual'),false,'accepted pool clears the manual override');
   assert.equal(get('draftComplete'),false);assert.equal(state().advicePaused,false);
   console.log('PASS: actual worker: 52-count retained, scan paused, two-frame recovery, occlusion recovery, strategy scoring, game-only hide, failed lock retains pool');
 })().catch(e=>{console.error(e);process.exitCode=1;});

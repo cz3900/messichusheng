@@ -76,7 +76,9 @@ button.go{background:#8a6a1f;border-color:#d4a73c;color:#fff;font-weight:bold}bu
 </section>
 
 <section><h2>运行</h2>
- <div class="row"><label class="k">识别</label><button id="b-pause"></button><button id="b-reset">重新识别池子</button><span class="note">一般不需要重新识别</span></div>
+ <div class="row"><label class="k">识别</label><button id="b-pause"></button><button id="b-recover">恢复本局（保留池子）</button></div>
+ <div class="row"><label class="k"></label><button id="b-auto-end">恢复自动结束判断</button><button id="b-reset">重新识别池子</button></div>
+ <div class="note" id="recovery-note">误判结束时点“恢复本局”或按 F10；完整复核后恢复推荐，并暂停自动结束判断。下一局前请恢复自动判断或重新识别池子。</div>
  <div class="row"><label class="k">运行模式</label><div class="seg"><button id="t-off">正式</button><button id="t-on">🔬 测试(自动截图+细日志)</button></div></div>
  <div class="row"><label class="k">状态估计内核</label><div class="seg"><button id="v-1x">1.x 稳定</button><button id="v-v2">2.0 试验</button></div></div>
  <div class="row"><label class="k">日志</label><label class="sw"><input type="checkbox" id="c-up">打完一局自动上传日志(帮作者排查问题)</label></div>
@@ -119,6 +121,8 @@ function render(m){S=m;look=ADFrames.norm(m.look);
  for(const k of ["c1","c2","c3","mid"])$("k-"+k).value=look[k];
  $("k-midN").value=look.midN;$("k-rest").checked=look.showRest;$("k-thick").value=look.thick;$("k-thick-v").textContent=look.thick.toFixed(1)+"×";
  $("b-pause").textContent=m.paused?"▶ 已暂停 — 点击继续":"⏸ 运行中 — 点击暂停";$("b-pause").className=m.paused?"":"on";
+ $("b-auto-end").disabled=!m.manualRecovery;
+ $("recovery-note").textContent=m.recoveryNotice||(m.manualRecovery?"人工恢复中：自动结束判断已暂停。下一局前请恢复自动判断或重新识别池子。":"误判结束时点“恢复本局”或按 F10；保留原池，完整复核后恢复推荐。");
  $("t-off").className=m.test?"":"on";$("t-on").className=m.test?"on":"";
  $("v-1x").className=m.core==="v2"?"":"on";$("v-v2").className=m.core==="v2"?"on":"";
  $("c-up").checked=!!m.uploadLogs;$("c-live").checked=!!m.allowCapture;
@@ -146,6 +150,7 @@ $("c-share").onchange=e=>panel.set("shareOpt",e.target.checked);
 $("c-arr").onchange=e=>panel.set("arrive",e.target.checked);
 $("s-me").onchange=e=>panel.set("meSeat",e.target.value);
 $("b-pause").onclick=()=>panel.set("paused",!S.paused);$("b-reset").onclick=()=>panel.act("reset");
+$("b-recover").onclick=()=>panel.act("recover");$("b-auto-end").onclick=()=>panel.act("auto-end");
 $("t-off").onclick=()=>panel.set("test",false);$("t-on").onclick=()=>panel.set("test",true);
 $("v-1x").onclick=()=>panel.set("core","1x");$("v-v2").onclick=()=>panel.set("core","v2");
 $("c-up").onchange=e=>panel.set("uploadLogs",e.target.checked);$("c-live").onchange=e=>panel.set("allowCapture",e.target.checked);

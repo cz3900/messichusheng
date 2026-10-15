@@ -5,7 +5,7 @@
      快通道(扫描帧, 几毫秒) —— 只量 60 格亮度找"谁被选走了"。恰好多黑 1 格 = 有人落子 ⇒ 立刻记账 + 立刻给下一位算胜率(不等高亮移过来)。
                                  多黑 ≥2 格 = 多半是鼠标悬停的提示框盖住了一片 ⇒ 不认, 要一张全图确认。
      慢通道(全分辨率, 数百毫秒) —— 完整识别:对齐、面板技能、英雄名、当前选人/我, 用来纠正快通道的记账。
-   开局自动:棋盘出现 → 读池子 → 12 英雄齐就锁定, 不需要按键。中途加入/误按 F10 也能重锁(黑格用库亮度回退)。 */
+   开局自动:棋盘出现 → 读池子 → 12 英雄齐就锁定, 不需要按键。中途加入也能在设置中重新识别池子(黑格用库亮度回退)。 */
 const { parentPort } = require("worker_threads"); const fs = require("fs"), path = require("path");
 const AIModes = require("./ai_modes.js");
 const DraftState = require("./draft_lifecycle.js"), DraftScene = require("./draft_scene.js");
@@ -100,7 +100,7 @@ const TR_CAP = +(process.env.AD_TRACE_CAP || 40) * 1024 * 1024;   // 单局上�
 const needV2 = () => CORE === "v2" || TESTMODE;                   // 2.0 要不要跑(驱动输出, 或并行对照)
 function trStart(t, img, samePool) {
   const write = TRDIR && process.env.AD_TRACE !== "0";
-  const keep = samePool && EST;   // 同一池子重锁(F10 / 画面抖动):2.0 的证据必须带过来, 否则整局的累计全丢
+  const keep = samePool && EST;   // 同一池子重锁(菜单 / 画面抖动):2.0 的证据必须带过来, 否则整局的累计全丢
   if (!write && !needV2()) { EST = null; return; }                // 既不写盘也不需要 2.0 → 完全不用记录器
   try { const f = write ? path.join(TRDIR, `trace_${new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14)}.jsonl`) : null;
     const old = EST; REC = new TR.Recorder(f); const head = REC.head(t, [img.w, img.h], FULL_ORDER); trBytes = 0;
@@ -188,10 +188,12 @@ function tryLock(img, pres) {
 }
 function cancelComputations(reason = "state-reset", resetSearch = true) {
   seq++; SCREEN_RUN++; SCREEN = null; lastSig = null; turnLock = null;
-  if (POOL) POOL.cancel();
-  if (COMBO_W) { COMBO_W.postMessage({ type: "cancel", reason }); if(resetSearch)COMBO_W.postMessage({ type: "cfg", resetSearch: true }); }
+  lastAdvice = null; curCtx = null;
+  try { if (POOL) POOL.cancel(); } catch (e) { POOL = null; log("error", "取消推演失败，停用线程池: " + e.message); }
+  try { if (COMBO_W) { COMBO_W.postMessage({ type: "cancel", reason }); if(resetSearch)COMBO_W.postMessage({ type: "cfg", resetSearch: true }); } }
+  catch (e) { COMBO_OFF = "broken"; log("error", "取消计算失败，停用本次计算: " + e.message); }
 }
-function goIdle(why) { cancelComputations("idle: "+why); if (COMBO_OFF === "slow") COMBO_OFF = ""; trFlush(); if (phase !== "idle") log("phase", "→ idle: " + why); if (POOL) POOL.cancel(); phase = "idle"; lastNd = 0; lockSig = null; lastQuick = null; cachedState = null; lastS = null; fastDarkPrev = null; seq++;
+function goIdle(why) { cancelComputations("idle: "+why); if (COMBO_OFF === "slow") COMBO_OFF = ""; trFlush(); if (phase !== "idle") log("phase", "→ idle: " + why); phase = "idle"; lastNd = 0; lockSig = null; lastQuick = null; cachedState = null; lastS = null; fastDarkPrev = null; seq++;
   parentPort.postMessage({ type: "clear" }); want(false); }
 /* Pause computation independently of session/display lifetime. Never discard the locked pool here. */
 function holdDraft(mode, reason) {
@@ -201,9 +203,25 @@ function holdDraft(mode, reason) {
   cachedState = { ...previous, type: "state", phase, idle: false, board: true, poolOk: !!tracker,
     taken: previous.taken == null ? Math.max(0, lastTaken) : previous.taken, ms: previous.ms || 0,
     current: previous.current || { side: "L", idx: 0 }, me: previous.me || null,
-    playerScores: previous.playerScores || [], draftStage: mode, advicePaused: true, notice: reason };
+    playerScores: previous.playerScores || [], draftStage: mode, advicePaused: true, manualRecovery: lifecycle.manual,
+    notice: (lifecycle.manual ? "人工恢复 · " : "") + reason + "（评分为上次确认）" };
   parentPort.postMessage(cachedState);
   const now = Date.now(); if (now - lastHoldFull >= 900) { lastHoldFull = now; want(true); }
+}
+let recoverySize = null, recoverySample = null, recoveryImage = "", recoveryTime = -Infinity;
+function recoverDraft() {
+  if (!tracker) { log("key", "尚无本局池子，等待首次识别"); forceReset = true; retryAt = 0;
+    parentPort.postMessage({type:"state",phase,idle:true,board:false,manualRecovery:false,notice:"尚无本局池子，等待首次识别"}); want(true); return; }
+  // Repeated presses cannot reset a successful review or accumulate work.
+  if (lifecycle.manual) { if (cachedState) parentPort.postMessage(cachedState); want(true); return; }
+  cancelComputations("manual-recovery"); lifecycle.recover();
+  recoverySize = tracker.ref ? [tracker.ref.w, tracker.ref.h] : DISP && DISP.slice();
+  recoverySample = null; recoveryImage = ""; recoveryTime = -Infinity; draftComplete = false; completedFrames = 0;
+  forceReset = false; retryAt = 0; dropRun = 0; lastQuick = null; lastS = null;
+  fastPicks.clear(); fastCand = null; fastDarkPrev = null; pendingNext = true;
+  lastSeat = -1; pickedAtCur = false;
+  holdDraft("review", lifecycle.reason); want(true);
+  log("key", "人工恢复本局：保留原池和归属，自动结束判断已暂停");
 }
 function resumeDraft() {
   if (!draftHoldMode) return;
@@ -262,7 +280,8 @@ let COMBO_W = null, COMBO_ID = 0, COMBO_R_EFF = null, COMBO_OFF = "";
 const COMBO_CB = new Map();
 const COMBO_READY = new Map();
 function comboWorker() {
-  if (COMBO_W || COMBO_OFF === "broken") return COMBO_W;
+  if (COMBO_OFF === "broken") return null;
+  if (COMBO_W) return COMBO_W;
   try { const { Worker } = require("worker_threads");
     COMBO_W = new Worker(path.join(D, "..", "combo_worker.js"), { workerData: { model: path.join(D, COMBO_NET + ".onnx"), modelTeam: path.join(D, COMBO_NET_TEAM + ".onnx"), prefer: process.env.AD_COMBO_EP || "", diagnosticFile: TRDIR ? path.join(TRDIR, `diag_combo_${Date.now()}.jsonl`) : null } });
     const launchedCombo = COMBO_W;
@@ -733,10 +752,17 @@ parentPort.on("message", async m => {
     const child=COMBO_W;if(!child){parentPort.postMessage({type:"shutdown-ready"});return;}
     let replied=false;const done=()=>{if(!replied){replied=true;parentPort.postMessage({type:"shutdown-ready"});}};
     child.once("exit",done);child.on("message",msg=>{if(msg.type==="shutdown-ready")child.terminate().then(done,e=>parentPort.postMessage({type:"shutdown-error",msg:String(e)}));else if(msg.type==="shutdown-error")parentPort.postMessage(msg);});
-    child.postMessage({type:"shutdown",reason:m.reason});return; }
+    try { child.postMessage({type:"shutdown",reason:m.reason}); }
+    catch (e) { parentPort.postMessage({type:"shutdown-error",msg:"计算线程未确认排空: "+String(e)}); }
+    return; }
   if(shuttingDown)return;
   if (m.type === "visibility") { if (suppressAdvice !== !!m.hidden) { suppressAdvice = !!m.hidden; cancelComputations("visibility: "+suppressAdvice,false); if (!suppressAdvice) { lastQuick = null; pendingNext = true; want(true); log("advice", "恢复显示: 下一帧完整复核并重新计算"); } } return; }
-  if (m.type === "reset") { log("key", "收到重新识别(F10/菜单): 下一帧重锁池子"); forceReset = true; presentRun = 0; retryAt = 0; want(true); return; }
+  if (m.type === "recover" || (m.type === "reset" && ["strategy", "away", "full"].includes(lifecycle.mode))) { recoverDraft(); return; }
+  if (m.type === "auto-end") { cancelComputations("auto-end"); lifecycle.reset(); lifecycle.review("已恢复自动结束判断，等待完整复核"); draftComplete = false; lastSceneImage = ""; lastSceneCheck = 0; lastQuick = null; pendingNext = true;
+    if (tracker) holdDraft("review", lifecycle.reason); want(true); return; }
+  if (m.type === "reset" || m.type === "relock") { log("key", "收到重新识别池子: 下一帧尝试重锁，成功前保留原池");
+    if (tracker) { lifecycle.review("正在重新识别池子，成功前保留原池"); lifecycle.vote = null; holdDraft("review", lifecycle.reason); }
+    forceReset = true; presentRun = 0; retryAt = 0; want(true); return; }
   if (m.type === "logdir") { TRDIR = m.dir;
     const wd = require("./crash_diagnostics.js").create(path.join(TRDIR, `diag_recognition_${Date.now()}.jsonl`), { rotate: true, context: () => ({ mode: AIMODE, shareMode: SHARE_MODE, phase, busy, lastTaken, comboPending: COMBO_CB.size, comboDisabled: COMBO_OFF }) }); wd.start();
     process.on("uncaughtExceptionMonitor", e => wd.record("uncaught-exception", { stack: String(e && e.stack || e) }, true)); process.on("unhandledRejection", e => { wd.record("unhandled-rejection", { stack: String(e && e.stack || e) }, true); log("error", "识别线程异步异常 " + String(e && e.stack || e)); }); process.on("exit", code => wd.record("worker-exit", { code }, true)); return; }
@@ -752,17 +778,37 @@ parentPort.on("message", async m => {
     if (t !== TESTMODE || c !== CORE) { const was = needV2(); TESTMODE = t; CORE = c;
       log("cfg", `运行模式=${TESTMODE ? "🔬 测试(点位全截图 + 两版并行对照)" : "正式"} 状态估计内核=${CORE === "v2" ? "2.0(试验)" : "1.x(稳定)"}`);
       /* 本来不需要 2.0、现在需要了 → 只能等下一次锁池才有观测源;反过来留着也无妨 */
-      if (!was && needV2() && tracker) log("cfg", "2.0 需要从锁池那一刻开始累计证据 → 按 F10 重新识别池子即可让它接上"); } }
+      if (!was && needV2() && tracker) log("cfg", "2.0 需要从锁池那一刻开始累计证据 → 在设置中点“重新识别池子”即可让它接上"); } }
+  let rollback = null;
   try {
+    const bytes = m.buf && m.buf.byteLength;
+    if (!Number.isInteger(m.w) || !Number.isInteger(m.h) || m.w <= 0 || m.h <= 0 ||
+        !Number.isSafeInteger(m.w * m.h * 4) || bytes !== m.w * m.h * 4) throw new Error("截图尺寸或像素长度无效，保留本局等待下一帧");
     const img = { w: m.w, h: m.h, data: new Uint8Array(m.buf) };
+    if (img.data.byteLength !== bytes) throw new Error("截图像素格式无效，保留本局等待下一帧");
     if (tracker) tracker.cursor = m.cursor || null;   // 鼠标位置(全分辨率坐标), 悬停那格当"看不清"
     if (m.bgra) for (let i = 0; i < img.data.length; i += 4) { const t = img.data[i]; img.data[i] = img.data[i + 2]; img.data[i + 2] = t; }
     if (m.snap) snapshot(img, "manual");
     const isFull = !!m.full;
+    if (lifecycle.manual && !forceReset && tracker && isFull && recoverySize && (img.w !== recoverySize[0] || img.h !== recoverySize[1])) {
+      lifecycle.review(`分辨率已改变，请恢复到 ${recoverySize.join("×")} 或重新识别池子`); holdDraft("review", lifecycle.reason); return;
+    }
     if (isFull && (!DISP || DISP[0] !== img.w || DISP[1] !== img.h)) {   // 分辨率变了(或主进程没报过)→ 按实际帧重新缩放
-      DISP = [img.w, img.h]; const r = R.rescale(img.w, img.h); trStop(); tracker = null; phase = "idle"; 
+      DISP = [img.w, img.h]; const r = R.rescale(img.w, img.h);
+      if (!lifecycle.manual) { trStop(); tracker = null; phase = "idle"; }
       log("disp", `按全分辨率帧重设版式 ${img.w}x${img.h} 比例 ${r.scale.toFixed(4)}${r.sixteenNine ? "" : " ⚠ 非 16:9"}`); }
     const now = m.capturedAt == null ? Date.now() : m.capturedAt; let scene = { stage: "unknown" };
+    if (!Number.isFinite(now)) throw new Error("截图时间无效，保留本局等待下一帧");
+    if (lifecycle.manual && !forceReset) {
+      const digest = isFull ? createHash("sha256").update(img.data).digest("hex") : "";
+      if (m.frozenFrames >= 8) lifecycle.review("截图已冻结，等待新的完整画面");
+      if (!isFull || m.frozenFrames >= 8 || now <= recoveryTime || (m.captureId != null && m.captureId === recoverySample) || digest === recoveryImage) {
+        if (lifecycle.advicePaused) holdDraft(lifecycle.mode, lifecycle.reason);
+        else if (cachedState) parentPort.postMessage({ ...cachedState, skipped: true });
+        if (Date.now() - lastHoldFull >= 900) { lastHoldFull = Date.now(); want(true); } return;
+      }
+      recoverySample = m.captureId; recoveryImage = digest; recoveryTime = now;
+    }
     if (isFull && now - lastSceneCheck >= 700 && !(m.frozenFrames >= 8)) {
       lastSceneCheck = now;
       const digest = createHash("sha256").update(img.data).digest("hex");
@@ -771,16 +817,21 @@ parentPort.on("message", async m => {
         lifecycle.observeScene(scene, now, m.captureId == null ? frames : m.captureId);
       }
     }
-    if (tracker && lifecycle.mode === "away") {
+    if (tracker && !forceReset && lifecycle.mode === "away") {
       draftComplete = true;
       if (phase !== "idle") goIdle("已确认进入游戏，保留本局资料");
       if (now - lastHoldFull >= 1500) { lastHoldFull = now; want(true); }
       parentPort.postMessage({ type: "state", phase, idle: true, board: false }); return;
     }
-    if (tracker && lifecycle.mode === "strategy") {
+    if (tracker && !forceReset && lifecycle.mode === "strategy") {
       draftComplete = true; holdDraft("strategy", lifecycle.reason); return;
     }
     const pres = R.quickPresence(img);
+    let originalPoolVisible = false;
+    if (lifecycle.manual && !forceReset && tracker && isFull) {
+      originalPoolVisible = R.recoveryEvidence(img, tracker);
+      if (!originalPoolVisible) { lifecycle.review("未确认原池图标，保留本局等待复核"); holdDraft("review", lifecycle.reason); return; }
+    }
     if (tracker && draftComplete && scene.stage === "drafting") {
       const next = R.boardSig(img, tracker.boxesNow), prev = tracker.lastBoardSig || [];
       let up = 0; for (let i = 0; i < 60 && i < next.length && i < prev.length; i++) if (next[i] - prev[i] > 25) up++;
@@ -795,7 +846,7 @@ parentPort.on("message", async m => {
     }
     /* 锁池前要求严(格子间隙必须暗, 免得在别的界面上乱锁);已经锁上之后只要格子还亮着就认为棋盘还在 ——
        实测有一次格子 59 亮却因 间隙0.37 被判"没有棋盘"而退出追踪(多半是有面板压住了格子之间的缝) */
-    const boardLike = scene.stage === "drafting" || (phase === "active"
+    const boardLike = originalPoolVisible || scene.stage === "drafting" || (phase === "active"
       ? (pres.bright + pres.dark >= 50 && pres.bright >= 8)
       : (pres.bright >= 8 && pres.bright + pres.dark >= 50 && pres.gapDark >= 0.75));
     if (frames % 120 === 1) log("stat", `帧${frames} 完整识别${heavy}次均${heavy ? Math.round(tHeavy / heavy) : 0}ms 快扫${scans}次均${scans ? (tScan / scans).toFixed(1) : 0}ms 阶段${phase} 亮格${pres.bright} 暗格${pres.dark} 间隙${pres.gapDark.toFixed(2)} 帧宽${img.w}`);
@@ -818,7 +869,7 @@ parentPort.on("message", async m => {
     if (phase === "idle" && !forceReset && Date.now() < retryAt) { parentPort.postMessage({ type: "state", phase, idle: true, pres, board: false }); return; }
     if (!isFull) { want(true); parentPort.postMessage({ type: "state", phase, idle: true, pres, board: true, near: lastNd >= 40 }); return; }   // 需要全图才能继续
     /* A candidate new pool must lock successfully before replacing the old one. */
-    if (phase === "active" && lastTaken >= 4 && pres.dark <= 2 && pres.dark <= lastTaken - 4) dropRun++; else dropRun = 0;
+    if (!lifecycle.manual && phase === "active" && lastTaken >= 4 && pres.dark <= 2 && pres.dark <= lastTaken - 4) dropRun++; else dropRun = 0;
     if (dropRun >= 3) { log("phase", "疑似新局开局，先确认新池再替换旧池"); forceReset = true; presentRun = 2; retryAt = 0; dropRun = 0; }
     if (phase === "idle" || forceReset) {
       if (tracker && !forceReset) {
@@ -860,6 +911,7 @@ parentPort.on("message", async m => {
       if (fl >= 3) { const adj = R.calibratePanels(img, tracker.pool.skills.filter(x => !x.unknown).map(x => x.key)); lastCal = frames;
         log("cal", `技能槽贴框: 左 ${adj.L.join(",")} 右 ${adj.R.join(",")}`); } }
     const t0 = Date.now(); let S, src = null;
+    if (lifecycle.manual) rollback = require("./draft_checkpoint.js").checkpoint(tracker);
     if (REC && (!REC.file || trBytes < TR_CAP)) {   // 上限只约束写盘;只在内存里跑(给 2.0 当观测源)时不受限
       try { src = REC.capture(img, tracker); S = tracker.update(img); }
       finally { R.setSource(null); }
@@ -880,6 +932,10 @@ parentPort.on("message", async m => {
       trBytes = REC.bytes;
       if (REC.file && trBytes >= TR_CAP) { log("trace", `轨迹到达 ${(TR_CAP / 1048576).toFixed(0)}MB 上限, 停止写盘`); REC.file = null; } }
     else S = tracker.update(img);
+    if (lifecycle.manual && (!S || !Array.isArray(S.skills) || !Array.isArray(S.taken_heroes) || !Array.isArray(S.panels) || S.panels.length !== 10 ||
+        !S.current || !["L", "R"].includes(S.current.side) || !Number.isInteger(S.current.idx) || S.current.idx < 0 || S.current.idx > 4)) throw new Error("恢复复核返回了无效局面");
+    if (rollback && (S.offScreen || S.offMsg || !Number.isInteger(R.pickedCount(S)) || R.pickedCount(S) < 0 || R.pickedCount(S) > 50)) { rollback(); rollback = null; }
+    else rollback = null;
     const ms = Date.now() - t0; heavy++; tHeavy += ms;
     if (tracker.meMsg) { log("me", tracker.meMsg); tracker.meMsg = null; }
     /* 快通道判定的落子, 完整识别要连续 2 帧 + 面板配对才确认(1~2 秒)。这段时间里局面如果把它时有时无, 推荐的计算会被打断重来 ——
@@ -934,11 +990,16 @@ parentPort.on("message", async m => {
     syncShareMode(S.me);
     cachedState = { type: "state", playerScores: safeScore(S.panels, R.LAYOUT()), phase, ms, my_turn: S.my_turn, current: S.current, me: S.me, meSource: tracker.meManual ? "manual" : tracker.meAuto ? "auto" : null, align: S.align, taken: nTaken, poolOk: S.pool_heroes.length === 12, pre: pickedAtCur, nextIsMe: pickedAtCur && effIsMe, board: true };
     cachedState.draftStage = "drafting"; cachedState.advicePaused = false;
+    cachedState.manualRecovery = lifecycle.manual;
+    cachedState.notice = lifecycle.manual ? "人工恢复中 · 自动结束判断已暂停" : "";
     lastGoodState = cachedState;
     parentPort.postMessage(cachedState);
     try { turnTick(S, startIdx, nTaken); } catch (e) { log("error", "回合账本出错(不影响推荐): " + String(e && e.message || e)); }
     if (S.pool_heroes.length === 12) chooseAdvice(S, startIdx, pickedAtCur, null);
-  } catch (e) { log("error", String(e && e.stack || e)); parentPort.postMessage({ type: "error", msg: String(e && e.stack || e) }); }
+  } catch (e) { if (rollback) rollback();
+    log("error", String(e && e.stack || e));
+    if (tracker && (!draftComplete || lifecycle.manual)) { lifecycle.review("本帧识别失败，保留原池等待复核"); holdDraft("review", lifecycle.reason); }
+    parentPort.postMessage({ type: "error", msg: String(e && e.stack || e) }); }
   finally { busy = false; }
 });
 parentPort.postMessage({ type: "ready" });

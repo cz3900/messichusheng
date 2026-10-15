@@ -18,12 +18,16 @@ class DraftLifecycle {
     this.mode = "drafting"; this.scene = "unknown"; this.cue = "unknown";
     this.vote = null; this.lastSample = null; this.full = null; this.good = null;
     this.reason = "";
+    this.manual = false;
   }
+  recover() { this.reset(); this.manual = true; return this.review("人工恢复本局，等待两帧完整复核"); }
   observeScene(evidence, now, sample) {
     if (sample === this.lastSample) return this.mode;
     this.lastSample = sample;
     const stage = evidence.stage || "unknown";
     this.cue = stage;
+    // User override lasts until explicitly released or a new pool is accepted.
+    if (this.manual) { this.vote = null; return this.mode; }
     if (stage === "unknown") { this.vote = null; return this.mode; }
     if (stage === "drafting") {
       // A real choice prompt vetoes a conflicting roster/count immediately.
@@ -43,7 +47,7 @@ class DraftLifecycle {
   review(reason) { this.mode = "review"; this.reason = reason; this.good = null; this.full = null; return this.mode; }
   observeState(S, count, now) {
     if (this.mode === "strategy" || this.mode === "away") return this.mode;
-    if (!Number.isFinite(count) || count > 50) return this.review("选技账目复核中，保留本局信息");
+    if (!Number.isInteger(count) || count < 0 || count > 50) return this.review("选技账目复核中，保留本局信息");
     if (S.offScreen || S.offMsg) return this.review("画面暂时遮挡，等待恢复");
     if (this.mode === "review") {
       if (!this.good) this.good = { at: now, n: 0 };
@@ -51,7 +55,7 @@ class DraftLifecycle {
       if (this.good.n < 2 || now - this.good.at < 800) return this.mode;
       this.mode = "drafting"; this.good = null;
     }
-    if (fullRoster(S) && this.cue !== "drafting") {
+    if (!this.manual && fullRoster(S) && this.cue !== "drafting") {
       if (!this.full) this.full = { at: now, n: 0 };
       this.full.n++;
       if (this.full.n >= 3 && now - this.full.at >= 1500) {
