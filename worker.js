@@ -7,6 +7,7 @@
      慢通道(全分辨率, 数百毫秒) —— 完整识别:对齐、面板技能、英雄名、当前选人/我, 用来纠正快通道的记账。
    开局自动:棋盘出现 → 读池子 → 12 英雄齐就锁定, 不需要按键。中途加入/误按 F10 也能重锁(黑格用库亮度回退)。 */
 const { parentPort } = require("worker_threads"); const fs = require("fs"), path = require("path");
+const AIModes = require("./ai_modes.js");
 const R = require("./recog.js"); const D = path.join(__dirname, "data");
 const TR = require("./trace.js");   // 观测轨迹:把每帧**看到了什么**写下来, 真机对局才能离线回放
 const V2 = require("./v2.js");      // 2.0 状态估计(证据累加 + 带容量指派), 由内核开关决定用不用
@@ -70,7 +71,9 @@ function buildState(S, startIdx) {
   const cur = order.length ? order[0] : FULL_ORDER[Math.min(startIdx, FULL_ORDER.length - 1)];
   st.order = order; st.step = 0; return { st, cur };
 }
+function treeState(S, index) { const { st } = buildState(S, index); st.order = FULL_ORDER.slice(0, index).concat(st.order); st.step = index; return st; }
 /* ---- 状态 ---- */
+let draftComplete = false, completedFrames = 0;
 let phase = "idle", tracker = null, seq = 0, busy = false;
 let lastSig = null;        // 上次触发引擎的局面签名(有效座位/已选走/归属)
 let lastQuick = null;      // 上次完整识别那一帧的画面签名
@@ -134,7 +137,7 @@ function poolSummary(t) { const by = {}; let orphan = 0;
   return t.pool.poolHeroes.map(h => `${R.cn(h)}[${(by[h] || []).join("/")}]`).join(" ") + (extra.length ? `  | 其它大招格: ${extra.join(" / ")}` : ""); }
 function reject(img, why, snap) { rejects++; const wait = rejects <= 12 ? 1.5 : 5;   // 选技界面是淡入的, 头十几次失败很正常, 一直快速重试;别再指数退避到几十秒
   retryAt = Date.now() + wait * 1000; presentRun = 1;
-  log("pool", `拒绝(第 ${rejects} 次): ${why}; ${wait}s 后再试`); if (snap && rejects <= 2) snapshot(img, "reject");
+  log("pool", `拒绝(第 ${rejects} 次): ${why}; ${wait}s 后再试; frame=${img.w}x${img.h} phase=${phase} hidden=${suppressAdvice}`); if ((snap && rejects <= 2) || rejects === 1 || rejects === 8) snapshot(img, "reject");
   if (forceReset) { forceReset = false; log("pool", tracker ? "重锁失败, 沿用原池子继续追踪" : "重锁失败"); } return false; }
 function tryLock(img, pres) {
   /* 先便宜地对齐(允许参数搜索):检出格不够就别做 60 格 × 513 图标的匹配了 —— 主菜单误判成棋盘时省下 1.5 s CPU */
@@ -162,23 +165,28 @@ function tryLock(img, pres) {
   catch (e) { log("error", "锁池诊断日志出错 " + e.message); }
   if (!ok) return reject(img, `英雄 ${q.heroes} 行裕度 ${q.minMargin.toFixed(3)}`, true);
   const old = tracker; rejects = 0;
-  if (old && old.pool && old.pool.poolHeroes.slice().sort().join() === t.pool.poolHeroes.slice().sort().join()) {   // 同一局重锁:把已经认出的归属带过来
+  const samePool = !!(!draftComplete && old && old.pool && old.pool.poolHeroes.slice().sort().join() === t.pool.poolHeroes.slice().sort().join());
+  if (samePool) {   // 同一局重锁:把已经认出的归属带过来；结束后即使池子相同也不能继承上一局
     t.owner = old.owner; t.heroOf = old.heroOf; t.firstT = old.firstT; t.pickT = old.pickT; t.frameNo = old.frameNo; t.lockFrame = old.lockFrame;   /* 帧号接着走, 否则旧落子的时间比新落子还大, 按时间排座位会乱 */
     /* 归属过程的其余状态也要带上:以前只带了归属结果, "哪些格已处理过"丢了 → 已归属的技能被当成新变暗的格子重走一遍、判成"不当落子";
        面板计数从头数 → 第一帧按"开局已在面板里"重记一遍、回合数被重置 */
-    for (const f of ["known", "suspect", "pend", "unknownBy", "orphan", "forced", "pc", "pcRaw", "pcRun", "pcInit", "surSince", "turn", "flaky", "flips", "hold", "nameHero", "nameRun", "icoRef", "heroRef"]) if (old[f] !== undefined) t[f] = old[f]; t.log = old.log.slice(); t.meSeat = old.meSeat; t.meVotes = old.meVotes; t.meAuto = old.meAuto; t.curSeat = old.curSeat; t.stable = old.stable; t.darkRun = old.darkRun; t.brightRun = old.brightRun; t.bhist = old.bhist; t.nameSize = old.nameSize;
+    for (const f of ["known", "suspect", "pend", "unknownBy", "orphan", "forced", "pc", "pcRaw", "pcRun", "pcInit", "surSince", "turn", "flaky", "flips", "hold", "nameHero", "nameRun", "icoRef", "heroRef", "joinedMidDraft"]) if (old[f] !== undefined) t[f] = old[f]; t.log = old.log.slice(); t.meSeat = old.meSeat; t.meVotes = old.meVotes; t.meAuto = old.meAuto; t.curSeat = old.curSeat; t.stable = old.stable; t.darkRun = old.darkRun; t.brightRun = old.brightRun; t.bhist = old.bhist; t.nameSize = old.nameSize;
     log("pool", `同一池子重锁, 保留归属 ${Object.keys(t.owner).length} 技能 ${Object.keys(t.heroOf).length} 英雄`); }
   else logIdx = 0;
   t.fullOrder = FULL_ORDER; t.orderSeat = n => { const x = FULL_ORDER[Math.max(0, Math.min(n, FULL_ORDER.length - 1))]; return [x < 5 ? "L" : "R", x % 5]; };   // 第 n 手归谁
-  tracker = t; phase = "active"; forceReset = false; lastSig = null; lockSig = null; fastPicks.clear(); lastCal = -999; if (!old || !old.pool || old.pool.poolHeroes.slice().sort().join() !== t.pool.poolHeroes.slice().sort().join()) endSnapped = false; lastQuick = null; lastCur = ""; lastTaken = -1; seq++; pendingNext = true;
+  tracker = t; draftComplete = false; completedFrames = 0; phase = "active"; forceReset = false; lastSig = null; lockSig = null; fastPicks.clear(); lastCal = -999; if (!samePool) endSnapped = false; lastQuick = null; lastCur = ""; lastTaken = -1; seq++; pendingNext = true;
   lastSeat = -1; pickedAtCur = false; lastAdvice = null; curCtx = null; myTurn = null; myEv.clear(); SCREEN = null; lastS = null; turnLock = null; fastDarkPrev = null; sinceFull = 0;
-  const samePool = !!(old && old.pool && old.pool.poolHeroes.slice().sort().join() === t.pool.poolHeroes.slice().sort().join());
   log("pool", "池子: " + poolSummary(t));
   if (REC) { try { REC.save(); } catch (e) { } REC = null; }   // 只收掉轨迹文件, EST 交给 trStart 决定留不留
   trStart(t, img, samePool);
   snapshot(img, q.darkCells > 3 ? "pool_mid" : "pool"); want(true); return true;
 }
-function goIdle(why) { if (COMBO_OFF === "slow") COMBO_OFF = ""; trFlush(); if (phase !== "idle") log("phase", "→ idle: " + why); if (POOL) POOL.cancel(); phase = "idle"; lastNd = 0; lockSig = null; lastQuick = null; cachedState = null; lastS = null; fastDarkPrev = null; seq++;
+function cancelComputations(reason = "state-reset", resetSearch = true) {
+  seq++; SCREEN_RUN++; SCREEN = null; lastSig = null; turnLock = null;
+  if (POOL) POOL.cancel();
+  if (COMBO_W) { COMBO_W.postMessage({ type: "cancel", reason }); if(resetSearch)COMBO_W.postMessage({ type: "cfg", resetSearch: true }); }
+}
+function goIdle(why) { cancelComputations("idle: "+why); if (COMBO_OFF === "slow") COMBO_OFF = ""; trFlush(); if (phase !== "idle") log("phase", "→ idle: " + why); if (POOL) POOL.cancel(); phase = "idle"; lastNd = 0; lockSig = null; lastQuick = null; cachedState = null; lastS = null; fastDarkPrev = null; seq++;
   parentPort.postMessage({ type: "clear" }); want(false); }
 /* ---- 出建议 ---- */
 /* 同一个决策点("这一局的第 j 手")永远用同一套随机数:同一局面必然算出同一结果, 局面有真变化时结果只随变化本身变。
@@ -194,7 +202,7 @@ const ARRIVE_N = 200, ARRIVE_T = +process.env.AI_T || 0.05;
 /* v1.28「网络档」: 自博弈训练出的选技网络(第 550 轮, 对现役 AI 模型口径胜率约 52%)。
    排序改用网络的出手概率;格子上的胜率数字仍是原推演算的(网络自己的估值不准, 不显示)。设置面板「AI 档位」切换, 默认现役。 */
 let NETM = null; const NETNAME = "netB300";   /* 网络档/预估(CPU netinfer)仍用 netB300 */
-const COMBO_NET = "netC300";   /* v1.40 GPU 版推演换 09-24 重训网络(+潜在配合/对面配合输入, 纯直觉对 netB300 胜率 ~52.9%) */ const DEP_NET = Math.exp(-4);
+const COMBO_NET = "netS300";   /* v1.45 份额裁判下自博弈重训 320 轮(runS, 热启动自 runD): 新裁判判 对 runD 51.8%/整局 56.6%; 阵容 ≥4 陡 3.2→1.7%; 之前 v1.42 起用 netC_pf100 */ const COMBO_NET_OLD = "netC_pf100"; const COMBO_NET_TEAM = "netS300";   /* v1.47: 团队裁判下续训的 netT300 过门失败(团队裁判下对 runS 49.44%, z−0.024±0.007), 团队模式继续用 netS300, 只换推演打分口径 */   /* v1.42 GPU 版推演网络换成新打分(逐对修正)下续训 100 轮的 netC_pf100(新打分判 对 netC300 真实池 +0.021z); v1.40 起用 netC300 */ const DEP_NET = Math.exp(-4);
 function netModel() { if (NETM === null) { try { NETM = require(path.join(D, "..", "netinfer.js")).create(path.join(D, NETNAME)); log("engine", "网络档模型已载入(" + NETNAME + ")"); }
   catch (e) { NETM = false; log("error", "网络档模型载入失败, 退回现役排序: " + String(e && e.message || e)); } } return NETM || null; }
 function netProbs(st, cur, t) {
@@ -230,45 +238,66 @@ function netProbs(st, cur, t) {
 /* v1.29「组合版」: 本机显卡跑(combo_worker.js)。K/R/每手上限可调;超时自动把 R 减半, R=8 还超时或显卡用不了 → 这一局退回网络档。 */
 let COMBO_W = null, COMBO_ID = 0, COMBO_R_EFF = null, COMBO_OFF = "";
 const COMBO_CB = new Map();
+const COMBO_READY = new Map();
 function comboWorker() {
   if (COMBO_W || COMBO_OFF === "broken") return COMBO_W;
   try { const { Worker } = require("worker_threads");
-    COMBO_W = new Worker(path.join(D, "..", "combo_worker.js"), { workerData: { model: path.join(D, COMBO_NET + ".onnx"), prefer: process.env.AD_COMBO_EP || "" } });
+    COMBO_W = new Worker(path.join(D, "..", "combo_worker.js"), { workerData: { model: path.join(D, COMBO_NET + ".onnx"), modelTeam: path.join(D, COMBO_NET_TEAM + ".onnx"), prefer: process.env.AD_COMBO_EP || "", diagnosticFile: TRDIR ? path.join(TRDIR, `diag_combo_${Date.now()}.jsonl`) : null } });
+    const launchedCombo = COMBO_W;
+    launchedCombo.on("exit", code => { log("crash", `计算线程退出 code=${code} pending=${COMBO_CB.size} mode=${AIMODE} share=${SHARE_MODE}`); if (COMBO_W !== launchedCombo) return; COMBO_OFF = "broken"; COMBO_W = null; for (const cb of COMBO_CB.values()) cb({ type: "err", msg: "计算线程退出 " + code }); COMBO_CB.clear(); COMBO_READY.clear(); });
+    COMBO_W.postMessage({ type: "cfg", shareMode: SHARE_MODE });
     COMBO_W.on("message", m => {
+      if (m.type === "duelready") { const cb = COMBO_READY.get(m.id); if (cb) cb(m); return; }
+      if (m.type === "log") { log(m.tag || "engine", m.msg); return; }   // v1.47 组合版线程的日志(换网络等)
       if (m.type === "warm") { if (m.err) log("error", "组合版预热失败: " + m.err); else { COMBO_MED = m.info.med; const t = comboTier();
           log("engine", `组合版预热 ${m.info.ep}${m.info.dev != null ? " 显卡" + m.info.dev : ""} 固定批${m.info.bfix} 用时${m.ms}ms: ${m.info.detail}`);
           log("engine", `显卡测速: 每次 ${m.info.bfix} 局 ${COMBO_MED}ms → ${t.name}档(后台筛选 全部×${t.R1}→前${t.N2}×${t.R2}, 轮到时决赛前5×32${COMBO_CFG.refine ? ", 之后准确局面全部重算更新一次" : ""})`); } return; }
-      const cb = COMBO_CB.get(m.id); if (cb) { COMBO_CB.delete(m.id); cb(m); } });
-    COMBO_W.postMessage({ type: "warm", bfix: COMBO_CFG.K * COMBO_CFG.R });
-    COMBO_W.on("error", e => { log("error", "组合版线程崩了, 退回网络档: " + String(e && e.message || e)); COMBO_OFF = "broken"; COMBO_W = null; for (const cb of COMBO_CB.values()) cb({ type: "err", msg: "线程崩溃" }); COMBO_CB.clear(); });
+      const cb = COMBO_CB.get(m.id); if (cb) { COMBO_CB.delete(m.id); COMBO_READY.delete(m.id); cb(m); } });
+    COMBO_W.postMessage({ type: "warm", bfix: AIModes.isDuel(AIMODE) ? 32 : COMBO_CFG.K * COMBO_CFG.R });
+    COMBO_W.on("error", e => { log("error", "组合版线程崩了, 退回网络档: " + String(e && e.message || e)); COMBO_OFF = "broken"; COMBO_W = null; for (const cb of COMBO_CB.values()) cb({ type: "err", msg: "线程崩溃" }); COMBO_CB.clear(); COMBO_READY.clear(); });
   } catch (e) { log("error", "组合版线程起不来, 退回网络档: " + String(e && e.message || e)); COMBO_OFF = "broken"; COMBO_W = null; }
   return COMBO_W;
 }
 /* 一次组合版的耗时构成(日志用): 推进几手 × 每手一次网络(批 bfix) */
 const comboBreak = r => r && r.calls != null ? `推进${r.steps}手 调网络${r.calls}次(批${r.bfix}) 每次首${r.first}/中位${r.med}/最慢${r.max}ms | 打包${r.tBuild} 运行${r.tRun} 编码${r.tEnc} 抽样落子${r.tAp}ms${r.nPass ? ` | 空过${r.nPass}手(有人没得可选)` : ""}` : "";
+function comboContext() { return {stamp:seq,screenRun:SCREEN_RUN,highlight:lastS?.current,me:lastS?.me,myTurn:lastS?.my_turn,taken:lastS?R.pickedCount(lastS):null,selfPanel:lastS?.me?panelCount(lastS,seatIdx(lastS.me)):null,hidden:suppressAdvice}; }
 function comboRun(st, cur, t0, seed) {
   return new Promise(res => { const w = comboWorker(); if (!w) return res({ type: "err", msg: "组合版不可用" });
     const R = COMBO_R_EFF || COMBO_CFG.R, id = ++COMBO_ID; COMBO_CB.set(id, res);
-    w.postMessage({ type: "job", id, st, cur, t0, K: COMBO_CFG.K, R, bfix: COMBO_CFG.K * COMBO_CFG.R, seed, budget: COMBO_CFG.sec * 1000 }); });
+    w.postMessage({ type: "job", id, st, cur, t0, K: COMBO_CFG.K, R, bfix: COMBO_CFG.K * COMBO_CFG.R, seed, budget: COMBO_CFG.sec * 1000, context:comboContext() }); });
 }
 /* v1.38 新方案(09-23 三局 150 决策点验证, 见 combo_local.js 顶上说明): 任务类型 screen/final/refine, 同一个显卡线程, 新任务取消旧任务 */
 let COMBO_MED = null, SCREEN = null, SCREEN_RUN = 0;
 /* 分档: 预热测出每次 128 局 ≤8ms(4090 这类)算快卡, 后台多算一些; 其余(3060 这类 17ms)按普通档 */
 function comboTier() { if (process.env.AD_COMBO_TIER) { const [a, b, c] = process.env.AD_COMBO_TIER.split(",").map(Number); return { R1: a, N2: b, R2: c, name: "测试" }; }   // 只给回归测试缩小计算量
   return COMBO_MED != null && COMBO_MED <= 8 ? { R1: 16, N2: 10, R2: 32, name: "快卡" } : { R1: 8, N2: 6, R2: 32, name: "普通" }; }
-function comboJob(type, payload, budget) {
+function comboJob(type, payload, budget, onReady = null) {
   return new Promise(res => { const w = comboWorker(); if (!w) return res({ type: "err", msg: "组合版不可用" });
-    const id = ++COMBO_ID; COMBO_CB.set(id, res); w.postMessage({ type, id, bfix: COMBO_CFG.K * COMBO_CFG.R, budget: budget || 0, ...payload }); });
+    const id = ++COMBO_ID; COMBO_CB.set(id, res); if (onReady) COMBO_READY.set(id, onReady); w.postMessage({ type, id, bfix: COMBO_CFG.K * COMBO_CFG.R, budget: budget || 0, context:comboContext(), ...payload }); });
 }
 /* 后台筛选: 别人在选的时候, 从当前真实局面给我下一手(第 slot 手)的全部候选推演。局面每变一次重发(旧的自动取消) */
 function launchScreen(S, slot, ahead, me, seed) {
   const from = slot - ahead, { st } = buildState(S, from), run = ++SCREEN_RUN, t1 = Date.now(), tier = comboTier();
   comboJob("screen", { st: JSON.parse(JSON.stringify(st)), me, t0: from, o: { R1: tier.R1, N2: tier.N2, R2: tier.R2, seed } }, 0).then(m => {
+    if (run !== SCREEN_RUN) return;
     if (m.type !== "done") { log("error", "后台筛选出错: " + String(m.msg).slice(0, 300)); return; }
     if (!m.r || m.cancelled) { if (run === SCREEN_RUN) log("advice", `后台筛选没算出结果(${m.cancelled ? "被新局面取消" : "没有可选的"}) 已算${Date.now() - t1}ms`); return; }
     SCREEN = { slot, from, rows: m.r.rows, ms: m.r.ms, tier: tier.name, done: Date.now() };
+    if (PLAN_ON && AIMODE === "combo-team") launchPlan(st, me, from, slot, m.r.rows, seed + 21);
     log("advice", `后台筛选完成 第${slot + 1}手(从第${from + 1}手的局面, 中间还有${m.r.forceAt}手) ${tier.name}档 全${m.r.rows.length}个×${tier.R1}→前${tier.N2}×${tier.R2} 用时${m.r.ms}ms 调网络${m.r.calls}次 局面去重${m.r.uniq}/${m.r.tot} ${m.ep} | 前8 ${m.r.rows.slice(0, 8).map(x => `${R.cn(x.key)} ${(100 * x.win).toFixed(1)}(${x.n})`).join(" | ")}`);
     evMe(slot, `后台筛选完成(从第${from + 1}手局面, 用时${(m.r.ms / 1000).toFixed(1)}s, 前5 ${m.r.rows.slice(0, 5).map(x => R.cn(x.key)).join("/")})`); });
+}
+/* v1.41 两步计划·后台两步表: 筛选表出来后, 用同一局面算"这一手 X + 回手 Y"各线(细节见 combo_local.js plan)。AD_PLAN=0 关。 */
+const PLAN_ON = process.env.AD_PLAN !== "0";
+function launchPlan(st, me, from, slot, rows, seed) {
+  const generation = SCREEN_RUN;
+  const tier = comboTier(), t1 = Date.now(), RL = tier.name === "测试" ? 4 : tier.name === "快卡" ? 64 : 48;
+  comboJob("plan", { st: JSON.parse(JSON.stringify(st)), me, t0: from, o: { keys: rows.slice(0, 6).map(r => r.key), NX: 6, NY: 4, R: RL, seed } }, 0).then(m => {
+    if (generation !== SCREEN_RUN) return;
+    if (m.type !== "done") { log("error", "两步表出错: " + String(m.msg).slice(0, 300)); return; }
+    if (!m.r || m.cancelled || m.r.timeout) { log("advice", `两步表没算出(${m.cancelled ? "被新局面取消" : m.r === null ? "没有下下手/没有候选" : "超时"}) 已算${Date.now() - t1}ms`); return; }
+    log("advice", `两步表算完 第${slot + 1}手(从第${from + 1}手的局面, 中间${m.r.forceAt}手) ${m.r.lines}条线×${RL}局 用时${m.r.ms}ms 调网络${m.r.calls}次 局面去重${m.r.uniq}/${m.r.tot} ${m.ep} | 前5 ${m.r.rows.slice(0, 5).map(x => `${R.cn(x.x)}→${R.cn(x.y)} ${(100 * x.win).toFixed(1)}`).join(" | ")}`);
+    evMe(slot, `两步表算完(从第${from + 1}手局面, ${m.r.lines}条线, 用时${(m.r.ms / 1000).toFixed(1)}s)`); });
 }
 function arriveNote(S, realIdx, cur, rows, seed0) {
   const { st } = buildState(S, realIdx); const sim0 = AI._simFrom(st);
@@ -295,13 +324,15 @@ function advise(S, startIdx, pre, ms, ahead, lockInfo) {
   const plevel = effIsMe ? PLEVEL : 0, personal = plevel > 0, DELTA = PLEVELS[plevel].delta;   // 个人权重只作用于我自己的回合;队友那几手照旧按团队算
   /* 组合版:预估只用网络档, 真轮到时必须补算组合版 → "是不是预估"也算进局面签名。
      v1.33 及以前不算 → 局面没变就沿用预估的网络档结果, 组合版永远不启动(09-18 日志: 自己回合 45 次里只有 22 次算了组合版) */
-  const sigStr = JSON.stringify([startIdx, takenKeys, plevel, ARRIVE, AIMODE, AIMODE === "combo" ? [COMBO_CFG, pre === "preview"] : 0]);
+  const sigStr = JSON.stringify([startIdx, takenKeys.slice().sort(), plevel, ARRIVE, AIMODE, AIModes.isGpu(AIMODE) ? [COMBO_CFG, pre === "preview"] : 0]);
   if (sigStr === lastSig) {
     /* 同一局面(通常是"提前算"的结果, 现在真轮到他了):沿用结果, 并从这一刻起锁定 */
-    if (lockInfo && curCtx) { curCtx.lockInfo = lockInfo; if (lastAdvice && lastAdvice.stage === "done") turnLock = { ...lockInfo, keys: lastAdvice.rows.slice(0, 10).map(r => r.key) }; }
+    if (lockInfo && curCtx) { curCtx.lockInfo = lockInfo; if (lastAdvice && lastAdvice.stamp === seq && lastAdvice.stage === "done") turnLock = { ...lockInfo, stamp: seq, keys: lastAdvice.rows.slice(0, 10).map(r => r.key) }; }
     if (curCtx && curCtx.pre && !pre) { curCtx.pre = false;
-      if (lastAdvice) { lastAdvice = { ...lastAdvice, pre: false }; parentPort.postMessage(lastAdvice); } log("advice", `轮到 ${effSeat < 5 ? "左" : "右"}${effSeat % 5 + 1} 了, 提前算好的结果直接用`); } return; }
-  lastSig = sigStr; const stamp = ++seq; const ctx = curCtx = { pre, lockInfo }; const { st, cur } = buildState(S, startIdx); const side = cur < 5 ? "L" : "R", sg = side === "L" ? 1 : -1;
+      if (lastAdvice && lastAdvice.stamp === seq) { lastAdvice = { ...lastAdvice, pre: false }; parentPort.postMessage(lastAdvice); } log("advice", `轮到 ${effSeat < 5 ? "左" : "右"}${effSeat % 5 + 1} 了, 继续当前局面的计算`); } return; }
+  if(curCtx?.input) { const old=curCtx.input;log("compute",JSON.stringify({event:"advice-replaced",stamp:curCtx.stamp,nextStamp:seq+1,elapsedMs:Date.now()-curCtx.startedAt,fromStep:old.step,toStep:startIdx,fromPreview:old.preview,toPreview:pre==="preview",fromMode:old.mode,toMode:AIMODE,added:takenKeys.filter(k=>!old.taken.includes(k)).slice(0,8),removed:old.taken.filter(k=>!takenKeys.includes(k)).slice(0,8),highlight:S.current,selfPanel:panelCount(S,seatIdx(S.me))})); }
+  lastSig = sigStr; const stamp = ++seq; const ctx = curCtx = { pre, lockInfo, resultFinal: false,stamp,startedAt:Date.now(),input:{step:startIdx,preview:pre==="preview",mode:AIMODE,taken:takenKeys} }; const { st, cur } = buildState(S, startIdx); const side = cur < 5 ? "L" : "R", sg = side === "L" ? 1 : -1;
+  const gpuPool = st.pool && st.pool.heroKeys.length === 12 && st.pool.basics.length === 36 && st.pool.ults.length === 12 && new Set([...st.pool.heroKeys, ...st.pool.basics, ...st.pool.ults]).size === 60;
   const mySg = S.me.side === "L" ? 1 : -1;   // 数字一律按**我方**视角
   const seed0 = seedFor(startIdx);
   if (lockInfo) log("advice", `${side}${(cur % 5) + 1}${effIsMe ? "(我)" : "(队友)"} 正在选 → 算完即锁定到他落子为止`);
@@ -313,7 +344,7 @@ function advise(S, startIdx, pre, ms, ahead, lockInfo) {
   /* 排序:团队优先 = 按正在选的这一方的胜率;
      个人优先 = 先圈出"胜率不低于最好的 −2 个百分点"的候选, 圈内按个人分(我这一手 + 我之后几手给队伍带来的分), 圈外按胜率排在后面 */
   let NP = null;
-  if (AIMODE === "net" || AIMODE === "combo") { try { const t1 = Date.now(); NP = netProbs(st, cur, startIdx); if (NP) log("advice", `网络档: 网络出手概率已算好 用时${Date.now() - t1}ms`); }
+  if (AIMODE === "net" || AIModes.isGpu(AIMODE)) { try { const t1 = Date.now(); NP = netProbs(st, cur, startIdx); if (NP) log("advice", `网络档: 网络出手概率已算好 用时${Date.now() - t1}ms`); }
     catch (e) { NP = null; log("error", "网络档出错, 这一手退回现役排序: " + String(e && e.stack || e).slice(0, 300)); } }
   let CB = null, comboState = "";      // CB: key → {win, rank};  comboState: ""/"pending"/"done"/说明文字
   const rankRows = rows => { if (CB) { for (const r of rows) { const c = CB[r.key]; r.cw = c ? c.win : null; if (NP) r.np = NP[r.key] || 0; }
@@ -332,15 +363,16 @@ function advise(S, startIdx, pre, ms, ahead, lockInfo) {
      过程中旧显示不动, 顶部只标"更新中"。 */
   const publish = (rows, base, info) => { if (stamp !== seq) return;
     const takenNow = lastS ? new Set(lastS.skills.filter(x => x.taken).map(x => x.key).concat(lastS.taken_heroes)) : new Set();
+    for(const k of fastPicks.keys())takenNow.add(k.startsWith("hero:")?k.slice(5):k);
     const shown = rows.filter(r => !takenNow.has(r.key));   // 发出前再过滤此刻已经被拿走的
-    lastAdvice = { type: "advice", stamp, side, seat: cur, base, stage: "done", n: rows.length, N: rows.length, rows: shown, my_turn: effIsMe, reason: ctx.reason || null, mine: S.me, pre: ctx.pre, ahead, team: ALL, personal: personal && !NP, net: !!NP && !CB, combo: AIMODE === "combo" ? { state: comboState, K: COMBO_CFG.K, R: COMBO_R_EFF || COMBO_CFG.R } : null, plevel, plname: PLEVELS[plevel].name, delta: DELTA };
+    lastAdvice = { type: "advice", stamp, side, seat: cur, base, stage: "done", resultState: ctx.pre === "preview" || !ctx.resultFinal ? "budget" : "final", n: rows.length, N: rows.length, rows: shown, my_turn: effIsMe, reason: ctx.reason || null, mine: S.me, pre: ctx.pre, ahead, team: ALL, personal: personal && !NP, net: !!NP && !CB, combo: AIModes.isGpu(AIMODE) ? { state: comboState, K: COMBO_CFG.K, R: COMBO_R_EFF || COMBO_CFG.R } : null, plevel, plname: PLEVELS[plevel].name, delta: DELTA };
     if (ARRIVE && ctx.pre === "preview" && ahead > 0 && shown.length) { try { const t1 = Date.now(), a = arriveNote(S, startIdx - ahead, cur, shown, seed0);
       if (a) { lastAdvice.arrive = a; const best = a.top.slice().sort((x, y) => y.first - x.first)[0];
         log("advice", `  └ 轮到你时(模拟中间 ${ahead} 手 ×${a.n}): ${a.top.slice(0, 3).map(r => `${r.name} 还在${Math.round(100 * r.alive)}%`).join(" | ")} → 届时最可能的首选 ${best.name}(${Math.round(100 * best.first)}%) 用时${Date.now() - t1}ms`); } }
       catch (e) { log("error", "轮到你时备注出错(不影响推荐): " + String(e && e.stack || e).slice(0, 300)); } }
     parentPort.postMessage(lastAdvice);
     if (effIsMe && CB && ctx.pre !== "preview") { const k = `显示GPU结果(首推 ${shown[0] ? shown[0].name : "-"})`; const a = myEv.get(startIdx) || []; if (!a.some(e => e[1] === k)) evMe(startIdx, k); }
-    if (ctx.lockInfo) turnLock = { ...ctx.lockInfo, keys: shown.slice(0, 10).map(r => r.key) };
+    if (ctx.lockInfo) turnLock = { ...ctx.lockInfo, stamp, keys: shown.slice(0, 10).map(r => r.key) };
     log("advice", `${side}${(cur % 5) + 1} ${ctx.pre === "preview" ? "预估" : ctx.pre ? "下一位" : "在选"} ${effIsMe ? "(我)" : ""}${personal && !NP ? ` [${PLEVELS[plevel].name}·让队伍最多少${100 * DELTA}]` : personal ? " [个人权重在网络档/组合版下不生效]" : ""} 我方 ${(100 * base).toFixed(1)}% ${CB ? "[组合版] " : NP ? "[网络档] " : ""}前三 ${shown.slice(0, 3).map(r => `${r.name}${r.cw != null ? ` 组合${(100 * r.cw).toFixed(1)}%` : NP ? ` 网络${(100 * r.np).toFixed(1)}%` : ""} 我方${(100 * r.p).toFixed(1)}%${personal && r.pm != null ? ` 个${r.pm >= 0 ? "+" : ""}${r.pm.toFixed(1)}` : ""}`).join(" | ")} 候选${rows.length} ${info} 用时${Date.now() - tA}ms`);
     /* 复盘用: 全部候选一行写全(前三以外的分数以前不落日志, 09-22 织网炸弹人局复盘时只能离线重建) */
     log("advice", `  └ 全候选(${shown.length}) ${shown.map(r => `${r.name}${r.cw != null ? ` 组${(100 * r.cw).toFixed(1)}` : ""}${NP ? ` 网${(100 * (r.np || 0)).toFixed(1)}` : ""}${r.p != null ? ` 我${(100 * r.p).toFixed(1)}` : ""}`).join(" | ")}`); };
@@ -348,11 +380,49 @@ function advise(S, startIdx, pre, ms, ahead, lockInfo) {
   const publishKeep = (rows, base, info) => { lastPub = { rows, base, info }; publish(rows, base, info); };
   /* v1.38: GPU 结果一出来就发, 不等 CPU 上的现役推演(以前要等它算完才一起显示: 用户机上多等 2~3 秒, 慢机/忙机整个回合都出不来)。
      现役算完后照常 publishKeep, rankRows 仍按 GPU 胜率排, 只是补上"我方"那一列。 */
-  const cbRows = () => Object.entries(CB).map(([k, c]) => ({ key: k, name: R.cn(k), p: c.win, pick: c.win, d: 0, m: 0, box: boxes[cellOf[k]] || null }));
+  const cbRows = () => Object.entries(CB || {}).map(([k, c]) => ({ key: k, name: c.plan ? `${R.cn(k)}→${R.cn(c.plan)}` : R.cn(k), plan: c.plan || null, p: c.win, pick: c.win, d: 0, m: 0, box: boxes[cellOf[k]] || null }));   // v1.41: 两步改判的显示成 "X→Y"(回手拿 Y)
   const pubCB = tag => { if (lastPub && !lastPub.cbOnly) return publishKeep(rankRows(lastPub.rows), lastPub.base, lastPub.info + tag);
     const rows = rankRows(cbRows()), base = rows.length ? rows[0].cw : 0.5; lastPub = { rows, base, info: "(GPU 先出, 现役推演还在算)" + tag, cbOnly: true }; publish(rows, base, lastPub.info); };
-  const scr = AIMODE === "combo" && effIsMe && ctx.pre !== "preview" && COMBO_OFF !== "broken" && COMBO_OFF !== "slow" && SCREEN && SCREEN.slot === startIdx ? SCREEN : null;
-  if (scr) {
+  const scr = gpuPool && AIMODE === "combo-team" && effIsMe && ctx.pre !== "preview" && COMBO_OFF !== "broken" && COMBO_OFF !== "slow" && SCREEN && SCREEN.slot === startIdx ? SCREEN : null;
+  if (AIModes.isDuel(AIMODE) && gpuPool && COMBO_OFF !== "broken") {
+    const mode = AIMODE;
+    if (ctx.pre === "preview") {
+      comboState = "pending";
+      const before = treeState(S, Math.max(0, startIdx - ahead));
+      comboJob("duelbg", { st: before, mode, o: { targetSeat: cur, continuous: true } }, 0).then(m => {
+        if (stamp !== seq || m.cancelled) return;
+        if (m.type === "err") log("error", `${mode} 后台计算失败: ${String(m.msg).slice(0, 300)}`);
+        else log("advice", `${mode} 后台计算结束: 覆盖${m.r?.profiledChoices ?? "预测"}个选择`);
+      });
+    } else {
+      comboState = "pending";
+      const exact = treeState(S, startIdx), budget = mode === "duel-fast" ? Math.min(900, COMBO_CFG.sec * 1000) : COMBO_CFG.sec * 1000;
+      const onSearchResult = ready => {
+        if(stamp!==seq||ctx.resultFinal||!ready.r?.rows?.length)return;const rows=ready.r.rows.filter(row=>row.n>0&&Number.isFinite(row.win));if(!rows.length)return;
+        const samples=rows.reduce((n,row)=>n+row.n,0);if(samples<=(ctx.shownSamples||0))return;ctx.shownSamples=samples;
+        CB={};rows.forEach((row,i)=>CB[row.key]={win:row.win,rank:i});ctx.resultFinal=ready.r.complete===true;comboState=ctx.resultFinal?"done":"pending";
+        evMe(startIdx,`显示GPU${ctx.resultFinal?"最终":"阶段"}结果 ${samples}条`);log("advice",`${mode} 阶段结果 完成${samples}/${ready.r.requestedSamples}条 ${ctx.resultFinal?"完整计算":"仍在续算"} 从发起${Date.now()-ctx.startedAt}ms`);pubCB(ctx.resultFinal?" +最终结果":" +阶段结果");
+      };
+      evMe(startIdx, `GPU搜索发起 mode=${mode} budget=${budget}ms step=${exact.step}`);
+      comboJob("duel", { st: exact, mode, o: {} }, budget, onSearchResult).then(m => {
+        if (stamp !== seq || m.cancelled) { evMe(startIdx, `GPU搜索结果作废 stamp=${stamp}/${seq} reason=${m.cancelReason || "局面已改变"}`); return; }
+        if (m.type !== "done" || !m.r?.rows?.length) {
+          comboState = "计算未完成";
+          log("error", `${mode} 计算失败: ${String(m.msg || "无结果").slice(0, 300)}`);
+          if (lastPub) publishKeep(rankRows(lastPub.rows), lastPub.base, lastPub.info);
+          return;
+        }
+        const continueSearch = () => comboJob("duelbg", { st: exact, mode, o: { targetSeat: cur, continuous: true } }, 0, onSearchResult).then(m => { if (stamp === seq && m.r?.reason?.startsWith("no-legal")) log("error", `${mode} 后台续算停止: ${m.r.reason}`); });
+        const rows = m.r.rows.filter(row => row.n > 0 && Number.isFinite(row.win));
+        if (!rows.length) { comboState = "计算未完成"; log("advice", `${mode} 预算内无完整推演 reason=${m.r.reason || "unknown"} calls=${m.r.calls} 推进${m.r.suspendedSteps || 0}手，继续后台计算`); if (!m.r.reason?.startsWith("no-legal")) continueSearch(); return; }
+        onSearchResult({r:m.r});
+        log("advice", `${mode} 最终结果 ${m.r.ms.toFixed(0)}ms 新算${m.r.newSamples} 复用${m.r.reusedSamples} ${m.r.partial ? "预算到点" : "完整计算"}`);
+        // While this player is still choosing, keep improving compatible
+        // future states. The selected move remains unknown until observed.
+        continueSearch();
+      });
+    }
+  } else if (scr) {
     /* v1.38: 有后台筛选表 → 决赛(表上前 5 名, 准确局面各补到 32 局, 筛选里能复用的局直接并入) → 显示 → 更新一次(准确局面全部重算) */
     comboState = "pending"; const t1 = Date.now(), takenNow = new Set(takenKeys), stJ = JSON.parse(JSON.stringify(st));
     const keys = scr.rows.filter(r => !takenNow.has(r.key)).slice(0, 5).map(r => r.key), lag = startIdx - scr.from;
@@ -375,14 +445,27 @@ function advise(S, startIdx, pre, ms, ahead, lockInfo) {
     };
     const bad = (m, what, t0) => { const why = m.type !== "done" ? "出错: " + String(m.msg).slice(0, 120) : m.cancelled ? "被取消" : m.r && m.r.timeout ? "超时" : "没有可算的";
       evMe(startIdx, `${what}没出结果: ${why}`); log(m.type !== "done" ? "error" : "advice", `${what}没出结果(${why}) 从发起${Date.now() - t0}ms`); };
-    comboJob("final", { st: stJ, me: cur, t0: startIdx, keys, o: { R: 32, seed: seed0 + 11 } }, COMBO_CFG.sec * 1000).then(m => {
+    /* v1.41 两步计划·轮到时补算: 现行结果都出来后, 拿后台两步表里前缀一致的样本 + 前 3 条线补到 128 局, 比现行第一名高就改判成 "X→Y"。竞技场里改判阈值只会压掉对的改判, 所以不设阈值。 */
+    const markFinal = () => { ctx.resultFinal = true; comboState = "done"; if (CB) pubCB(" +最终结果"); };
+    const launchPlanFinal = () => { if (!PLAN_ON) { markFinal(); return; } const t4 = Date.now(); evMe(startIdx, "两步补算发起");
+      comboJob("planfinal", { st: stJ, me: cur, t0: startIdx, o: { RT: process.env.AD_COMBO_TIER ? 6 : 128, NTOP: 3, seed: seed0 + 23 } }, Math.max(8, COMBO_CFG.sec) * 1000).then(m3 => {
+        if (stamp !== seq) { evMe(startIdx, "两步结果作废(期间局面变了/我已落子)"); return; }
+        if (m3.type !== "done" || !m3.r || m3.cancelled || m3.r.timeout) { bad(m3, "两步补算", t4); return; }
+        const r = m3.r; if (!r.rows.length) { log("advice", `两步补算完: 没有可用的线(${r.why || "线都作废了"}) ${r.ms}ms`); evMe(startIdx, `两步补算完: 无可用线(${r.why || ""})`); markFinal(); return; }
+        const top = r.rows[0]; let cbTop = null, cbW = -1; for (const k in CB) if (CB[k].win > cbW) { cbW = CB[k].win; cbTop = k; }
+        const d = 100 * (top.win - cbW);
+        log("advice", `两步补算完(表来自第${r.from + 1}手局面, 复用${r.reused}局 新算${r.fresh}局 调网络${r.calls}次 用时${r.ms}ms) ${r.rows.map(x => `${R.cn(x.x)}→${R.cn(x.y)} ${(100 * x.win).toFixed(1)}(${x.n})`).join(" | ")} | 现行第一 ${R.cn(cbTop)} ${(100 * cbW).toFixed(1)} → ${d > 0 ? `改判 ${R.cn(top.x)}(回手 ${R.cn(top.y)}) +${d.toFixed(1)}` : "不改判"}`);
+        evMe(startIdx, `两步补算完 ${d > 0 ? `改判 ${R.cn(top.x)}→${R.cn(top.y)} +${d.toFixed(1)}` : "不改判"} 本身${r.ms}ms 发起到回来${Date.now() - t4}ms`);
+        if (d > 0) { CB[top.x] = { win: top.win, rank: 0, plan: top.y }; ctx.plan = { x: top.x, y: top.y, win: top.win, base: cbW, baseKey: cbTop }; pubCB(" +两步"); } markFinal(); }); };
+    if (!keys || keys.length < 2) { log("advice", `候选只剩 ${keys ? keys.length : 0} 个, 不发 GPU 决赛(第 50 手/无可比)`); comboState = "done"; ctx.resultFinal = true; if (CB) { pubCB(""); askReason(); } }   // 无 GPU 候选仍继续下方基础推荐
+    else comboJob("final", { st: stJ, me: cur, t0: startIdx, keys, o: { R: 32, seed: seed0 + 11 } }, COMBO_CFG.sec * 1000).then(m => {
       if (stamp !== seq) { evMe(startIdx, "GPU决赛结果作废(期间局面变了/重算)"); log("advice", `决赛结果作废(期间已换手/重算) 从发起${Date.now() - t1}ms`); return; }
       if (m.type !== "done" || !m.r || m.cancelled || m.r.timeout) { comboState = "出错, 用网络档"; bad(m, "GPU决赛", t1); if (lastPub) publishKeep(rankRows(lastPub.rows), lastPub.base, lastPub.info); return; }
       CB = {}; m.r.rows.forEach((x, i) => CB[x.key] = { win: x.win, rank: i }); comboState = "done";
       evMe(startIdx, `GPU决赛算完 本身${m.r.ms}ms 发起到回来${Date.now() - t1}ms 复用${m.r.reused}局 新算${m.r.fresh}局(${m.ep})`);
       log("advice", `决赛算完(筛选表比当前早${lag}手) 用时${m.r.ms}ms 复用${m.r.reused}局 新算${m.r.fresh}局 调网络${m.r.calls}次 局面去重${m.r.uniq}/${m.r.tot} ${m.ep} | ${m.r.rows.map(x => `${R.cn(x.key)} ${(100 * x.win).toFixed(1)}(${x.n})`).join(" | ")}`);
       pubCB(" +GPU决赛");
-      if (!COMBO_CFG.refine) return askReason();
+      if (!COMBO_CFG.refine) { askReason(); launchPlanFinal(); return; }
       const t2 = Date.now(), top0 = m.r.rows[0] && m.r.rows[0].key; evMe(startIdx, "GPU更新发起(准确局面全部候选重算)");
       comboJob("refine", { st: stJ, me: cur, t0: startIdx, o: { seed: seed0 + 13 } }, Math.max(15, COMBO_CFG.sec * 3) * 1000).then(m2 => {
         if (stamp !== seq) { evMe(startIdx, "GPU更新结果作废(期间局面变了/我已落子)"); log("advice", `更新结果作废(期间已换手/重算) 从发起${Date.now() - t2}ms`); return; }
@@ -390,9 +473,9 @@ function advise(S, startIdx, pre, ms, ahead, lockInfo) {
         CB = {}; m2.r.rows.forEach((x, i) => CB[x.key] = { win: x.win, rank: i }); const top1 = m2.r.rows[0] && m2.r.rows[0].key;
         evMe(startIdx, `GPU更新算完 本身${m2.r.ms}ms 发起到回来${Date.now() - t2}ms 新算${m2.r.fresh}局 首推${top1 === top0 ? "不变" : ` ${R.cn(top0)}→${R.cn(top1)}`}`);
         log("advice", `更新算完(准确局面全部${m2.r.rows.length}个) 用时${m2.r.ms}ms 新算${m2.r.fresh}局 复用${m2.r.reused}局 调网络${m2.r.calls}次 局面去重${m2.r.uniq}/${m2.r.tot} 首推${top1 === top0 ? "不变" : ` ${R.cn(top0)}→${R.cn(top1)}`} | 前8 ${m2.r.rows.slice(0, 8).map(x => `${R.cn(x.key)} ${(100 * x.win).toFixed(1)}(${x.n})`).join(" | ")}`);
-        pubCB(" +GPU更新"); askReason(); });
+        pubCB(" +GPU更新"); askReason(); launchPlanFinal(); });
     });
-  } else if (AIMODE === "combo" && ctx.pre !== "preview" && COMBO_OFF !== "broken" && COMBO_OFF !== "slow") {
+  } else if (gpuPool && ["combo", "combo-team"].includes(AIMODE) && ctx.pre !== "preview" && COMBO_OFF !== "broken" && COMBO_OFF !== "slow") {
     comboState = "pending"; const t1 = Date.now(); if (effIsMe) evMe(startIdx, `GPU发起(${ctx.pre ? "提前算" : "在选"}${effIsMe ? ", 没有后台筛选表 → 旧算法 网络前K×R" : ""})`);
     comboRun(JSON.parse(JSON.stringify(st)), cur, startIdx, seed0).then(m => {
       if (stamp !== seq) { if (effIsMe) evMe(startIdx, `GPU结果作废(期间局面变了/重算) 本身${m.r ? m.r.ms : "?"}ms`); log("advice", `组合版结果作废(期间已换手/重算): ${m.type === "done" && m.r ? `${m.r.cancelled ? "已取消" : m.r.timeout ? "超时" : "算完"} 本身用时${m.r.ms}ms ${comboBreak(m.r)}` : m.type === "done" ? "局面已选完" : "出错"} 从发起到回来${Date.now() - t1}ms`); return; }
@@ -404,25 +487,26 @@ function advise(S, startIdx, pre, ms, ahead, lockInfo) {
         if (effIsMe) evMe(startIdx, `GPU超时(上限${COMBO_CFG.sec}s) → ${comboState}`);
         log("advice", `组合版超时(K${m.r.K}×R${m.r.R}, 上限${COMBO_CFG.sec}s, ${m.ep}) → ${comboState} ${comboBreak(m.r)}`);
       } else {
-        CB = {}; m.r.rows.forEach((x, i) => CB[x.key] = { win: x.win, rank: i }); comboState = "done";
+        CB = {}; m.r.rows.forEach((x, i) => CB[x.key] = { win: x.win, rank: i }); comboState = "done"; ctx.resultFinal = true;
         if (effIsMe) evMe(startIdx, `GPU算完 本身${m.r.ms}ms 发起到回来${Date.now() - t1}ms(${m.ep}, K${m.r.K}×R${m.r.R})`);
         log("advice", `组合版算完 K${m.r.K}×R${m.r.R} ${m.ep} 用时${m.r.ms}ms(${comboBreak(m.r)}) 全部${m.r.rows.length}个 ${m.r.rows.map(x => `${R.cn(x.key)} ${(100 * x.win).toFixed(1)}%(网${(100 * x.net).toFixed(1)})`).join(" | ")}`);
       }
       if (CB) pubCB(" +组合版"); else if (lastPub) publishKeep(rankRows(lastPub.rows), lastPub.base, lastPub.info);
     });
-  } else if (AIMODE === "combo") { comboState = ctx.pre === "preview" ? "预估用网络档, 轮到时再用显卡算" : COMBO_OFF === "slow" ? "太慢, 本局改网络档" : "显卡不可用, 用网络档";
+  } else if (AIModes.isGpu(AIMODE)) { comboState = ctx.pre === "preview" ? "预估用网络档, 轮到时再用显卡算" : COMBO_OFF === "slow" ? "太慢, 本局改网络档" : "显卡不可用, 用网络档";
     if (effIsMe && ctx.pre !== "preview") evMe(startIdx, `没发起GPU: ${comboState}`);
-    if (ctx.pre === "preview" && effIsMe && COMBO_OFF !== "broken" && COMBO_OFF !== "slow") launchScreen(S, startIdx, ahead, cur, seed0 + 7);
+    if (AIMODE === "combo-team" && gpuPool && ctx.pre === "preview" && effIsMe && COMBO_OFF !== "broken" && COMBO_OFF !== "slow") launchScreen(S, startIdx, ahead, cur, seed0 + 7);
     if (myTurn && ctx.pre === "preview" && S.my_turn) myTurn.notes.push([Date.now(), `轮到我但按"预估"算(前面还有${ahead}手, 算的是第${startIdx + 1}手) → 不发起GPU`]); }
   let sentDone = false;
   const onBatch = res => { if (stamp !== seq) { if (POOL) POOL.cancel(); return; } if (res.stage !== "done" || sentDone) return; sentDone = true;
     const coarse = mkRows(res.vals, sig(mySg * res.base));
-    if (!POOL || coarse.length <= 3) return publishKeep(coarse, sig(mySg * res.base), "");
+    if (!POOL || coarse.length <= 3) { if (!AIModes.isGpu(AIMODE)) ctx.resultFinal = true; return publishKeep(coarse, sig(mySg * res.base), ""); }
     const top = coarse.slice(0, REFINE_K).map(r => r.key);
     POOL.omni(st, REFINE_M, seed0, rr => { if (stamp !== seq || rr.stage !== "done") return;
       const base = sig(mySg * rr.base), fine = mkRows(rr.vals, base), fineKeys = new Set(fine.map(r => r.key));
       const rest = coarse.filter(r => !fineKeys.has(r.key)).map(r => ({ ...r, d: r.p - base, band: false }));
       const before = coarse.slice(0, 3).map(r => r.name).join("/"), after = fine.slice(0, 3).map(r => r.name).join("/");
+      if (!AIModes.isGpu(AIMODE)) ctx.resultFinal = true;
       publishKeep(rankRows(fine.concat(rest)), base, `(决赛加时前 ${REFINE_K}${before !== after ? `: ${before} → ${after}` : ", 名次不变"})`); }, top, personal ? cur : null); };
   if (POOL) POOL.omni(st, OMNI_M, seed0, onBatch, null, personal ? cur : null);
   else AI.omniAsync(st, onBatch, () => stamp === seq).then(r => { if (r && stamp === seq) onBatch(r); }).catch(e => { log("error", "引擎 " + (e && e.stack || e)); parentPort.postMessage({ type: "error", msg: String(e) }); });
@@ -436,15 +520,24 @@ function advise(S, startIdx, pre, ms, ahead, lockInfo) {
 let turnLock = null;   // {cur: 当前选人座位, j: 目标下标, keys: 显示中的前十}
 function isTarget(seat, S) { const side = seat < 5 ? "L" : "R"; return ALL ? side === S.me.side : (side === S.me.side && seat % 5 === S.me.idx); }
 function chooseAdvice(S, startIdx, picked, ms) {
+  if (suppressAdvice) return;
+  const n = R.pickedCount(S);
+  if (n >= 50) { if (lastSig !== "finished") { cancelComputations(); lastSig = "finished"; parentPort.postMessage({ type: "clear" }); } return; }
   /* 还没认出本人座位(v1.22):不猜, 不出推荐 —— 状态行提示"未确定你是几号位", 托盘可以手动指定 */
   if (!S.me) { if (lastSig !== null) { seq++; if (POOL) POOL.cancel(); lastSig = null; lastAdvice = null; parentPort.postMessage({ type: "clear" }); } turnLock = null; return; }
   /* 目标座位在识别里已经选满时, buildState 排剩余顺序会跳过他, 真正被算的是顺序里下一个还有空位的人 ——
      可能是对面(v1.34 及以前:团队模式 09-18 日志 5 次给对面算, 还标成"队友")。所以按"实际被算的人"是不是目标来挑 */
   let j = startIdx; while (j < FULL_ORDER.length && !(isTarget(FULL_ORDER[j], S) && isTarget(buildState(S, j).cur, S))) j++;
-  if (j >= FULL_ORDER.length) { if (lastSig !== null) { seq++; if (POOL) POOL.cancel(); lastSig = null; lastAdvice = null; parentPort.postMessage({ type: "clear" }); } return; }
+  if (j >= FULL_ORDER.length) {
+    /* v1.46: 我(或团队模式下我方)已选满而这局还没结束 → 不清空, 顶上留一句提示, 小卡上的位置建议继续每手更新(09-28 真机: 满员后推荐框空, 被当成"消失") */
+    const nT = S.skills.filter(x => x.taken).length + (S.taken_heroes || []).length, meFull = panelCount(S, seatIdx(S.me)) >= 5;
+    if (meFull && nT < 50) { if (lastSig !== "full") { seq++; if (POOL) POOL.cancel(); lastSig = "full"; lastAdvice = null; turnLock = null;
+        parentPort.postMessage({ type: "advice", note: `${S.me.side === "L" ? "左" : "右"}${S.me.idx + 1}(我) 已选满 · 各座位小卡上有「预计 / 建议」位置行, 每落一手都会更新`, rows: [], side: S.me.side, seat: seatIdx(S.me), base: 0.5, my_turn: false }); log("advice", `我已选满(已选走 ${nT}) → 显示提示, 不再算推荐`); } return; }
+    if (lastSig !== null) { seq++; if (POOL) POOL.cancel(); lastSig = null; lastAdvice = null; parentPort.postMessage({ type: "clear" }); } return; }
   /* 锁定范围:目标就是下一个要选的人(不管他已经开始选, 还是上家刚落子、高亮还没移过来)。
      这段时间里局面不会再有合法变化(上家已经选完, 目标还没选), 任何变化都是识别抖动 —— 算好就锁住。 */
   const inTurn = j === startIdx, curSeat = seatIdx(S.current);
+  if (turnLock && turnLock.stamp !== seq) turnLock = null;
   if (inTurn && turnLock && turnLock.j === j) {
     const takenNow = new Set(S.skills.filter(x => x.taken).map(x => x.key).concat(S.taken_heroes));
     const gone = turnLock.keys.filter(k => takenNow.has(k));
@@ -489,22 +582,41 @@ function turnTick(S, startIdx, nTaken) {
   const ended = !S.my_turn || (n != null && myTurn.n0 != null && n > myTurn.n0);
   if (!ended) return;
   const T = myTurn, sec = t => `${t >= T.t0 ? "+" : ""}${((t - T.t0) / 1000).toFixed(1)}s`, ev = (myEv.get(T.slot) || []).concat(T.notes).sort((a, b) => a[0] - b[0]);
-  const shown = ev.find(e => e[1].startsWith("显示GPU")), mode = AIMODE === "combo" ? "" : ` (档位=${AIMODE}, 不用 GPU)`;
+  const shown = ev.find(e => e[1].startsWith("显示GPU")), mode = AIModes.isGpu(AIMODE) ? "" : ` (档位=${AIMODE}, 不用 GPU)`;
   const why = shown ? `GPU结果 ${shown[0] <= T.t0 ? "轮到我之前就已显示" : `轮到我后 ${sec(shown[0])} 才显示`}` :
-    AIMODE === "combo" ? `**整个回合没显示GPU结果**${ev.length ? "" : " —— 期间一次 GPU 都没发起(没触发计算)"}` : "";
+    AIModes.isGpu(AIMODE) ? `**整个回合没显示GPU结果**${ev.length ? "" : " —— 期间一次 GPU 都没发起(没触发计算)"}` : "";
   log("turn", `我的回合小结 第${T.slot + 1}手: 轮到我→${n > T.n0 ? "我落子" : "高亮离开"} 共${((now - T.t0) / 1000).toFixed(1)}s${mode} | ${why} | ${ev.map(e => `${sec(e[0])} ${e[1]}`).join(" ; ") || "无事件"}`);
   for (const k of [...myEv.keys()]) if (k <= T.slot) myEv.delete(k);
   myTurn = null; }
 /* ---- 快通道:半分辨率扫描帧 ---- */
+function classifyFastChanges(previous, dark, known) {
+  const rawAdded = [...dark].filter(k => !previous.has(k)), rawGone = [...previous].filter(k => !dark.has(k));
+  const added = rawAdded.filter(k => !known.has(k)), gone = rawGone.filter(k => !known.has(k));
+  return { added, gone, rawAdded, rawGone, ignored: [...rawAdded, ...rawGone].filter(k => known.has(k)) };
+}
+function confirmedFastPicks(tracker) {
+  // Tracker.known also contains rejected suspects and unassigned orphans.
+  // Those must still be eligible for fast/full confirmation.
+  return new Set([...Object.keys(tracker.owner || {}), ...Object.keys(tracker.heroOf || {}).map(h => "hero:" + h)]);
+}
+let lastFastNoiseAt = 0;
 function fastTick(img) {
   const t0 = Date.now(); const dark = R.fastDark(img, tracker.pool, tracker.boxesNow, tracker.refB); scans++; tScan += Date.now() - t0;
   if (!fastDarkPrev) { fastDarkPrev = dark; want(true); return false; }
   const hk = tracker.hoverKey(tracker.boxesNow); if (hk) { if (fastDarkPrev.has(hk)) dark.add(hk); else dark.delete(hk); }   // 鼠标停着的那格:当作没变
   if (REC && REC.file && trBytes < TR_CAP) { try { REC.scan(dark, tracker); } catch (e) { } }   // 快扫也进轨迹:时间分辨率 4 倍
-  const added = [...dark].filter(k => !fastDarkPrev.has(k)), gone = [...fastDarkPrev].filter(k => !dark.has(k));
+  // Confirmed selected cells can flicker bright/dark, but cannot be another pick.
+  // Keep raw scan observations in the trace; only the scheduling signal is filtered.
+  const change = classifyFastChanges(fastDarkPrev, dark, confirmedFastPicks(tracker));
+  const { added, gone } = change;
   fastDarkPrev = dark;
+  if (change.ignored.length && Date.now() - lastFastNoiseAt >= 1000) {
+    lastFastNoiseAt = Date.now();
+    const labels = keys => keys.map(k => R.cn(k.startsWith("hero:") ? k.slice(5) : k)).join("、");
+    log("fast-noise", `原始变暗${change.rawAdded.length}/变亮${change.rawGone.length}，忽略已确认选走:${labels(change.ignored)}；未确认变暗:${labels(added) || "无"}，变亮:${labels(gone) || "无"}；扫描${img.w}×${img.h} 第${tracker.frameNo}帧 任务${seq}`);
+  }
   if (!added.length && !gone.length) { fastCand = null; return false; }
-  if (added.length >= 2 || gone.length) { fastCand = null; log("fast", `${added.length} 格变黑 / ${gone.length} 格变亮 → 不当落子(多半是鼠标提示框/拖动), 要全图确认`); want(true); return false; }
+  if (added.length >= 2 || gone.length) { fastCand = null; log("fast", `${added.length} 格变黑 / ${gone.length} 格变亮 → 不当作落子，要全图确认；变暗:${added.map(k => R.cn(k.startsWith("hero:") ? k.slice(5) : k)).join("、") || "无"}；变亮:${gone.map(k => R.cn(k.startsWith("hero:") ? k.slice(5) : k)).join("、") || "无"}`); want(true); return false; }
   /* 判据是"九宫格全暗"(见 recog.isDarkCell), 鼠标只挡一角是过不了的 —— 所以一帧就能下结论, 不用等第二帧 */
   fastCand = null;
   /* 恰好多黑一格 = 有人落子。立刻记在当前高亮那位头上,并给下一位算;随后的全图识别会纠正细节 */
@@ -525,7 +637,8 @@ function fastTick(img) {
      以前快通道直接写归属, 写错了再靠后面改, 改的时候又可能改错。 */
   log("fast", `${R.cn(key)} 整格变暗 → 判定 ${seat[0]}${seat[1] + 1} 已落子 (扫描 ${Date.now() - t0}ms)`);
   fastPicks.set(k, { t: Date.now(), n: 0 });   // 在完整识别确认/否认之前, 推荐一直把它算作已拿走(见慢通道);n = 之后完整识别清楚看到它亮着的次数
-  pickedAtCur = true; lastS = S; lastTaken = S.skills.filter(x => x.taken).length + S.taken_heroes.length + (S.extraPicks || 0);
+  if (S.me && seatIdx(S.current) === seatIdx(S.me)) { log("fast", "本人高亮下单格变暗: 先过滤候选，完整帧确认前不切换回合/取消正在计算的结果"); want(true); return true; }
+  pickedAtCur = true; lastS = S; lastTaken = R.pickedCount(S);
   chooseAdvice(S, startIdxOf(S, true, lastTaken), true, Date.now() - t0);
   want(true); return true;
 }
@@ -573,22 +686,45 @@ function testPoints(img, src) {
   } catch (e) { log("error", "点位 " + (e && e.message || e)); }
 }
 /* ---- 主循环 ---- */
+let suppressAdvice = false;
 let ARRIVE = false, AIMODE = "mcts", COMBO_CFG = { K: 8, R: 16, sec: 8, refine: true };   // v1.28 AIMODE: mcts=现役推演排序, net=网络档   // v1.28 设置面板「轮到你时」备注开关
 let ALL = false, PLEVEL = 0, ME_PICK = null, mePickPool = null, meExpired = null;   // ME_PICK = 托盘手动指定的本人座位("L1".."R5"), 只对指定时那一局有效   // ALL=团队模式(显示我方五人);PLEVEL=个人权重档 0..3(界面上叫 1~4 档), 只影响我自己的回合
 /* 个人权重四档 = 每一手最多允许让队伍胜率比最好的低多少(在这个范围里挑个人分最高的)。
    标定(40 个随机局面, test/calib_personal.js):个人收益的大头在前 1~2 个百分点就拿到了(每手 +0.9 折合, 整局队伍约少 ≤1),
    4~5 个百分点起每手代价跳到 0.7~0.8(整局约少 4), 7 以上等于纯贪心到顶(整局约少 5)。 */
+/* 团队分配开 → 双方按曲线最优分配 1~5 号位算分，关 → 双方期望份额。
+   推演与座位分使用相同口径；切换时清旧搜索并同步全部评分器。 */
+let SHARE_OPT = false, SHARE_MODE = "expect";
+function syncShareMode(me) {
+  const mode = SHARE_OPT ? "optimalBoth" : "expect";
+  if (mode === SHARE_MODE) return; cancelComputations(); SHARE_MODE = mode;
+  try { FS.setShareMode(mode); } catch (e) { }
+  if (POOL && POOL.cfg) POOL.cfg({ shareMode: mode });
+  if (COMBO_W) COMBO_W.postMessage({ type: "cfg", shareMode: mode });
+  if (scorePlayers && scorePlayers.setShareMode) scorePlayers.setShareMode(mode);
+  log("cfg", `份额模式 → ${mode}${mode === "expect" ? "(双方自然分配)" : "(双方最优分配)"}`);
+}
 const PLEVELS = [{ name: "团队", delta: 0 }, { name: "略偏个人", delta: 0.01 }, { name: "偏个人", delta: 0.025 }, { name: "贪", delta: 0.05 }];
+let shuttingDown = false;
 parentPort.on("message", async m => {
+  if (m.type === "shutdown") { if(shuttingDown)return;shuttingDown=true;suppressAdvice=true;cancelComputations("shutdown: "+m.reason);trFlush();
+    const child=COMBO_W;if(!child){parentPort.postMessage({type:"shutdown-ready"});return;}
+    let replied=false;const done=()=>{if(!replied){replied=true;parentPort.postMessage({type:"shutdown-ready"});}};
+    child.once("exit",done);child.on("message",msg=>{if(msg.type==="shutdown-ready")child.terminate().then(done,e=>parentPort.postMessage({type:"shutdown-error",msg:String(e)}));else if(msg.type==="shutdown-error")parentPort.postMessage(msg);});
+    child.postMessage({type:"shutdown",reason:m.reason});return; }
+  if(shuttingDown)return;
+  if (m.type === "visibility") { if (suppressAdvice !== !!m.hidden) { suppressAdvice = !!m.hidden; cancelComputations("visibility: "+suppressAdvice,false); if (!suppressAdvice) { lastQuick = null; pendingNext = true; want(true); log("advice", "恢复显示: 下一帧完整复核并重新计算"); } } return; }
   if (m.type === "reset") { log("key", "收到重新识别(F10/菜单): 下一帧重锁池子"); forceReset = true; presentRun = 0; retryAt = 0; want(true); return; }
-  if (m.type === "logdir") { TRDIR = m.dir; return; }
+  if (m.type === "logdir") { TRDIR = m.dir;
+    const wd = require("./crash_diagnostics.js").create(path.join(TRDIR, `diag_recognition_${Date.now()}.jsonl`), { rotate: true, context: () => ({ mode: AIMODE, shareMode: SHARE_MODE, phase, busy, lastTaken, comboPending: COMBO_CB.size, comboDisabled: COMBO_OFF }) }); wd.start();
+    process.on("uncaughtExceptionMonitor", e => wd.record("uncaught-exception", { stack: String(e && e.stack || e) }, true)); process.on("unhandledRejection", e => { wd.record("unhandled-rejection", { stack: String(e && e.stack || e) }, true); log("error", "识别线程异步异常 " + String(e && e.stack || e)); }); process.on("exit", code => wd.record("worker-exit", { code }, true)); return; }
   if (m.type === "display") {   // 主进程报物理分辨率 → 按它缩放版式
     DISP = [m.w, m.h]; const r = R.rescale(m.w, m.h);
     log("disp", `屏幕 ${m.w}x${m.h} → 版式比例 ${r.scale.toFixed(4)}${r.sixteenNine ? "" : " ⚠ 非 16:9, 带鱼屏版式未经验证, 可能对不准"}`); return; }
-  if (m.type !== "frame" || busy) return; busy = true; frames++; ALL = !!m.all; PLEVEL = Math.max(0, Math.min(3, m.plevel | 0)); ARRIVE = !!m.arrive; AIMODE = ["net", "combo"].includes(m.aimode) ? m.aimode : "mcts";
+  if (m.type !== "frame" || busy) return; busy = true; frames++; ALL = !!m.all; PLEVEL = Math.max(0, Math.min(3, m.plevel | 0)); ARRIVE = !!m.arrive; SHARE_OPT = !!m.shareOpt; const nextMode = AIModes.normalize(m.aimode); if (nextMode !== AIMODE) { cancelComputations(); COMBO_OFF = ""; lastAdvice = null; parentPort.postMessage({ type: "clear" }); } AIMODE = nextMode;
   if (m.combo) { const c = m.combo, nc = { K: Math.max(2, Math.min(16, c.K | 0 || 8)), R: Math.max(8, Math.min(128, c.R | 0 || 16)), sec: Math.max(2, Math.min(30, +c.sec || 8)), refine: c.refine !== false };
     if (nc.R !== COMBO_CFG.R || nc.sec !== COMBO_CFG.sec) COMBO_R_EFF = null; COMBO_CFG = nc; }
-  if (AIMODE === "combo" && !COMBO_W && COMBO_OFF !== "broken") comboWorker();   // v1.30 开着组合版就先在后台建会话+测速, 不等第一手
+  if (AIModes.isGpu(AIMODE) && !COMBO_W && COMBO_OFF !== "broken") comboWorker();   // v1.30 开着组合版就先在后台建会话+测速, 不等第一手
   { const pick = /^[LR][1-5]$/.test(m.meSeat || "") ? m.meSeat : null; if (!pick) meExpired = null; ME_PICK = pick && pick !== meExpired ? pick : null; }
   { const t = !!m.test, c = m.core === "v2" ? "v2" : "1x";
     if (t !== TESTMODE || c !== CORE) { const was = needV2(); TESTMODE = t; CORE = c;
@@ -621,6 +757,7 @@ parentPort.on("message", async m => {
       if (!hit && sinceFull >= 4 && (pendingNext || sinceFull >= 8)) want(true);   // 有待确认的变化最快 1 秒一张全图, 平时 2 秒一张
         // (实测全分辨率一帧 99ms、扫描帧 22ms —— 全图张数才是 CPU 大头)
       if (cachedState) parentPort.postMessage({ ...cachedState, skipped: true, board: true }); return; }
+    if (phase === "idle" && !forceReset && Date.now() < retryAt) { parentPort.postMessage({ type: "state", phase, idle: true, pres, board: false }); return; }
     if (!isFull) { want(true); parentPort.postMessage({ type: "state", phase, idle: true, pres, board: true, near: lastNd >= 40 }); return; }   // 需要全图才能继续
     /* 新一局:棋盘暗格数比已确认的已选走数少 4 个以上,且连续 2 帧 */
     if (phase === "active" && lastTaken >= 4 && pres.dark <= 2 && pres.dark <= lastTaken - 4) dropRun++; else dropRun = 0;
@@ -633,7 +770,11 @@ parentPort.on("message", async m => {
            (09-19 那局实测 d=88.7, 其实只是 2 格被选走)。同一局的棋盘只会**越选越暗**, 换了一局才会大片变亮:
            实测 同一局离开再回来 变亮 0 格 / 开局到局末 变亮 0 格 / 换一局 变亮 59 格。所以加一条"没有大片变亮 = 还是这一局"。 */
         let up = 0; for (let i = 0; i < 60 && i < sigNow.length && i < sigOld.length; i++) if (sigNow[i] - sigOld[i] > 25) up++;
-        if (d < 25 || up < 10) { phase = "active"; lastQuick = null; pendingNext = true; tracker.allowBulk = 1;   // 离开期间可能已经选走好几件, 允许一次批量更新
+        if (draftComplete) {
+          if ((d < 25 && up < 10) || !R.draftBoardEvidence(img, tracker.boxesNow)) { retryAt = Date.now() + 5000; parentPort.postMessage({ type: "state", phase, idle: true, pres, board: false }); return; }
+          // Keep the completed tracker until a new pool actually locks. A failed
+          // probe or flip animation must not discard the sleeping end state.
+        } else if (d < 25 || up < 10) { phase = "active"; lastQuick = null; pendingNext = true; tracker.allowBulk = 1;   // 离开期间可能已经选走好几件, 允许一次批量更新
           log("phase", `棋盘回来了(签名差 ${d.toFixed(0)}, 变亮 ${up} 格), 继续上一局追踪`); want(true); }
         else { log("phase", `棋盘变了(签名差 ${d.toFixed(0)}, 变亮 ${up} 格) → 当新一局重锁`); trStop(); tracker = null; presentRun = Math.max(presentRun, 2); retryAt = 0; } }
       if ((phase !== "active" || forceReset) && presentRun >= 1 && Date.now() >= retryAt) tryLock(img, pres);   // 不再要求"看到棋盘第 2 帧":tryLock 里"连续两帧画面一样"本身就证明棋盘真在, 两条叠加会多等一帧
@@ -647,7 +788,7 @@ parentPort.on("message", async m => {
       if (String(man) !== String(tracker.meManual)) { log("me", man ? `手动指定本人座位 ${ME_PICK}` : "本人座位改回自动识别"); tracker.meManual = man; tracker.meSeat = man || tracker.meAuto || null; pendingNext = true; } }   // 变了就强制做一次完整识别, 不等画面变化
     /* ---- 慢通道:完整识别 ---- */
     const qs = R.quickSig(img, tracker.boxesNow); const diff = R.sigDiff(qs, lastQuick);
-    if (diff < 10 && cachedState && !pendingNext) { parentPort.postMessage({ ...cachedState, skipped: true }); return; }
+    if (diff < 10 && cachedState && !pendingNext && completedFrames === 0) { parentPort.postMessage({ ...cachedState, skipped: true }); return; }
     lastQuick = qs; tracker.lastBoardSig = qs.slice(0, 60); sinceFull = 0; wantFull = false;
     /* 技能槽贴框标定:面板是平的 UI, 同一侧所有槽偏移一样。标一次平均匹配 0.62→0.84(真实 1080p 截图),
        之前那些"面板图标认不准"(0.2~0.5)基本都是框没贴准。等有人拿到技能后才能标, 之后每 200 帧复标一次 */
@@ -689,7 +830,14 @@ parentPort.on("message", async m => {
       const raw = isH ? ((tracker.pool.heroBoxes.find(h => "hero:" + h.hero === k) || {}).state) : rawNow[k];
       if (raw === "N") fp.n = (fp.n || 0) + 1;
       if (confirmed || Date.now() - fp.t > 20000 || fp.n >= 2) { fastPicks.delete(k); continue; }
+      if(S.me&&seatIdx(S.current)===seatIdx(S.me))continue; // 暂存快扫暗格只过滤显示，不驱动本人回合重算。
       if (isH) S.taken_heroes.push(key); else { const r = S.skills.find(x => x.key === key); if (r) r.taken = true; } }
+    const ultimateKeys = new Set(S.skills.filter(x => x.ultslot).map(x => x.key));
+    const confirmedFull = S.panels.length === 10 && new Set(S.panels.map(p => p.hero)).size === 10 &&
+      new Set(S.panels.flatMap(p => p.skills.map(x => x.key))).size === 40 &&
+      S.panels.every(p => p.hero && p.skills.length === 4 && p.skills.every(x => x.key !== '?pick') && p.skills.filter(x => ultimateKeys.has(x.key)).length === 1);
+    completedFrames = confirmedFull ? completedFrames + 1 : 0;
+    if (completedFrames >= 2) { draftComplete = true; goIdle("十个座位已选满，停止推荐，等待下一局"); return; }
     pendingNext = !!S.pending;
     flushTrackLog(img);
     if (S.bulkMsg) log("fast", S.bulkMsg);
@@ -698,7 +846,9 @@ parentPort.on("message", async m => {
     /* v1.37:画面不是选技棋盘的那几帧(切回大厅打字/看记分板/选完转场), observe 里已经整帧当"看不清"、一个字不改,
        所以这里**不**退出追踪 —— 退出会走下面的"棋盘回来了还是换了一局"比对, 而大厅画面过不了那个比对, 反倒把整局记账重置掉。
        画面回来后那几手照常认得出(实测那局离开 11 秒、期间队友选了 3 手, 回来后 3 手全部补上)。 */
-    const curStr = `${S.current.side}${S.current.idx + 1}`, nTaken = S.skills.filter(s => s.taken).length + S.taken_heroes.length + (S.extraPicks || 0), prevTaken = lastTaken;
+    const observedCount = R.pickedCount(S);
+    if (observedCount > 50) { goIdle("计数超过合法上限，停止推演并等待复核"); retryAt = Date.now() + 2000; parentPort.postMessage({ type: "state", phase, idle: true, pres, board: false }); return; }
+    const curStr = `${S.current.side}${S.current.idx + 1}`, nTaken = R.pickedCount(S), prevTaken = lastTaken;
     if (nTaken !== lastTaken && lastTaken >= 0) { log("board", `第 ${nTaken} 手 [1.x] ${tracker.snapshotLine()}`);
       if (EST) { const st = EST.state(), seats = [];
         for (const side of ["L", "R"]) for (let i = 0; i < 5; i++) { const q = side + i;
@@ -720,6 +870,7 @@ parentPort.on("message", async m => {
     /* 快通道基准 = 上一张**扫描帧**(同一分辨率同一判据)。以前拿全分辨率的判定当基准, 暗色英雄卡在两种分辨率下判得不一样,
        每张扫描帧都显示"1 格变黑/2 格变亮", 快通道整整半分钟是瞎的(实测 50 多行)。 */
     lastS = S;
+    syncShareMode(S.me);
     cachedState = { type: "state", playerScores: safeScore(S.panels, R.LAYOUT()), phase, ms, my_turn: S.my_turn, current: S.current, me: S.me, meSource: tracker.meManual ? "manual" : tracker.meAuto ? "auto" : null, align: S.align, taken: nTaken, poolOk: S.pool_heroes.length === 12, pre: pickedAtCur, nextIsMe: pickedAtCur && effIsMe, board: true };
     parentPort.postMessage(cachedState);
     try { turnTick(S, startIdx, nTaken); } catch (e) { log("error", "回合账本出错(不影响推荐): " + String(e && e.message || e)); }

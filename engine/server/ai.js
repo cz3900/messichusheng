@@ -59,6 +59,9 @@ function simFrom(st) {
     }
   });
   s.step = st.step;
+  // The root scorer has its own model instance. Match the incremental engine
+  // before evaluating the base value, including legacy and two-step callers.
+  win.ADScore.setShareMode(F.getShareMode());
   s.z = win.ADScore.evaluate(seatKeys).logit;
   return s;
 }

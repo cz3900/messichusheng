@@ -8,7 +8,7 @@ let drawn = 0; const ctx = new Proxy({}, { get: (t, k) => k === "measureText" ? 
 const canvas = { getContext: () => ctx, width: 0, height: 0 }; const handlers = {};
 const document = { getElementById: id => id === "c" ? canvas : el(id) };
 const timers = []; const setTimeout = (f) => { timers.push(f); return timers.length; }, clearTimeout = () => {};
-new Function("document", "ad", "addEventListener", "innerWidth", "innerHeight", "setTimeout", "clearTimeout", code)(document, { on: (ch, f) => handlers[ch] = f }, () => {}, 1920, 864, setTimeout, clearTimeout);
+new Function("document", "ad", "addEventListener", "innerWidth", "innerHeight", "setTimeout", "clearTimeout", "requestAnimationFrame", "setInterval", code)(document, { on: (ch, f) => handlers[ch] = f }, () => {}, 1920, 864, setTimeout, clearTimeout, () => {}, () => {});
 const cfg = (o) => handlers.cfg({ scale: 0.75, all: false, paused: false, hidden: false, plname: "1 团队", version: "1.8.0", hotkey: { "隐藏/显示": "F6" }, ...o });
 const adv = { type: "advice", side: "R", seat: 7, my_turn: true, pre: "preview", ahead: 2, base: 0.6, rows: [{ key: "a", name: "影魔", p: 0.66, d: 0.06, box: [100, 100, 60, 60] }, { key: "b", name: "锚击", p: 0.64, d: 0.04, box: [200, 100, 60, 60] }] };
 const active = { type: "state", phase: "active", ms: 20, current: { side: "L", idx: 0 }, me: { side: "R", idx: 2 }, taken: 3, poolOk: true, board: true };
@@ -23,7 +23,7 @@ check("真看到选技棋盘但池子还没锁上: 显示\"正在识别\"", /正
 handlers.state(active); drawn = 0; handlers.advice(adv);
 check("选技中: 状态行 + 推荐框都显示", /已选走 3/.test(show().status) && drawn > 0);
 cfg({ hidden: true });
-check("按 F6 隐藏: 状态行清空 + 弹 2 秒提示", show().status === "" && /已隐藏 · 识别照常运行\(F6 恢复显示\)/.test(show().toast));
+check("按 F6 隐藏: 状态行清空 + 弹 2 秒提示", show().status === "" && /已隐藏 · 保留识别，暂停推荐计算\(F6 恢复显示\)/.test(show().toast));
 drawn = 0; handlers.advice({ ...adv, base: 0.61 }); handlers.state({ ...active, taken: 4 });
 check("隐藏期间照常收到新推荐/新状态, 但不画", drawn === 0 && show().status === "");
 timers.splice(0).forEach(f => f());

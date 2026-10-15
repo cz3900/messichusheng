@@ -13,6 +13,7 @@ const TEMP = +process.env.AI_T || 0.05;
 const flag = new Int32Array(workerData.sab);   // [0] = 当前有效 job 号
 const me = workerData.k, K = workerData.K;
 parentPort.on("message", m => {
+  if (m.type === "cfg") { if (m.shareMode && F.setShareMode) F.setShareMode(m.shareMode); return; }
   if (m.type !== "omni") return;
   const job = m.job, t0 = Date.now();
   try {

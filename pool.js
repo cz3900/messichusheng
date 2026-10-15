@@ -39,4 +39,6 @@ function omni(st, M, seed0, onBatch, only, mySeat) {
   return job;
 }
 function cancel() { Atomics.store(flag, 0, 0); cur = null; }
-module.exports = { start, omni, cancel, K, size: () => threads.length };
+/* 经济分配口径广播(双方自然 expect / 双方团队 optimalBoth)：每个引擎线程都要同步。 */
+function cfg(m) { for (const w of threads) w.postMessage({ type: "cfg", ...m }); }
+module.exports = { start, omni, cancel, cfg, K, size: () => threads.length };

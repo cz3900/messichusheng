@@ -278,6 +278,37 @@ function quickPresence(img) {
       if (gx >= 0 && gy + s < img.h) { const [r2, g2, b2] = meanBGR(img, gx, gy, gw, s); gapN++; if ((r2 + g2 + b2) / 3 < 70) gapOk++; } } }
   return { bright, dark, gapDark: gapN ? gapOk / gapN : 0, k };
 }
+// After a completed draft, brightness changes alone also match menus and gameplay.
+// Verify a few bright ability icons before attempting expensive alignment/pool reads.
+function pickedCount(state) {
+  const board = new Set(state.skills.filter(s => s.taken).map(s => s.key));
+  const heroes = new Set(state.taken_heroes || []);
+  if (!state.panels) return board.size + heroes.size + (state.extraPicks || 0);
+  const slots = state.panels.flatMap(p => p.skills || []), known = new Set(slots.filter(s => s.key !== '?pick').map(s => s.key));
+  const unknown = slots.filter(s => s.key === '?pick').length;
+  const unassigned = [...board].filter(k => !known.has(k)).length;
+  return board.size + heroes.size + Math.max(0, unknown - unassigned);
+}
+function draftBoardEvidence(img, boxes) {
+  const choices = [];
+  LAYOUT.board.forEach((c, j) => {
+    if (c.role === 'hero') return;
+    const b = boxes && boxes[j] ? boxes[j] : cellBox(c, rowDefault(c.row), 0, 0);
+    const st = cellStats(img, b);
+    if (st.mean >= 30 && st.max >= 48) choices.push({ b, row: c.row, mean: st.mean });
+  });
+  choices.sort((a, b) => b.mean - a.mean);
+  const sample = [], rows = new Set();
+  for (const c of choices) if (!rows.has(c.row)) { sample.push(c); rows.add(c.row); if (sample.length === 6) break; }
+  for (const c of choices) if (sample.length < 6 && !sample.includes(c)) sample.push(c);
+  if (sample.length < 3) return false;
+  let hits = 0;
+  for (const c of sample) {
+    const r = matchSkillRaw(img, c.b, null);
+    if (r.s1 >= 0.50 && r.s1 - r.s2 >= 0.05 && ++hits >= 3) return true;
+  }
+  return false;
+}
 /* 帧签名:60 格亮度 + 10 面板边框亮度 + 40 面板槽亮度。两帧签名接近 → 画面对我们关心的部分没变,跳过重识别 */
 function quickSig(img, boxes) {
   const out = new Float32Array(60 + 10 + 40); let n = 0;
@@ -483,7 +514,11 @@ function refBrightness(imgRef, pool) {
   for (const [k, cell, isHero] of all) { const st = cellStats(imgRef, (pool.skills.find(r => r.cell === cell) || pool.heroBoxes.find(h => h.cell === cell)).box);
     stats[cell] = st; refB[cell] = st.mean;
     /* 英雄卡没了颜色(饱和度 <0.08;英雄原画实测最灰的也有 0.18)= 开局前就被选走、且是带反光的那种(不黑, 亮度 60+) */
-    gone[cell] = isBlack(st) || (isHero && st.sat < 0.08 && st.mean < 120 && st.max < 150);
+    /* 10-07 幽鬼原画实测 12.4/38.5、饱和度 0.783：很暗但仍有颜色，不能直接当已选。
+       英雄近黑判据须同时低饱和；接近纯黑时颜色不可靠，保留绝对纯黑分支。 */
+    gone[cell] = (isBlack(st) && (!isHero || st.sat < 0.25)) ||
+      (isHero && st.mean < 10 && st.max < 20) ||
+      (isHero && st.sat < 0.08 && st.mean < 120 && st.max < 150);
     if (st.mean < 60 || gone[cell]) darkCells++; }
   for (const r of pool.skills) if (refB[r.cell] >= 60 && BRIGHT[r.key]) ratios.push(refB[r.cell] / BRIGHT[r.key]);
   for (const hb of pool.heroBoxes) if (refB[hb.cell] >= 60 && HBRIGHT[hb.hero]) hratios.push(refB[hb.cell] / HBRIGHT[hb.hero]);
@@ -503,6 +538,9 @@ function refBrightness(imgRef, pool) {
 /* ---- 面板 ---- */
 function matchSkill(img, box, cands) {
   if (SRC && SRC.match && box && box.slot) return SRC.match(box.slot, cands);
+  return matchSkillRaw(img, box, cands);
+}
+function matchSkillRaw(img, box, cands) {
   const v = cellVec(img, box); let b1 = -9, k1 = null, b2 = -9, k2 = null;
   /* 只对候选算点积。原来不管候选多少都先 scoreAll 全部 513 个(每个 12288 维),面板 40 个槽位就是 2.5 亿次乘法 —— 白烧 */
   const list = cands ? cands.map(k => KIDX[k]).filter(i => i != null) : null;
@@ -756,6 +794,7 @@ class Tracker {
        有人会拖动自己的技能换位置 —— 拖起来那一格会空一下、放下又回来;按"增加"算会把放下当成一次新落子(然后认错一件或计数多一手),
        按"多出来"算:放下后图标数 = 已记件数, 什么都不会发生。图标数暂时比已记件数少(正在拖)也不处理。 */
     const first = !this.pcInit;
+    if (first) this.joinedMidDraft = ob.panels.reduce((n, p) => n + p.filled, 0) >= 3;
     for (const p of ob.panels) { const k = seatKey([p.side, p.idx]);
       if (first) { this.pc[k] = p.filled; continue; }
       if (p.filled === this.pcRaw[k]) this.pcRun[k] = (this.pcRun[k] || 0) + 1; else { this.pcRaw[k] = p.filled; this.pcRun[k] = 1; }
@@ -770,13 +809,13 @@ class Tracker {
       if (best >= 0 && !(noBack && best + 1 < this.turn)) this.turn = best + 1; };
     const seatAt = i => { const x = ORDER[Math.max(0, Math.min(i, ORDER.length - 1))]; return x == null ? cur : [x < 5 ? 'L' : 'R', x % 5]; };
     const seats = ob.panels.map(p => [p.side, p.idx]);
-    /* 开局第一帧:已经在面板里的技能按图标一次配完(中途才打开插件的情况);回合数 = 面板里的图标总数 + 已经变黑的英雄卡数 */
+    /* 开局第一帧:已经在面板里的技能按图标一次配完(中途才打开插件的情况);先按面板里的技能计数；本帧新英雄由 D 逐个记账，不能提前再加一次 */
     const skillsTaken = Object.keys(ob.taken).filter(k => ob.taken[k]);
     if (first) { this.pcInit = true;
       const cands = skillsTaken.filter(k => k[0] !== '?');
       for (const p of ob.panels) if (p.filled) { const pp = readPanels(img, cands).find(x => x.side === p.side && x.idx === p.idx);
         for (const sl of pp.skills) if (sl && sl.key !== '?' && sl.s >= 0.45 && !this.known.has(sl.key)) { this.owner[sl.key] = [p.side, p.idx]; this.known.add(sl.key); this.pickT = this.pickT || {}; this.pickT[sl.key] = 0; this.log.push(['skill', sl.key, pq([p.side, p.idx]), `开局已在面板里 ${sl.s.toFixed(2)}`]); } }
-      this.turn = ob.panels.reduce((a, p) => a + p.filled, 0) + ob.takenHeroes.length; }
+      this.turn = ob.panels.reduce((a, p) => a + p.filled, 0); }
     /* 多出来的状态从哪一帧开始(C 步要等它持续一阵子) */
     this.surSince = this.surSince || {};
     for (const q of seats) { const k = seatKey(q); if (surplus(q) > 0) { if (this.surSince[k] == null) this.surSince[k] = F; } else delete this.surSince[k]; }
@@ -862,6 +901,13 @@ class Tracker {
           this.log.push(['skill', k, pq(q), `按时间配:只剩这一格暗格和他那一个"没认出", 时间相差 ${Math.abs(q.t - this.firstT[k])} 帧(图标吻合 ${sc.toFixed(2)})`]); } } }
     /* D. 英雄:按回合填空 —— 当前回合是 turn(被技能配对不断重新锚定);该座位已有英雄就试前后一手 */
     for (const h of newHero) { let q = null;
+      // Existing heroes in a mid-draft join have no reliable pick timestamps.
+      // Keep them unavailable, but let panel names establish their seats.
+      if (this.joinedMidDraft && ((this.firstT || {})['hero:' + h] || 0) <= (this.lockFrame || 1)) {
+        this.orphan['hero:' + h] = true; this.known.add('hero:' + h);
+        this.log.push(['hero', h, '', '中途加入的已有英雄，等待面板名字确认座位']); continue;
+      }
+      if (Object.keys(this.nameHero || {}).length === 10 && !Object.values(this.nameHero).includes(h)) continue;
       for (const d of [0, 1, -1, 2]) { const c = seatAt(this.turn + d); if (!hasHero(c)) { q = c; if (d) this.turn += d; break; } }
       this.known.add('hero:' + h);
       if (!q) { this.orphan['hero:' + h] = true; this.log.push(['hero', h, '', '附近几手的人都已有英雄, 只记"被拿走"']); continue; }
@@ -914,11 +960,14 @@ class Tracker {
        确认后以名字为准:推算错了的座位改过来, 棋盘卡没看出变暗的也补上, 之后不撤销、不按时间顺序挪。
        每帧读 3 个面板(正在选的人、上一手的人、再轮一个), 已确认的不再读;名字位置固定, 只在左边缘 x≈50 / 右边缘 x≈181、y≈7 附近 ±5 找 */
     if (!process.env.AD_NONAME) { this.nameRun = this.nameRun || {}; this.nameHero = this.nameHero || {}; this.nameRR = this.nameRR || 0;
-      const named = new Set(Object.values(this.nameHero)), want = [];
+      const want = [];
       const addS = q => { if (q && !this.nameHero[seatKey(q)] && !want.some(x => same(x, q))) want.push(q); };
       addS(cur); addS(seatAt(this.turn - 1)); for (let n = 0; n < 10 && want.length < 3; n++) addS(seats[(this.nameRR++) % 10]);
-      const cands = this.pool.poolHeroes.filter(h => !named.has(h)).concat([null]);
-      for (const q of want) { const k = seatKey(q), r = readHeroName(img, q[0], q[1], cands, 29, { x: q[0] === 'L' ? 50 : 181, y: 7, r: 5 });
+      for (const q of want) { const k = seatKey(q);
+        // A confirmation earlier in this frame removes that hero immediately;
+        // two panels must never permanently confirm the same name.
+        const cands = this.pool.poolHeroes.filter(h => !Object.values(this.nameHero).includes(h)).concat([null]);
+        const r = readHeroName(img, q[0], q[1], cands, 29, { x: q[0] === 'L' ? 50 : 181, y: 7, r: 5 });
         const [sc, h] = r[0], lead = sc - (r[1] ? r[1][0] : -1);
         /* 棋盘上这张卡已经暗了(被拿走)→ 0.40 就信;卡还亮着 → 名字要 ≥0.50, 或 ≥0.40 且领先第二名 ≥0.15 才信。
            实测:候选里恰好没有真答案时(池子读漏), "蝙蝠骑士"会被认成字形相近的"混沌骑士" 0.44;认对的名字 0.46~0.62 */
@@ -936,6 +985,33 @@ class Tracker {
     /* E. 撤销:确认过的技能连续 6 次清清楚楚"没变"才撤(被选走的东西不会回来, 撤只可能是之前认错) */
     for (const k of Object.keys(this.owner)) if (!ob.taken[k] && !(this.forced && this.forced[k])) { this.log.push(['skill', k, pq(this.owner[k]), 'retract']); delete this.owner[k]; this.known.delete(k); }
     for (const h of Object.keys(this.heroOf)) if (!ob.takenHeroes.includes(h) && !Object.values(this.nameHero || {}).includes(h)) { this.log.push(['hero', h, pq(this.heroOf[h]), 'retract']); delete this.heroOf[h]; this.known.delete('hero:' + h); }
+    // A displaced guess is not another selected hero. Once all ten names are
+    // confirmed the roster is exhaustive; otherwise retract only visible cards.
+    const namedHeroes = new Set(Object.values(this.nameHero || {}));
+    const fullRoster = Object.keys(this.nameHero || {}).length === 10 && namedHeroes.size === 10;
+    for (const k of Object.keys(this.orphan)) if (k.startsWith('hero:')) {
+      const h = k.slice(5);
+      if (this.heroOf[h] || (!ob.takenHeroes.includes(h) && !namedHeroes.has(h)) || (fullRoster && !namedHeroes.has(h))) {
+        delete this.orphan[k]; if (!this.heroOf[h]) this.known.delete(k);
+      }
+    }
+    // At the end, one unread slot and one unassigned selected skill are the
+    // same pick even if their timestamps differ (late icon/drag recovery).
+    // Require a complete physical layout and legal slot kind, never just cap 50.
+    if (!ob.offScreen && (this.unknownBy || []).length === 1 && Object.keys(this.owner).length === 39 &&
+        Object.keys(this.heroOf).length === 10 && new Set(Object.values(this.heroOf).map(q => q.join(''))).size === 10 &&
+        seats.length === 10 && (seats.every(q => this.pc[seatKey(q)] === 4) || (fullRoster && seats.every(q => attributed(q) === 4)))) {
+      const picked = this.pickedKeys(), selected = this.pool.skills.filter(r => picked.has(r.key));
+      const remaining = selected.filter(r => !this.owner[r.key] && r.key[0] !== '?');
+      const q = this.unknownBy[0], mine = this.pool.skills.filter(r => this.owner[r.key] && same(this.owner[r.key], q));
+      const ults = mine.filter(r => r.ultslot).length;
+      if (selected.length === 40 && remaining.length === 1 && mine.length === 3 &&
+          (remaining[0].ultslot ? ults === 0 : ults === 1)) {
+        const k = remaining[0].key; this.owner[k] = q.slice(); this.known.add(k);
+        delete this.suspect[k]; delete this.pend[k]; this.unknownBy = [];
+        anchor(q, true); this.log.push(['skill', k, pq(q), '尾局排除法:40个已选技能、十人四槽，只剩这一格与一个未知占位']);
+      }
+    }
     for (const k of Object.keys(this.suspect)) if (!ob.taken[k]) { delete this.suspect[k]; this.known.delete(k); }
   }
   update(img) {
@@ -952,9 +1028,12 @@ class Tracker {
       const sk = Object.keys(this.owner).filter(k => this.owner[k][0] === q[0] && this.owner[k][1] === q[1]).map(k => ({ key: k }));
       for (const u of unk) if (u[0] === q[0] && u[1] === q[1]) sk.push({ key: '?pick' });
       return { side: p.side, idx: p.idx, hero, skills: sk, filled: p.filled }; });
-    const takenHeroes = Object.keys(this.heroOf).concat(Object.keys(this.orphan || {}).filter(k => k.startsWith('hero:')).map(k => k.slice(5)));
+    const takenHeroes = [...new Set(Object.keys(this.heroOf).concat(Object.keys(this.orphan || {}).filter(k => k.startsWith('hero:')).map(k => k.slice(5))))];
+    // Unknown panel slots and unassigned dark board cells describe overlapping
+    // picks. Count only placeholders not already represented on the board.
+    const unassigned = this.pool.skills.filter(r => pk.has(r.key) && !this.owner[r.key]).length;
     return { pool_heroes: this.pool.poolHeroes, skills: this.pool.skills.map(r => ({ key: r.key, taken: pk.has(r.key), ultslot: !!r.ultslot })), taken_heroes: takenHeroes, panels,
-      extraPicks: unk.length, pendingPair: Object.keys(this.pend || {}).length, suspects: Object.keys(this.suspect || {}), turn: this.turn,
+      extraPicks: Math.max(0, unk.length - unassigned), pendingPair: Object.keys(this.pend || {}).length, suspects: Object.keys(this.suspect || {}), turn: this.turn,
       current: { side: ob.current[0], idx: ob.current[1] }, me: ob.me ? { side: ob.me[0], idx: ob.me[1] } : null, my_turn: !!ob.me && ob.current[0] === ob.me[0] && ob.current[1] === ob.me[1], boxes: this.boxesNow, align: this.pool.align,
       pending: ob.pending || Object.keys(this.pend || {}).length > 0 || Object.keys(this.surSince || {}).length > 0, bulkMsg: ob.bulkMsg, flakyMsg: ob.flakyMsg, occluded: ob.occluded, offScreen: ob.offScreen, offMsg: ob.offMsg, rawDark: ob.rawDark }; }
   /* 引擎看到的"已被拿走" = 配对确认的 + 正在等面板配对的(一两帧内就会确认, 先算上免得局面来回变);被判"不是落子"的不算 */
@@ -979,4 +1058,4 @@ class Tracker {
       seats.push(`${side}${i + 1}:${h ? cn(h) : '-'}|${sk.join('/') || '-'}`); }
     return seats.join('  '); }
 }
-module.exports = { GEO: () => GEO, boxesFor, setSource, cellState, iconScore, skillVerdict, maskedVec, selfScore, heroVerdict, slotFilled, slotSignal, cellVec, _scoreCell: (img, b) => scoreAll(cellVec(img, b)), init, rescale, SCALE: () => SC, readPool, alignBoard, takenFlags, refBrightness, readPanels, matchSkill, calibratePanels, readHeroName, quickPresence, quickSig, boardSig, fastDark, sigDiff, cellBright, cellStats, isDarkCell, Tracker, cn, OWNER: () => OWNER, LAYOUT: () => LAYOUT };
+module.exports = { GEO: () => GEO, boxesFor, setSource, cellState, iconScore, skillVerdict, maskedVec, selfScore, heroVerdict, slotFilled, slotSignal, cellVec, _scoreCell: (img, b) => scoreAll(cellVec(img, b)), init, rescale, SCALE: () => SC, readPool, alignBoard, takenFlags, refBrightness, readPanels, matchSkill, calibratePanels, readHeroName, quickPresence, draftBoardEvidence, pickedCount, quickSig, boardSig, fastDark, sigDiff, cellBright, cellStats, isDarkCell, Tracker, cn, OWNER: () => OWNER, LAYOUT: () => LAYOUT };

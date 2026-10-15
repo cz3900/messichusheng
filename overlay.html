@@ -5,21 +5,22 @@ canvas{position:absolute;left:0;top:0}
 #status{position:absolute;left:12px;top:8px;font:13px/1.4 "Microsoft YaHei",system-ui,sans-serif;color:#ffd76a;text-shadow:0 0 4px #000,0 0 2px #000;pointer-events:none;white-space:pre}
 </style></head><body><canvas id="c"></canvas><div id="status"></div><div id="toast"></div><script src="frames.js"></script><script>
 /* v1.39 报平安: 每 2 秒一次, 带上这段时间画了几帧(页面 JS 卡死 → 不发; 不重绘 → 帧数 0) */
-{ let fr = 0; const f = () => { fr++; requestAnimationFrame(f); }; requestAnimationFrame(f); setInterval(() => { try { ad.ping(fr); } catch (e) { } fr = 0; }, 2000); }
+{ let fr = 0; const f = () => { fr++; requestAnimationFrame(f); }; requestAnimationFrame(f); setInterval(() => { try { draw(); ad.ping({frames:fr,...renderHealth,phase:lastState?.phase,idle:!!lastState?.idle,hidden:!!cfg.hidden,hasAdvice:!!adv,rows:adv?.rows?.length||0,stamp:adv?.stamp,width:cv.width,height:cv.height}); } catch (e) { } fr = 0; }, 2000); }
 
 const cv=document.getElementById('c'),ctx=cv.getContext('2d'),status=document.getElementById('status'),toast=document.getElementById('toast');let toastT=null;
 let scale=1,cfg={all:false,paused:false},lastState=null,adv=null,err='',busy=false;
+let renderHealth={draws:0,lastDrawAt:0,error:null,advicePainted:false};
 function fit(){cv.width=innerWidth;cv.height=innerHeight;}fit();addEventListener('resize',()=>{fit();draw();});
 /* 推荐框的画法和配色都在 frames.js(和设置面板的预览共用一份);颜色/名次范围/粗细来自 cfg.look(设置面板改, 存盘) */
 let look=ADFrames.norm(null);
 function drawPlayers(){
  if(cfg.showPlayerScores===false||!lastState||lastState.phase!=='active'||lastState.idle)return;
  for(const p of lastState.playerScores||[]){
-  const [x,y,w,h]=p.box.map(v=>v/scale),unit=h/176,fs=Math.max(9,12*unit),pad=6*unit;
+  const [x,y,w,h]=p.box.map(v=>v/scale),unit=h/176,fs=Math.max(9,11*unit),pad=6*unit;
   ctx.fillStyle='rgba(0,0,0,.84)';ctx.fillRect(x,y,w,h);
   ctx.font=`bold ${fs}px "Microsoft YaHei",system-ui`;ctx.textBaseline='middle';
   const line=(label,value,index)=>{
-   const yy=y+(16+index*20)*unit;
+   const yy=y+(11+index*17.2)*unit;
    ctx.textAlign='left';ctx.fillStyle='#dce8f2';ctx.fillText(label,x+pad,yy,w-2*pad);
    if(value===undefined)return;
    const n=value==null?null:Math.round(value*100)/100;
@@ -27,31 +28,38 @@ function drawPlayers(){
    ctx.fillText(n==null?'—':(n>0?'+':'')+n.toFixed(2),x+w-pad,yy,w*.53);
   };
   line('组合明细',undefined,0);
-  for(const [i,label,key] of [[1,'基础','main'],[2,'配合','synergy'],[3,'队友','team'],[4,'克制','counter']])line(label,p.parts?.[key]??null,i);
-  line('合计',p.total,5);
-  line(`英雄${p.heroKnown?'✓':'—'}`,undefined,6);
-  line(`技能${p.skillCount}/4${p.unknown?' 待认':''}`,undefined,7);
+  for(const [i,label,key] of [[1,'基础','main'],[2,'配合','synergy'],[3,'队友','team'],[4,'克制','counter'],[5,'份额','share']])line(label,p.parts?.[key]??null,i);
+  line('合计',p.total,6);
+  line(`英雄${p.heroKnown?'✓':'—'} 技能${p.skillCount}/4${p.unknown?' 待认':''}`,undefined,7);
+  /* v1.45 位置建议: 预计=按刷钱上限的期望份额排名; 建议=双方最优分配下该排几号位, 括号=听安排比顺其自然多的分 */
+  const tl=(label,txt,index,color)=>{const yy=y+(11+index*17.2)*unit;ctx.textAlign='left';ctx.fillStyle='#dce8f2';ctx.fillText(label,x+pad,yy,w*.34);ctx.textAlign='right';ctx.fillStyle=color||'#dce8f2';ctx.fillText(txt,x+w-pad,yy,w*.64);};
+  if(p.pos){const q=p.pos;tl('预计',`第${q.expRank}刷钱 ${Math.round(100*q.shareP)}%`,8);
+   if(q.optRank){const g=q.gain||0;tl('建议',`${q.optRank}号位${g>0.02?' +'+g.toFixed(2):g<-0.02?' '+g.toFixed(2):''}`,9,q.optRank<q.expRank?'#7ee0a8':q.optRank>q.expRank?'#ffd27f':'#dce8f2');}else tl('建议','—',9);}
+  else{tl('位置','待定(≥2件)',8);}
  }
 }
-function draw(){ctx.clearRect(0,0,cv.width,cv.height);if(cfg.hidden||(cfg.phase&&cfg.phase!=='active'))return;
+function draw(){try{paint();renderHealth.draws++;renderHealth.lastDrawAt=Date.now();renderHealth.error=null;}catch(e){renderHealth.error=String(e?.stack||e).slice(0,1600);}}
+function paint(){renderHealth.advicePainted=false;ctx.clearRect(0,0,cv.width,cv.height);if(cfg.hidden||(cfg.phase&&cfg.phase!=='active'))return;
  drawPlayers();if(!lastState||lastState.phase!=='active'||lastState.idle||!adv||!adv.rows)return;
  adv.rows.forEach((r,i)=>{if(!r.box)return;const [x,y,w,h]=r.box.map(v=>v/scale);
-  const txt=r.cw!=null?('GPU'+(100*r.cw).toFixed(1)+'% · '+(100*r.p).toFixed(1)):adv.net&&r.np>=0.01?('网'+Math.round(100*r.np)+'% · '+(100*r.p).toFixed(1)):((100*r.p).toFixed(1)+(r.d>=0?' +':' ')+(100*r.d).toFixed(1));
+  const txt=r.cw!=null?(100*r.cw).toFixed(1)+'%':((100*r.p).toFixed(1)+(r.d>=0?' +':' ')+(100*r.d).toFixed(1));
   ADFrames.drawRow(ctx,i,x,y,w,h,txt,look,adv.pre==='preview');
   if(adv.personal&&i<Math.max(10,look.midN)&&r.pm!=null){const t2=`个${r.pm>=0?'+':''}${r.pm.toFixed(1)}`;ctx.font='bold 11px "Segoe UI",system-ui';
    const tw2=ctx.measureText(t2).width+8,bx=x+w-tw2+2,by=y-2;ctx.fillStyle='rgba(0,0,0,.85)';ctx.fillRect(bx,by,tw2,15);
    ctx.fillStyle=r.pm>0.05?'#7ee0a8':(r.pm<-0.05?'#f0908b':'#c9d1d9');ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(t2,bx+tw2/2,by+8);}});
+ /* v1.46 已选满提示: 只画一行, 不画推荐框 */
+ if(adv.note){const t=adv.note;ctx.font='bold 18px "Microsoft YaHei",system-ui';ctx.textAlign='center';ctx.textBaseline='middle';const tw=ctx.measureText(t).width,bx=cv.width/2-tw/2-16,by=84/scale;ctx.fillStyle='rgba(0,0,0,.82)';ctx.fillRect(bx,by,tw+32,34);ctx.lineWidth=2;ctx.strokeStyle='#9ad0ff';ctx.strokeRect(bx,by,tw+32,34);ctx.fillStyle='#cfe8ff';ctx.fillText(t,cv.width/2,by+17);return;}
  /* 顶部一行 */
  const nm=`${adv.side==='L'?'左':'右'}${(adv.seat%5)+1}${adv.my_turn?'(我)':'(队友)'}`;
  const who=adv.pre==='preview'?`${nm} 下一手 · 预估(前面还有 ${adv.ahead} 手, 每有人选都会更新)`:`${nm}${adv.pre?' 马上轮到':' 正在选 · 已锁定'}`;
- const top=adv.rows.slice(0,3).map((r,i)=>['①','②','③'][i]+r.name+' '+(r.cw!=null?'GPU'+(100*r.cw).toFixed(1)+'% ':adv.net&&r.np>=0.01?'网'+Math.round(100*r.np)+'% ':'')+(100*r.p).toFixed(1)).join('  ');
- const cs=adv.combo&&adv.combo.state,mode=adv.combo?(cs==='pending'?'【⚡GPU版 计算中…】':cs==='done'?'【⚡GPU版 已算完】':/^预估/.test(cs||'')?'【🧠预估(网络档) · 轮到时再用显卡算】':`【🧠网络档 · ${cs}】`):adv.net?'【🧠网络档】':adv.personal?`【${adv.plname}】`:'';
+ const top=adv.rows.slice(0,3).map((r,i)=>['①','②','③'][i]+r.name+' '+(100*(r.cw!=null?r.cw:r.p)).toFixed(1)+'%').join('  ');
+ const mode=adv.resultState==='final'&&!busy?'【最终结果】':'【预算结果】';
  const t=`${mode}${who}   我方 ${(100*adv.base).toFixed(1)}%   推荐: ${top}`+(busy?'   (有新选择, 更新中…)':'');
  ctx.font='bold 20px "Microsoft YaHei",system-ui';ctx.textAlign='center';ctx.textBaseline='middle';
  const tw=ctx.measureText(t).width,bx=cv.width/2-tw/2-16,by=84/scale;
  ctx.fillStyle='rgba(0,0,0,.82)';ctx.fillRect(bx,by,tw+32,36);
  ctx.lineWidth=2;ctx.strokeStyle='#ffcc33';ctx.strokeRect(bx,by,tw+32,36);
- ctx.fillStyle='#ffcc33';ctx.fillText(t,cv.width/2,by+18);
+ ctx.fillStyle='#ffcc33';ctx.fillText(t,cv.width/2,by+18);renderHealth.advicePainted=true;
  /* v1.40 推荐理由: GPU 首推不是网络首选时, 说清"高多少、不拿会被谁拿走"(断人型推荐看着怪, 让用户自己判断对面会不会拿) */
  if(adv.pre!=='preview'&&adv.reason&&adv.rows[0]&&adv.rows[0].key===adv.reason.top){const r=adv.reason;
   const tail=r.steps===0?`你下一手还能接着拿`:r.who&&r.pWho>=0.3?`${r.topName}在你下次轮到前 ${Math.round(100*r.p)}% 会被拿走, 最可能是${r.who}(${Math.round(100*r.pWho)}%)`:`${r.topName}多半还会留到你下次(被拿走 ${Math.round(100*r.p)}%)`;
@@ -67,7 +75,7 @@ function st(){const hk=(cfg.hotkey||{}),k=n=>hk[n]?hk[n]:'托盘菜单';
  /* 只在选技时显示:锁上池子(active)才画;没锁上时只有"真看到了棋盘"(检出格≥40, near)才提示正在识别 ——
     游戏里的画面常被粗检当成像棋盘, 以前会一直挂着"看到棋盘, 正在识别池子…"。隐藏时什么都不画 */
  if(cfg.hidden||!lastState||(lastState.idle&&!(lastState.board&&lastState.near))){status.textContent='';return;}
- const s=[];s.push(`AD 助手 v${cfg.version||''} · `+(cfg.paused?`⏸ 已暂停(${k('暂停/继续')} 继续)`:(cfg.all?`团队模式:我方五人(${k('切换显示模式')} 切换)`:`单人模式:只看我(${k('切换显示模式')} 切换)`)+` · 个人权重 ${cfg.plname||'1 团队'}(${k('团队/个人优先')} 切换)`+(cfg.aimode==='net'?' · 🧠 网络档':cfg.aimode==='combo'?' · ⚡ GPU版':'')));
+ const s=[];s.push(`AD 助手 v${cfg.version||''} · `+(cfg.paused?`⏸ 已暂停(${k('暂停/继续')} 继续)`:(cfg.all?`团队模式:我方五人(${k('切换显示模式')} 切换)`:`单人模式:只看我(${k('切换显示模式')} 切换)`)+` · 个人权重 ${cfg.plname||'1 团队'}(${k('团队/个人优先')} 切换)`));
  if(cfg.live&&cfg.live.on)s.push('📺 直播模式: '+(cfg.live.msg||(cfg.live.mode==='window'?'已捕获游戏窗口':'等待游戏窗口…')));
  if(lastState&&lastState.idle)s.push(lastState.waiting?'看到棋盘, 正在识别池子…':'看到棋盘, 等待完整画面…');
  else if(lastState)s.push(`识别 ${lastState.ms}ms${lastState.skipped?'(画面未变)':''} · 池子${lastState.poolOk?'OK':`未认全(${k('重新识别')})`} · 已选走 ${lastState.taken} · 当前 ${lastState.current.side}${lastState.current.idx+1}${lastState.pre?'(已选)':''} 我 ${lastState.me?`${lastState.me.side}${lastState.me.idx+1}${lastState.meSource==='manual'?'(手动)':''}`:'未确定'}${lastState.nextIsMe?' · 下一个是我':''}`);
@@ -80,7 +88,7 @@ function st(){const hk=(cfg.hotkey||{}),k=n=>hk[n]?hk[n]:'托盘菜单';
  if(err)s.push('⚠ '+err);status.textContent=s.join('\n');}
 function flash(t){toast.textContent=t;toast.style.display='block';clearTimeout(toastT);toastT=setTimeout(()=>{toast.style.display='none';},2000);}
 ad.on('cfg',m=>{scale=m.scale||1;const was=cfg.hidden;cfg=m;look=ADFrames.norm(m.look);const k=(m.hotkey||{})['隐藏/显示']||'托盘菜单';
- if(was!==undefined&&was!==m.hidden)flash(m.hidden?`AD 助手已隐藏 · 识别照常运行(${k} 恢复显示)`:`AD 助手恢复显示(${k} 隐藏)`);
+ if(was!==undefined&&was!==m.hidden)flash(m.hidden?`AD 助手已隐藏 · 保留识别，暂停推荐计算(${k} 恢复显示)`:`AD 助手恢复显示(${k} 隐藏)`);
  st();draw();});ad.on('state',m=>{lastState=m;err='';st();draw();});
 ad.on('advice',m=>{adv=m;busy=false;draw();});ad.on('computing',m=>{busy=true;draw();});ad.on('clear',()=>{adv=null;draw();});ad.on('error',m=>{err=(m.msg||'').slice(0,160);st();});
 </script></body></html>

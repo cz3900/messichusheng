@@ -43,7 +43,7 @@ function pickFiles(logdir, logfile, since) {
   try { const b = fs.readFileSync(logfile); out.push({ name: path.basename(logfile), data: b }); total += b.length; } catch (e) { }
   let rest = [];
   try { rest = fs.readdirSync(logdir).filter(f => /\.(png|jsonl)$/i.test(f)).map(f => { const p = path.join(logdir, f), st = fs.statSync(p); return { f, p, st }; })
-    .filter(x => x.st.mtimeMs >= since).sort((a, b) => (a.f.endsWith(".jsonl") === b.f.endsWith(".jsonl") ? b.st.mtimeMs - a.st.mtimeMs : a.f.endsWith(".jsonl") ? -1 : 1)); } catch (e) { }
+    .filter(x => x.st.mtimeMs >= since).sort((a, b) => (/^diag_/.test(b.f)-/^diag_/.test(a.f)) || (a.f.endsWith(".jsonl") === b.f.endsWith(".jsonl") ? b.st.mtimeMs - a.st.mtimeMs : a.f.endsWith(".jsonl") ? -1 : 1)); } catch (e) { }
   for (const x of rest) { if (total + x.st.size > CAP) continue; try { const b = fs.readFileSync(x.p); out.push({ name: x.f, data: b }); total += b.length; } catch (e) { } }
   return out;
 }
@@ -95,7 +95,8 @@ function findPrevUnclean(logdir, logfile) {
   let sent = ""; try { sent = fs.readFileSync(path.join(logdir, "prevcrash_sent.txt"), "utf8"); } catch (e) { }
   if (sent.split(/\r?\n/).includes(x.f)) return null;
   let tail = ""; try { const fd = fs.openSync(x.p, "r"), n = Math.min(4096, x.st.size), b = Buffer.alloc(n); fs.readSync(fd, b, 0, n, x.st.size - n); fs.closeSync(fd); tail = b.toString("utf8"); } catch (e) { return null; }
-  if (/\] stop +退出/.test(tail)) return null;
+  if (/\] stop +退出|\] update +重启插件/.test(tail)) return null;
+  try{x.diagnosticEndMs=Math.max(x.st.mtimeMs,fs.statSync(path.join(logdir,x.f.replace(/^ad_/,"diag_main_").replace(/\.log$/,".jsonl"))).mtimeMs);}catch(_){}
   return x;
 }
 function pickPrev(logdir, x) {
@@ -103,7 +104,7 @@ function pickPrev(logdir, x) {
   const m = /^ad_(\d{4})(\d\d)(\d\d)_(\d\d)(\d\d)(\d\d)\.log$/.exec(x.f), t0 = m ? new Date(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime() : x.st.mtimeMs - 6 * 3600e3;
   let rest = [];
   try { rest = fs.readdirSync(logdir).filter(f => /\.jsonl$/i.test(f)).map(f => ({ f, p: path.join(logdir, f), st: fs.statSync(path.join(logdir, f)) }))
-    .filter(y => y.st.mtimeMs >= t0 && y.st.mtimeMs <= x.st.mtimeMs + 60e3).sort((a, b) => b.st.mtimeMs - a.st.mtimeMs); } catch (e) { }
+    .filter(y => y.st.mtimeMs >= t0 && y.st.mtimeMs <= (x.diagnosticEndMs||x.st.mtimeMs) + 60e3).sort((a, b) => (/^diag_/.test(b.f)-/^diag_/.test(a.f)) || b.st.mtimeMs - a.st.mtimeMs); } catch (e) { }
   for (const y of rest) { if (total + y.st.size > CAP) continue; try { const b = fs.readFileSync(y.p); out.push({ name: y.f, data: b }); total += b.length; } catch (e) { } }
   return out;
 }
@@ -115,10 +116,10 @@ function create(opts) {
   async function run(why, manual) {
     if (busy) return;
     if (!manual && (!opts.enabled() || Date.now() - lastAuto < MIN_GAP)) return;
-    busy = true; opts.flush();
-    await new Promise(r => setTimeout(r, 800));   // 等日志落盘(flushLog 是 500ms 攒一批)
-    const t0 = Date.now(), files = pickFiles(opts.logdir, opts.logfile, since);
+    busy = true;
     try {
+      await opts.flush();
+      const t0 = Date.now(), files = pickFiles(opts.logdir, opts.logfile, since);
       const raw = files.reduce((a, f) => a + f.data.length, 0), zip = makeZip(shrinkSnaps(files));
       const r = await postChunked(zip, { "x-ad-ver": opts.version, "x-ad-id": opts.installId, "x-ad-why": why });
       if (r.code === 200) { since = t0; if (!manual) lastAuto = Date.now(); opts.log("upload", `日志已上传(${why}) ${files.length} 个文件 ${(zip.length / 1048576).toFixed(1)}MB(原 ${(raw / 1048576).toFixed(1)}MB, 分${r.parts}块) 用时${((Date.now() - t0) / 1000).toFixed(0)}s`); }
@@ -128,13 +129,17 @@ function create(opts) {
   }
   setTimeout(async () => {
     if (!opts.enabled()) return; const x = findPrevUnclean(opts.logdir, opts.logfile); if (!x) return;
-    try { fs.appendFileSync(path.join(opts.logdir, "prevcrash_sent.txt"), x.f + "\n"); } catch (e) { }
+    // Mark this previous session sent only after successful upload.
     opts.log("upload", `上一次会话 ${x.f} 没有正常退出(被结束/卡死/崩溃), 补传那份日志`);
-    try { const files = pickPrev(opts.logdir, x), zip = makeZip(files);
+    try { const evidence=opts.collectNativeEvidence?await opts.collectNativeEvidence(x):[];
+      const picked=pickPrev(opts.logdir,x),names=new Set(evidence.map(f=>f.name));const files=[picked[0],...evidence,...picked.slice(1).filter(f=>!names.has(f.name))];
+      let bytes=0;const bounded=files.filter(f=>{if(bytes+f.data.length>CAP)return false;bytes+=f.data.length;return true;}),zip = makeZip(bounded);
       const r = await postChunked(zip, { "x-ad-ver": opts.version, "x-ad-id": opts.installId, "x-ad-why": "prevcrash" });
-      opts.log("upload", r.code === 200 ? `上一次会话日志已补传 ${files.length} 个文件 ${(zip.length / 1048576).toFixed(1)}MB` : `上一次会话日志补传失败 HTTP ${r.code} ${r.body}`);
+      if (r.code === 200) { try { fs.appendFileSync(path.join(opts.logdir, "prevcrash_sent.txt"), x.f + "\n"); } catch (_) {} }
+      opts.log("upload", r.code === 200 ? `上一次会话日志已补传 ${bounded.length} 个文件 ${(zip.length / 1048576).toFixed(1)}MB` : `上一次会话日志补传失败 HTTP ${r.code} ${r.body}`);
     } catch (e) { opts.log("upload", "上一次会话日志补传出错 " + (e.message || e)); }
   }, opts.prevDelay != null ? opts.prevDelay : 30e3);
+  let lastNolock = 0;
   return {
     onPhase(p) {
       if (p === "active") { if (!activeSince) activeSince = Date.now(); rejects = 0; clearTimeout(rejectTimer); return; }
@@ -146,7 +151,9 @@ function create(opts) {
     onLog(tag, msg) {
       if (tag === "snap" && msg.includes("(draft_end")) sawEnd = true;
       else if (tag === "pool" && msg.startsWith("拒绝(")) { rejects++; clearTimeout(rejectTimer);
-        if (rejects >= 8) rejectTimer = setTimeout(() => { rejects = 0; run("nolock", false); }, 120e3); }
+        if (rejects >= 8) rejectTimer = setTimeout(() => { rejects = 0;
+          /* v1.46 限频: 打完停在大厅/结算界面时锁不上棋盘是常态, 一晚上能传十次; 一小时最多一次 */
+          if (Date.now() - lastNolock < 3600e3) return; lastNolock = Date.now(); run("nolock", false); }, 120e3); }
     },
     now() { opts.log("upload", "菜单: 立即上传本次日志"); run("manual", true); },
     /* v1.30 识别线程崩溃: 不等"一局结束"(线程死了永远等不到), 立刻传(仍听"自动上传"开关) */

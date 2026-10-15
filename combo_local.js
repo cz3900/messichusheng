@@ -7,20 +7,26 @@ const E = path.join(__dirname, "engine", "server");
 const AI = require(E + "/ai.js"), F = require(E + "/mcts_fast.js");
 const CAPK = [1, 3, 1];
 let ort = null, sess = null, EP = null, DEV = null, BFIX = 0, INFO = null, MED = null, FP16 = false;
+let sessionModel = null, sessionPreference = null;
+const native = require('./native_monitor').create();
+const nativeRun = (session, feeds) => native.call('infer', { batch: feeds.ids.dims[0] }, () => session.run(feeds));
+const nativeCreate = (model, options) => native.call('session-create', { model: path.basename(model), providers: options.executionProviders, batch: options.freeDimensionOverrides.B }, () => ort.InferenceSession.create(model, options));
+const nativeRelease = session => native.call('session-release', {}, () => session.release());
 /* v1.30: ① 批大小固定(freeDimensionOverrides B=BFIX): 模型里 20 个 Shape/34 个 Concat 等"现算形状"的节点在建会话时就折叠掉
    (369→209 节点), DirectML 上这些节点落在 CPU, 每次调用中途要显卡↔CPU 来回倒;不够一批的补齐(复制第 0 行, 结果丢掉)。
    ② DirectML 逐块显卡(deviceId 0..3)建会话实测, 选最快的 —— 防 Windows 把插件分到核显。每块的结果都写日志。 */
 function dummyBuf(B) { const b = mkBuf(B); for (let i = 0; i < B * 60; i++) { b.ids[i] = (i * 7) % 600; b.legal[i] = 1; b.delta[i] = ((i % 13) - 6) / 10; } b.t.fill(10); return b; }
 async function benchSess(s, B) {
   HAS_EXT = (s.inputNames || []).includes("ext");
-  const b = dummyBuf(B), f = feedsOf(b, B), t0 = Date.now(); await s.run(f); const first = Date.now() - t0, a = [];
-  for (let i = 0; i < 5; i++) { const q = Date.now(); await s.run(f); a.push(Date.now() - q); }
+  const b = dummyBuf(B), f = feedsOf(b, B), t0 = Date.now(); await nativeRun(s, f); const first = Date.now() - t0, a = [];
+  for (let i = 0; i < 5; i++) { const q = Date.now(); await nativeRun(s, f); a.push(Date.now() - q); }
   a.sort((x, y) => x - y); return { first, med: a[2] };
 }
 async function init(modelPath, prefer, bfix) {
+  await native.waitIdle();
   bfix = bfix || 128;
-  if (sess && BFIX === bfix) return INFO;
-  if (sess) { try { await sess.release(); } catch (e) { } sess = null; } FP16 = false;
+  if (sess && BFIX === bfix && sessionModel === modelPath && sessionPreference === prefer) return INFO;
+  if (sess) { await nativeRelease(sess); sess = null; } FP16 = false;
   ort = ort || require("onnxruntime-node");
   const T0 = Date.now(), base = { graphOptimizationLevel: "all", freeDimensionOverrides: { B: bfix } }, notes = [];
   if (process.env.AD_COMBO_THREADS) base.intraOpNumThreads = +process.env.AD_COMBO_THREADS;
@@ -29,12 +35,12 @@ async function init(modelPath, prefer, bfix) {
     let best = null;
     for (let d = 0; d < 4; d++) {
       let s = null; const q = Date.now();
-      try { s = await ort.InferenceSession.create(modelPath, { ...base, executionProviders: [{ name: gpu, deviceId: d }], enableMemPattern: false, executionMode: "sequential" }); }
+      try { s = await nativeCreate(modelPath, { ...base, executionProviders: [{ name: gpu, deviceId: d }], enableMemPattern: false, executionMode: "sequential" }); }
       catch (e) { if (d === 0) notes.push(`${gpu}显卡0 建不起来: ${String(e && e.message || e).slice(0, 120)}`); break; }
       const tc = Date.now() - q; let b = null;
-      try { b = await benchSess(s, bfix); } catch (e) { notes.push(`显卡${d} 试跑出错 ${String(e && e.message || e).slice(0, 80)}`); try { await s.release(); } catch (e2) { } continue; }
+      try { b = await benchSess(s, bfix); } catch (e) { notes.push(`显卡${d} 试跑出错 ${String(e && e.message || e).slice(0, 80)}`); try { await nativeRelease(s); } catch (e2) { } continue; }
       notes.push(`显卡${d}: 建会话${tc}ms 首跑${b.first}ms 每次${b.med}ms`);
-      if (!best || b.med < best.med) { if (best) try { await best.s.release(); } catch (e) { } best = { s, d, med: b.med }; } else try { await s.release(); } catch (e) { }
+      if (!best || b.med < best.med) { if (best) try { await nativeRelease(best.s); } catch (e) { } best = { s, d, med: b.med }; } else try { await nativeRelease(s); } catch (e) { }
       if (gpu === "cuda") break;
     }
     if (best) { sess = best.s; EP = gpu; DEV = best.d; MED = best.med; notes.push(`选用显卡${best.d}`);
@@ -43,22 +49,23 @@ async function init(modelPath, prefer, bfix) {
       const m16 = modelPath.replace(/\.onnx$/, "_fp16.onnx");
       if (m16 !== modelPath && !process.env.AD_NO_FP16 && require("fs").existsSync(m16)) {
         let s16 = null;
-        try { s16 = await ort.InferenceSession.create(m16, { ...base, executionProviders: [{ name: gpu, deviceId: best.d }], enableMemPattern: false, executionMode: "sequential" });
+        try { s16 = await nativeCreate(m16, { ...base, executionProviders: [{ name: gpu, deviceId: best.d }], enableMemPattern: false, executionMode: "sequential" });
           const b16 = await benchSess(s16, bfix); notes.push(`半精度: 每次${b16.med}ms`);
-          if (b16.med < best.med * 0.9) { try { await sess.release(); } catch (e) { } sess = s16; MED = b16.med; FP16 = true; notes.push("选用半精度"); s16 = null; }
+          if (b16.med < best.med * 0.9) { await nativeRelease(sess); sess = s16; MED = b16.med; FP16 = true; notes.push("选用半精度"); s16 = null; }
           else notes.push("半精度不够快, 留单精度");
         } catch (e) { notes.push(`半精度建不起来, 留单精度: ${String(e && e.message || e).slice(0, 100)}`); }
-        if (s16) try { await s16.release(); } catch (e) { }
+        if (s16) try { await nativeRelease(s16); } catch (e) { }
       }
     }
   }
-  if (!sess) { sess = await ort.InferenceSession.create(modelPath, { ...base, executionProviders: ["cpu"] }); EP = "cpu"; DEV = null;
+  if (!sess) { sess = await nativeCreate(modelPath, { ...base, executionProviders: ["cpu"] }); EP = "cpu"; DEV = null;
     const b = await benchSess(sess, bfix); MED = b.med; notes.push(`CPU: 首跑${b.first}ms 每次${b.med}ms`); }
   BFIX = bfix; PAD = null; PBUF = null; HAS_EXT = (sess.inputNames || []).includes("ext");
   if (HAS_EXT) {   /* v1.40 新网络(netC300)多 3 项输入: 需要训练用的两两配合表 pairP.bin(640×640 float32, 下标 = 打分模型 key 顺序, 与 items[i].p 一致) */
     const b = require("fs").readFileSync(path.join(path.dirname(modelPath), "pairP.bin")); PN = Math.round(Math.sqrt(b.length / 4));
     PAIR = new Float32Array(b.buffer.slice(b.byteOffset, b.byteOffset + b.length)); notes.push(`新输入配合表 ${PN}×${PN}`); }
   INFO = { ep: EP + (FP16 ? "·半精度" : ""), dev: DEV, bfix, med: MED, fp16: FP16, detail: notes.join(" | "), ms: Date.now() - T0 };
+  sessionModel = modelPath; sessionPreference = prefer;
   return INFO;
 }
 function ownerOf(st, sim, cur) {
@@ -75,6 +82,7 @@ function encodeRange(sims, owns, tAbs, buf, base) {
     const b = base + k, sim = sims[k], own = owns[k], o = b * 60;
     for (let i = 0; i < 60; i++) {
       const it = sim.items[i], ow = own[i];
+      if (!it) throw new Error("无效技能池：不足 60 项，停止 GPU 编码");
       buf.ids[o + i] = it.p >= 0 ? it.p : 640;
       const rel = ow < 0 ? 0 : ((ow % 5 - seat % 5) + 5) % 5;
       buf.code[o + i] = ow < 0 ? 0 : ((ow < 5) === mySide ? 1 + rel : 6 + rel);
@@ -109,7 +117,7 @@ async function logits(buf, B) {
       dst.set(src.subarray(b0 * w, (b0 + n) * w), 0);
       for (let r = n; r < BFIX; r++) dst.copyWithin(r * w, 0, w); }
     const f = feedsOf(PAD, BFIX), q2 = Date.now(); ST.build += q2 - q;
-    const r = await sess.run(f), dt = Date.now() - q2; ST.run += dt; ST.runs.push(dt); ST.calls++;
+    const r = await nativeRun(sess, f), dt = Date.now() - q2; ST.run += dt; ST.runs.push(dt); ST.calls++;
     out.set(r.logits.data.subarray(0, n * 60), b0 * 60);
   }
   return out;
@@ -223,7 +231,9 @@ async function rollouts(sim0, own0, me, forceAt, cs, seed, o = {}) {
   const B = cs.length, T0 = Date.now(); if (!B) return { v: new Float64Array(0), pre: new Int16Array(0), steps: 0, calls: 0, tot: 0, uniq: 0, ms: 0 };
   const NT = o.threads | 0;
   if (NT > 1 && B >= 64 && !o.nodedup) return rolloutsMT(sim0, own0, me, forceAt, cs, seed, o, NT);
-  const rngs = Array.from({ length: B }, (_, b) => simRng(seed, b));
+  /* v1.41 两步计划: o.yb[b] = 这一局"我下次轮到时回手拿"的件(-1 不管); o.crn = 配对随机数(各线的第 r 局共用一串随机数, 比较时噪音互相抵消, 09-25 实测差值标准差 1.27→0.97pp) */
+  const CRN = !!o.crn, YB = o.yb || null; let nextDone = false;
+  const rngs = new Array(B); { const cnt = new Map(); for (let b = 0; b < B; b++) { let r = b; if (CRN) { const key = cs[b] + "|" + (YB ? YB[b] : -1); r = cnt.get(key) || 0; cnt.set(key, r + 1); } rngs[b] = simRng(seed, r); } }
   const sims = new Array(B), owns = new Array(B);
   for (let b = 0; b < B; b++) { sims[b] = F.cloneSim(sim0); owns[b] = Int8Array.from(own0); }
   const pre = new Int16Array(B * Math.max(1, forceAt)).fill(-1);
@@ -253,7 +263,7 @@ async function rollouts(sim0, own0, me, forceAt, cs, seed, o = {}) {
       ST.build += Date.now() - q; PROF.enc += Date.now() - q; return m; };
     const runChunk = c => { const q = Date.now(); ST.calls++;
       if (process.env.AD_COMBO_FAKE) return Promise.resolve({ L: new Float32Array(BFIX * 60), q });
-      return sess.run(feedsOf(PBUF[c & 1], BFIX)).then(r => { const dt = Date.now() - q; ST.run += dt; ST.runs.push(dt); return { L: r.logits.data, q }; }); };
+      return nativeRun(sess, feedsOf(PBUF[c & 1], BFIX)).then(r => { const dt = Date.now() - q; ST.run += dt; ST.runs.push(dt); return { L: r.logits.data, q }; }); };
     const sampleChunk = (c, L) => { const qs = Date.now(); try { return sampleChunk0(c, L); } finally { PROF.samp += Date.now() - qs; } };
     const sampleChunk0 = (c, L) => { const pb = PBUF[c & 1], r0 = c * BFIX, m = Math.min(BFIX, n - r0);
       const cum = new Float64Array(m * 60), Z = new Float64Array(m);
@@ -263,6 +273,7 @@ async function rollouts(sim0, own0, me, forceAt, cs, seed, o = {}) {
         if (!(Z[r] > 0)) { F.passSim(sims[b]); continue; }
         const u = U[b] * Z[r]; let pick = -1; for (let i = 0; i < 60; i++) if (pb.legal[o6 + i] && cum[o6 + i] >= u) { pick = i; break; }
         if (pick < 0) { F.passSim(sims[b]); continue; }
+        if (YB && forced && seat === me && !nextDone) { const y = YB[b]; if (y >= 0 && !sims[b].taken[y] && sims[b].items[y].p >= 0 && sims[b].slot[me * 3 + sims[b].items[y].kind] < CAPK[sims[b].items[y].kind]) pick = y; }   // 回手: Y 还在就拿 Y, 不在就按网络
         F.applySim(sims[b], pick); owns[b][pick] = seat; if (!forced && k < forceAt) pre[b * forceAt + k] = pick; } };
     /* 编码 c → 等 c-1 算完 → 发 c → 给 c-1 抽样(此时显卡在算 c) */
     let inflight = null;
@@ -274,11 +285,55 @@ async function rollouts(sim0, own0, me, forceAt, cs, seed, o = {}) {
       if (prev) sampleChunk(c - 1, prev.L);
     }
     if (inflight) { const qw = Date.now(); const last = await inflight; PROF.wait += Date.now() - qw; sampleChunk(nch - 1, last.L); }
+    if (forced && seat === me) nextDone = true;
     k++; steps++;
   }
   if (process.env.AD_MT_PROF) { console.log(`[单线程] 共${Date.now() - T0}ms = 去重${PROF.dedup} + 编码${PROF.enc} + 抽样落子${PROF.samp} + 等显卡${PROF.wait}`); for (const k in PROF) PROF[k] = 0; }
   const sg = me < 5 ? 1 : -1, v = new Float64Array(B); for (let b = 0; b < B; b++) v[b] = 1 / (1 + Math.exp(-sg * sims[b].z));
-  return { v, pre, steps, calls: ST.calls - calls0, tot, uniq, ms: Date.now() - T0 };
+  return { v, pre, steps, calls: ST.calls - calls0, tot, uniq, ms: Date.now() - T0, owns: o.wantOwns ? owns : undefined };
+}
+
+/* v1.41 两步计划(用户 09-25): "这一手 X + 我下次轮到时回手拿 Y"一起推演。
+   修的是推演里"以后的我不补组合另一半"的偏: rollouts 里以后的我按网络选, 而网络在"手里已有一半"的局面上常给另一半 0%(09-24 局第 9 手: 先拿狂战士之血本可第 12 手稳补智慧之刃 53.5%, 推演里的我却去拿棒击大地 → 误判成 44%)。
+   plan(): 别人回合(后台)从当前局面算两步表: X = 筛选表前 NX ∪ 一步加分前 NX, 每个 X 配"拿了 X 之后一步加分前 NY"的 Y, 每条线 R 局, 配对随机数, 记下轮到我之前别人拿了什么(前缀)。
+   planFinal(): 轮到我: 只留前缀与真实一致的样本, 按均值排前 NTOP 条线, 用准确局面补到 RT 局; 返回各线胜率, 由 worker 与现行结果比大小。
+   竞技场 09-25(arena/f/pf4, pf5): 轮到时全算 +0.70pp(308 局 t=2.4); 预处理版 +0.45pp(154 局 t=1.6), 轮到时只多约 34 次网络调用; 改判阈值(防抖)有害, 不设。 */
+const gainsFor = (sim, me) => { const BI = new Int32Array(64), BV = new Float64Array(64), so = sim.order, ss = sim.step; sim.order = [me]; sim.step = 0; F.setPolicyFix(true); let n = 0;
+  try { n = F.scoreAll(sim, BI, BV); } finally { F.setPolicyFix(false); sim.order = so; sim.step = ss; } const g = new Map(); for (let q = 0; q < n; q++) g.set(BI[q], BV[q]); return g; };
+const meanOf = a => a.length ? a.reduce((p, q) => p + q, 0) / a.length : -1;
+async function plan(st, me, t0, o = {}) {
+  const T0 = Date.now(), sim0 = AI._simFrom(st), own0 = ownerOf(st, sim0, me), NX = o.NX || 6, NY = o.NY || 4, R = o.R || 48;
+  const forceAt = sim0.order.slice(sim0.step).indexOf(me); if (forceAt < 0) return null;
+  if (sim0.order.slice(sim0.step + forceAt + 1).indexOf(me) < 0) return null;   // 没有"下下手"(最后一手)
+  const idx = k => sim0.items.findIndex(x => x.key === k), g0 = gainsFor(F.cloneSim(sim0), me);
+  const xs = (o.keys || []).map(idx).filter(x => x >= 0 && g0.has(x)).slice(0, NX);
+  for (const [x] of [...g0.entries()].sort((a, b) => b[1] - a[1]).slice(0, NX)) if (!xs.includes(x)) xs.push(x);   // 一步加分前 NX 也要: 现行推演系统性低估"组合的前一半"
+  const lines = []; for (const x of xs) { const s = F.cloneSim(sim0); F.applySim(s, x); const g1 = gainsFor(s, me);
+    for (const [y] of [...g1.entries()].filter(([y]) => y !== x).sort((a, b) => b[1] - a[1]).slice(0, NY)) lines.push({ x, y }); }
+  if (!lines.length) return null;
+  const cs = [], yb = []; for (const l of lines) for (let r = 0; r < R; r++) { cs.push(l.x); yb.push(l.y); }
+  const r = await rollouts(sim0, own0, me, forceAt, cs, o.seed || 5, { ...o, yb: Int16Array.from(yb), crn: true, t0, st }); if (!r || r.timeout) return r;
+  const fa = Math.max(1, forceAt);
+  lines.forEach((l, q) => { l.S = Array.from(r.v.subarray(q * R, q * R + R)); l.PRE = []; for (let b = q * R; b < q * R + R; b++) l.PRE.push(r.pre.subarray(b * fa, b * fa + forceAt)); });
+  LAST.plan = { me, from: t0, slot: t0 + forceAt, forceAt, seats: sim0.order.slice(sim0.step, sim0.step + forceAt), lines };
+  const rows = lines.map(l => ({ x: sim0.items[l.x].key, y: sim0.items[l.y].key, win: meanOf(l.S), n: l.S.length })).sort((a, b) => b.win - a.win);
+  return { rows, lines: lines.length, forceAt, ms: Date.now() - T0, calls: r.calls, tot: r.tot, uniq: r.uniq };
+}
+async function planFinal(st, me, t0, o = {}) {
+  const T0 = Date.now(), sim0 = AI._simFrom(st), own0 = ownerOf(st, sim0, me), RT = o.RT || 128, NTOP = o.NTOP || 3, MINKEEP = o.minKeep || 4;
+  if (sim0.order[sim0.step] !== me) return null;
+  const P = LAST.plan;
+  if (!P || P.me !== me || P.slot !== t0) return { rows: [], why: !P ? "无两步表" : P.me !== me ? "两步表不是我的" : `两步表是第${P.slot + 1}手的`, from: P ? P.from : -1, ms: Date.now() - T0, reused: 0, fresh: 0, calls: 0 };
+  const ok = i => i >= 0 && !sim0.taken[i] && sim0.items[i].p >= 0 && sim0.slot[me * 3 + sim0.items[i].kind] < CAPK3[sim0.items[i].kind];
+  const cand = []; let reused = 0;
+  for (const l of P.lines) { if (!ok(l.x) || sim0.taken[l.y]) continue;   // X 已被拿走/Y 已没了 → 这条线作废
+    const S = []; for (let q = 0; q < l.S.length; q++) { const pr = l.PRE[q]; let m = true; for (let k = 0; k < P.forceAt; k++) if (pr[k] < 0 || own0[pr[k]] !== P.seats[k]) { m = false; break; } if (m) S.push(l.S[q]); }
+    reused += S.length; cand.push({ x: l.x, y: l.y, S, est: S.length >= MINKEEP ? meanOf(S) : meanOf(l.S) - 0.02 }); }   // 前缀一致的样本不够就按全部样本估、打个折
+  cand.sort((a, b) => b.est - a.est); const top = cand.slice(0, NTOP);
+  const cs = [], yb = [], who = []; top.forEach((c, q) => { for (let r = c.S.length; r < RT; r++) { cs.push(c.x); yb.push(c.y); who.push(q); } });
+  let calls = 0; if (cs.length) { const r = await rollouts(sim0, own0, me, 0, cs, o.seed || 7, { ...o, yb: Int16Array.from(yb), crn: true, t0, st }); if (!r || r.timeout) return r; who.forEach((q, b) => top[q].S.push(r.v[b])); calls = r.calls; }
+  const rows = top.map(c => ({ x: sim0.items[c.x].key, y: sim0.items[c.y].key, win: meanOf(c.S), n: c.S.length })).sort((a, b) => b.win - a.win);
+  return { rows, from: P.from, reused, fresh: cs.length, calls, ms: Date.now() - T0 };
 }
 
 /* ④ 多线程: 一批推演局按局号均分给 N 个分片线程(combo_sub2.js), 各自去重/编码/抽样落子; 本线程只拼批、跑网络、把结果发回去。
@@ -313,7 +368,7 @@ async function rolloutsMT(sim0, own0, me, forceAt, cs, seed, o, NT) {
       for (const key in W_OF) { const w = W_OF[key]; for (let r = m; r < BFIX; r++) pb[key].copyWithin(r * w, 0, w); }
       ST.build += Date.now() - q; ST.calls++; tC += Date.now() - q;
       let L; if (process.env.AD_COMBO_FAKE) L = new Float32Array(BFIX * 60);
-      else { const q2 = Date.now(); L = (await sess.run(feedsOf(pb, BFIX))).logits.data; const dt = Date.now() - q2; ST.run += dt; ST.runs.push(dt); tN += dt; }
+      else { const q2 = Date.now(); L = (await nativeRun(sess, feedsOf(pb, BFIX))).logits.data; const dt = Date.now() - q2; ST.run += dt; ST.runs.push(dt); tN += dt; }
       const q3 = Date.now(); for (let r = 0; r < m; r++) { const [i, rr] = rows[r0 + r]; parts[i].s.views.logits.set(L.subarray(r * 60, r * 60 + 60), rr * 60); } tC += Date.now() - q3;
     }
     const q4 = Date.now(); rep = await Promise.all(parts.map(p => ask2(p.s, { type: "sample" }))); steps++; tW += Date.now() - q4;
@@ -343,7 +398,7 @@ async function fate(st, me, t0, altKey, tgtKey, o = {}) {
       const m = Math.min(BFIX, rep.length - r0), pb = PBUF[0];
       encodeRange(rep.slice(r0, r0 + m).map(b => sims[b]), rep.slice(r0, r0 + m).map(b => owns[b]), Math.min(49, t0 + k), pb, 0);
       for (const key in W_OF) { const w = W_OF[key]; for (let r = m; r < BFIX; r++) pb[key].copyWithin(r * w, 0, w); }
-      const L = process.env.AD_COMBO_FAKE ? new Float32Array(BFIX * 60) : (await sess.run(feedsOf(pb, BFIX))).logits.data; ST.calls++;
+      const L = process.env.AD_COMBO_FAKE ? new Float32Array(BFIX * 60) : (await nativeRun(sess, feedsOf(pb, BFIX))).logits.data; ST.calls++;
       for (let b = 0; b < B; b++) { const r = map[b] - r0; if (r < 0 || r >= m) continue; const o6 = r * 60;
         let mx = -Infinity; for (let i = 0; i < 60; i++) if (pb.legal[o6 + i] && L[o6 + i] > mx) mx = L[o6 + i];
         let z = 0; for (let i = 0; i < 60; i++) if (pb.legal[o6 + i]) z += Math.exp(L[o6 + i] - mx);
@@ -450,4 +505,9 @@ function extFill(sim, own, seat, buf, b) {
       let h = 0; for (const x of owned[oi]) { const v = PAIR[row + pp[x]]; if (v > 0) h += v; } if (h > hv) hv = h; const p2 = pot(o, i); if (p2 > po) po = p2; }
     buf.ext[q + 1] = hv; buf.ext[q + 2] = po; }
 }
-module.exports = { _setPair: (P, n) => { PAIR = P; PN = n; HAS_EXT = true; }, extFill, fate, init, decide, decideMT, ownerOf, encodeRange, views, rng, logits, statReset, statOut, rollouts, screen, final, refine, myCands, LAST, info: () => INFO, simRng, ownKey, mkBuf };
+async function dispose() {
+  await native.waitIdle();
+  if(sess){await nativeRelease(sess);sess=null;}INFO=null;BFIX=0;sessionModel=null;
+  await Promise.all([...(SUBS||[]),...(SUB2||[]).map(s=>s.w)].map(w=>w.terminate()));SUBS=null;SUB2=null;
+}
+module.exports = { dispose, setDiagnosticHook: native.setHook, nativeSnapshot: native.snapshot, _setPair: (P, n) => { PAIR = P; PN = n; HAS_EXT = true; }, extFill, fate, plan, planFinal, gainsFor, init, decide, decideMT, ownerOf, encodeRange, views, rng, logits, statReset, statOut, rollouts, screen, final, refine, myCands, LAST, info: () => INFO, simRng, ownKey, mkBuf };

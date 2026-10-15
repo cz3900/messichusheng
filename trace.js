@@ -18,7 +18,7 @@ const q1 = v => Math.round(v * 10) / 10;
 /* 重锁时 worker.js 从旧追踪器搬过来的字段(必须和 worker.js tryLock 里那张表一致) */
 const CARRY = ["owner", "heroOf", "suspect", "pend", "unknownBy", "orphan", "forced", "pc", "pcRaw", "pcRun", "pcInit",
   "surSince", "turn", "flaky", "flips", "hold", "nameHero", "nameRun", "stable", "darkRun", "brightRun", "bhist",
-  "firstT", "pickT", "frameNo", "meSeat", "meVotes", "meAuto", "curSeat", "nameSize", "refMaxAll"];
+  "firstT", "pickT", "frameNo", "meSeat", "meVotes", "meAuto", "curSeat", "nameSize", "refMaxAll", "joinedMidDraft"];
 /* 分数行用 int16(1e-4 精度)而不是 int8:阈值(0.3/0.45/0.6…)边上差 0.008 就可能翻判, 回放就不再是**同一件事**了。
    实测 int8 会让 8 条日志的分数差 0.01;换 int16 后逐字相同。 */
 const i8 = a => { const b = Buffer.allocUnsafe(a.length * 2);
@@ -61,7 +61,7 @@ class Frame {
     const P = row.pv || (row.pv = un8(row.p)); let b1 = -9, k1 = null, b2 = -9, k2 = null;
     for (const k of cands) { const i = this.poolKeys.indexOf(k); let s;
       if (i >= 0) s = P[i];
-      else { const g = (row.g || []).find(x => x[0] === k); if (g) s = g[1]; else { if (this.img) { s = R.matchSkill(this.img, this._box(slot), [k]).s1; this._extra(row, k, s); } else { this._gap("key " + k); continue; } } }
+      else { const g = (row.g || []).find(x => x[0] === k); if (g) s = g[1]; else { if (this.img) { s = R.matchSkill(this.img, this._box(slot).slice(), [k]).s1; this._extra(row, k, s); } else { this._gap("key " + k); continue; } } }
       if (s > b1) { b2 = b1; k2 = k1; b1 = s; k1 = k; } else if (s > b2) { b2 = s; k2 = k; } }
     return { key: k1, s1: b1, key2: k2, s2: b2 }; }
   /* 某个槽对**池子里每件技能**的整行分数(顺序同 head.poolKeys)。2.0 的面板证据按整行累加, 不逐件问。 */

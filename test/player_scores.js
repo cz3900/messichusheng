@@ -11,7 +11,7 @@ const seats = Array.from({length:10},()=>[]);seats[0]=['hero:'+h.id,...skills];
 assert.equal(rows.length,10);
 assert.equal(rows[0].total,win.ADScore.evaluate(seats).seats[0].total);
 const expected=win.ADScore.evaluate(seats).seats[0];
-assert.deepEqual(rows[0].parts,{main:expected.main2,synergy:expected.syn2,team:expected.cross,counter:expected.ctr});
+assert.deepEqual(rows[0].parts,{main:expected.main2,synergy:expected.syn2,team:expected.cross,counter:expected.ctr,share:expected.share||0});
 assert.ok(Math.abs(Object.values(rows[0].parts).reduce((a,b)=>a+b,0)-rows[0].total)<1e-10);
 assert.equal(rows[9].parts,null);
 assert.equal(rows[0].heroKnown,true);assert.equal(rows[0].skillCount,4);

@@ -15,7 +15,7 @@ const fs = require("fs"), path = require("path");
 
 function loadModel(pubDir) {
   const win = {}, atobShim = s => Buffer.from(s, "base64").toString("binary");
-  for (const f of ["ad_data.js", "ad_model.js", "ad_score.js"])
+  for (const f of ["ad_data.js", "ad_model.js", "ad_trio.js", "ad_score.js"])
     new Function("window", "atob", fs.readFileSync(path.join(pubDir, f), "utf8"))(win, atobShim);
   return win;
 }
@@ -32,6 +32,9 @@ function buildEngine(win) {
     for (const [a, bs] of Object.entries(dp)) { if (a.startsWith("_")) continue; const pa = toP(a); const pb = bs.map(toP).filter(x => x >= 0); if (pa >= 0 && pb.length) { DEPP[pa] = pb; n++; } }
     G.DEPP = n ? DEPP : null; G.DEPN = n;
   } catch (e) { G.DEPP = null; G.DEPN = 0; console.error("hard_deps.json", e.message); }
+  G.DEAD = new Map();
+  for (const [h, ks] of Object.entries(HERO_DEAD)) { const ph = G.at(h), ps = ks.map(k => G.at(k)).filter(x => x >= 0); if (ph >= 0 && ps.length) G.DEAD.set(ph, new Set(ps)); }
+  if (!G.DEAD.size || process.env.AI_HERO_DEAD === "0") G.DEAD = null;
   return G;
 }
 function buildEngineInner(win) {
@@ -45,9 +48,15 @@ function buildEngineInner(win) {
   const CL = M.cp ? M.cl : null, CP = M.cp ? b64f32(M.cp) : null, NCL = M.ncl || 0;
   /* 选手策略用(09-09):每件东西的平均配合 r_a(归因层 ANOVA 的泛用项)+ 打钱权重均值 */
   const RGV = M.rg ? b64f32(M.rg) : null;
+  /* 份额层(09-29):每件 sb=刷钱上限, sd=吃资源斜率;和 public/ad_score.js 同源 */
+  const SB = M.sb ? b64f32(M.sb) : null, SD = M.sd ? b64f32(M.sd) : null;
+  const SC = M.sc ? b64f32(M.sc) : null, SCE = M.scedges || null, SCS = M.scscale == null ? 0.7 : M.scscale;
   const MEANFW = FW ? Array.from(FW).reduce((a, b) => a + b, 0) / FW.length : 0;
   /* 玩家意见压缩表(09-08):key(a*n+b, a<b) → 压掉的分(负数),和 public/ad_score.js 的 sqOf 同源 */
   let SQ = null;
+  /* 逐对修正层(09-25):上三角 Int16(δ/pfs), 下标同 gk;直接加进配合项,不进 g 收缩。和 public/ad_score.js 的 pfOf 同源 */
+  let PF = null, PFS = 1e-4;
+  if (M.pfq) { const pb = Buffer.from(M.pfq, "base64"); PF = new Int16Array(pb.buffer.slice(pb.byteOffset, pb.byteOffset + pb.length)); PFS = M.pfs || 1e-4; }
   if (M.sqk && M.sqv) { const kb = Buffer.from(M.sqk, "base64"), sk = new Int32Array(kb.buffer.slice(kb.byteOffset, kb.byteOffset + kb.length)), sv = b64f32(M.sqv);
     SQ = new Map(); for (let q = 0; q < sk.length; q++) SQ.set(sk[q], sv[q * 2]); }
   /* 小样本正配合收缩(09-09):启动时预算一张 n×n 修正表 CORR[a*n+b] = (g−1)·max(真交互+压缩, 0),
@@ -90,6 +99,23 @@ function buildEngineInner(win) {
       PA[i * 8 + q] = a; }
   }
   const at = k => { const v = idx[k]; return v === undefined ? -1 : v; };
+  const TPAIR = new Map(), TTRIPLE = new Map();
+  const trioPairKey = (a, b) => a < b ? a * M.n + b : b * M.n + a;
+  const trioKey = (a, b, c) => { if (a > b) [a, b] = [b, a]; if (b > c) [b, c] = [c, b]; if (a > b) [a, b] = [b, a]; return (a * M.n + b) * M.n + c; };
+  if (win.AD_TRIO) for (const row of win.AD_TRIO.trios) {
+    const a = at(row[0]), b = at(row[1]), c = at(row[2]);
+    if (a < 0 || b < 0 || c < 0) throw new Error("三件修正表的技能不在模型里");
+    TPAIR.set(trioPairKey(a, b), row[3]); TTRIPLE.set(trioKey(a, b, c), row[4]);
+  }
+  const trioDelta = (p, si) => {
+    if (!TPAIR.size) return 0;
+    let v = 0;
+    for (let q = 0; q < si.length; q++) {
+      v += TPAIR.get(trioPairKey(p, si[q])) || 0;
+      for (let r = q + 1; r < si.length; r++) v += TTRIPLE.get(trioKey(p, si[q], si[r])) || 0;
+    }
+    return v;
+  };
   const cpair = (i, j) => { if (!CP || i < 0 || j < 0) return 0;
     let a = CL[i], b = CL[j]; if (a > b) { const t = a; a = b; b = t; }
     return CP[a * NCL - a * (a - 1) / 2 + (b - a)]; };
@@ -97,6 +123,7 @@ function buildEngineInner(win) {
   /* si(可选):放入前座位已有的下标;给了才做条件收缩 */
   const sqd = (i, j, si) => { if (i < 0 || j < 0) return 0; let v = 0;
     if (SQ) { const t = SQ.get(i < j ? i * nn_ + j : j * nn_ + i); if (t !== undefined) v += t; }
+    if (PF && i !== j) { const a = i < j ? i : j, b = i < j ? j : i; v += PF[a * (2 * nn_ - a - 1) / 2 + (b - a - 1)] * PFS; }
     if (CORR) { const key = i * nn_ + j; v += (CC && si && CC[key] >= 0 && si.indexOf(CC[key]) < 0) ? CORR2[key] : CORR[key]; } return v; };
   /* 放入 p 时:座位里已有的对 (q,r) 若以 p 为条件,修正从 CORR2 回到 CORR */
   const condBack = (p, si) => { if (!ISC || p < 0 || !ISC[p]) return 0; let v = 0;
@@ -110,9 +137,26 @@ function buildEngineInner(win) {
   /* sax_p/ASD 预先除好,省得每次除 */
   const SAXn = SAX ? new Float32Array(SAX.length) : null;
   if (SAX) for (let p = 0; p < M.n; p++) for (let k = 0; k < NAX; k++) SAXn[p * NAX + k] = SAX[p * NAX + k] / ASD[k];
-  return { K, KS, W, E, FW, KNOT, TH, AV, SAXn, AMU, ASD, NAX, CP, cpair, sqd, condBack, seg, at, n: M.n,
-           EN, TQAX, TQMUAX, TQHMU, TQHSD, TQG, PA, RG: RGV, MEANFW };
+  return { K, KS, W, E, FW, KNOT, TH, AV, SAXn, AMU, ASD, NAX, CP, cpair, sqd, condBack, trioDelta, seg, at, n: M.n,
+           EN, TQAX, TQMUAX, TQHMU, TQHSD, TQG, PA, RG: RGV, MEANFW, SB, SD, SC, SCE, SCS };
 }
+
+/* ---- 英雄机制(09-29, 用户裁定): 美杜莎座位上这几件按"空一个技能"算 —— 不给单件分、不进任何配合/克制/配比/份额。
+   与 public/ad_score.js 的 HERO_DEAD 同源, 改一处必须改两处。 ---- */
+const HERO_DEAD = { "hero:94": ["primal_beast_uproar", "tidehunter_kraken_shell", "huskar_berserkers_blood"] };
+function deadIn(G, list, p) { if (!G.DEAD) return false; for (let q = 0; q < list.length; q++) { const d = G.DEAD.get(list[q]); if (d && d.has(p)) return true; } return false; }
+function killsIn(G, list, p) { const d = G.DEAD && G.DEAD.get(p); if (!d) return null; let out = null; for (let q = 0; q < list.length; q++) if (d.has(list[q])) (out || (out = [])).push(list[q]); return out; }
+/* 英雄进了已经有"死件"的座位: 按最终阵容整局重算(整局分只取决于阵容, 与拿的顺序无关) */
+function rebuildSim(s, seat, addP, drop) {
+  const G = s.G, seq = [];
+  for (let q = 0; q < 10; q++) for (const p of s.seatItems[q]) if (!(q === seat && drop.includes(p))) seq.push([q, p]);
+  if (addP >= 0) seq.push([seat, addP]);
+  const items = seq.map(x => ({ p: x[1], kind: 0 })), order = seq.map(x => x[0]);
+  const r = makeSim(G, items, order);
+  for (let j = 0; j < seq.length; j++) { r.z += deltaOf(r, j); seedItem(r, order[j], items[j].p); r.step++; }
+  return r;
+}
+function adoptSim(s, r) { for (const k of ["SA", "seatItems", "gold", "A", "uu", "z", "U", "Usq", "ac8", "tq8", "TC", "sumB", "sumD", "sumC"]) s[k] = r[k]; }
 
 /* ---- 模拟状态 ---- */
 function makeSim(G, items, order) {
@@ -132,6 +176,9 @@ function makeSim(G, items, order) {
     ac8: G.TQG ? new Float64Array(NS * 8) : null,   // 每座位 8 轴未归一投影
     tq8: G.TQG ? new Float64Array(NS * 8) : null,   // 每座位归一后的 8 轴坐标
     TC:  G.TQG ? new Float64Array(2 * 8) : null,    // 每队 8 轴坐标之和
+    sumB: G.SB ? new Float64Array(NS) : null,       // 每座位 Σsb(刷钱上限)
+    sumD: G.SB ? new Float64Array(NS) : null,       // 每座位 Σsd(斜率)
+    sumC: G.SC ? new Float64Array(NS * 10) : null,  // 每座位 10 档曲线之和(团队模式用)
   };
   for (let t = 0; t < 2; t++) for (let k = 0; k < NAX; k++) s.uu[t * NAX + k] = -G.AMU[k] / G.ASD[k];
   return s;
@@ -142,7 +189,7 @@ function cloneSim(s) {
     taken: s.taken.slice(), SA: s.SA.slice(), seatItems: s.seatItems.map(x => x.slice()),
     slot: s.slot.slice(), gold: s.gold.slice(), A: s.A.slice(), uu: s.uu.slice(), z: s.z,
     U: s.U && s.U.slice(), Usq: s.Usq && s.Usq.slice(), ac8: s.ac8 && s.ac8.slice(),
-    tq8: s.tq8 && s.tq8.slice(), TC: s.TC && s.TC.slice() };
+    tq8: s.tq8 && s.tq8.slice(), TC: s.TC && s.TC.slice(), sumB: s.sumB && s.sumB.slice(), sumD: s.sumD && s.sumD.slice(), sumC: s.sumC && s.sumC.slice() };
 }
 const simDone = s => s.step >= s.order.length;
 const moverSeat = s => s.order[s.step];
@@ -170,11 +217,57 @@ function tqDelta(s, p, seat, d8) {
   return t === 0 ? dtq : -dtq;
 }
 
+/* 份额层:队 t 的份额项合计 = Σ_座位 sumD·(softmax(sumB)−0.2)·10;addSeat/addB/addD 表示假设往某座位再加一件 */
+const _sbv = new Float64Array(5), _sdv = new Float64Array(5), _cr = new Int8Array(5);
+/* 份额模式: expect(默认) / optimalL / optimalR / optimalBoth —— 和 public/ad_score.js 同源 */
+let SHARE_MODE = process.env.AI_SHARE_MODE || "expect";
+const setShareMode = m => { SHARE_MODE = m || "expect"; };
+const getShareMode = () => SHARE_MODE;
+const LADDER = [0.343, 0.255, 0.193, 0.132, 0.077];
+const TPL = [[0.47,0.22,0.15,0.10,0.05],[0.38,0.31,0.16,0.10,0.05],[0.37,0.23,0.18,0.14,0.08],[0.33,0.28,0.23,0.11,0.05],[0.28,0.24,0.20,0.17,0.10]];   // 09-29 分工模板(与 public/ad_score.js 同源)
+const PERMS = (() => { const out = [], a = [0, 1, 2, 3, 4]; (function rec(k) { if (k === 5) { out.push(a.slice()); return; } for (let i = k; i < 5; i++) { let t = a[k]; a[k] = a[i]; a[i] = t; rec(k + 1); t = a[k]; a[k] = a[i]; a[i] = t; } })(0); return out; })();
+const optimalFor = t => SHARE_MODE === "optimalBoth" || (t === 0 && SHARE_MODE === "optimalL") || (t === 1 && SHARE_MODE === "optimalR");
+function shareTeam(s, t, addSeat, addB, addD, addP) {
+  if (addSeat < 0 && s._stS === s.step && s._stM === SHARE_MODE) { const c = s._stV; if (c && c[t] !== undefined) return c[t]; }
+  const r0 = shareTeam0(s, t, addSeat, addB, addD, addP);
+  if (addSeat < 0) { if (s._stS !== s.step || s._stM !== SHARE_MODE) { s._stS = s.step; s._stM = SHARE_MODE; s._stV = []; } s._stV[t] = r0; }
+  return r0;
+}
+function shareTeam0(s, t, addSeat, addB, addD, addP) {
+  const b0 = t * 5; let mx = -1e300; if (addP === undefined) addP = -1;
+  for (let q = 0; q < 5; q++) { let v = s.sumB[b0 + q]; if (b0 + q === addSeat) v += addB; _sbv[q] = v; _sbvRaw[q] = v; if (v > mx) mx = v;
+    let d = s.sumD[b0 + q]; if (b0 + q === addSeat) d += addD; _sdv[q] = d; }
+  let zs = 0; for (let q = 0; q < 5; q++) { _sbv[q] = Math.exp(_sbv[q] - mx); zs += _sbv[q]; }
+  let tot = 0;
+  for (let q = 0; q < 5; q++) { _sh[q] = _sbv[q] / zs; tot += _sdv[q] * (_sh[q] - 0.2) * 10; }
+  if (optimalFor(t) && s.G.SC) {
+    /* 团队模式: 按曲线枚举 120 种分配(约束名次≤上限名次+1), 加 [曲线(分到)−曲线(期望)]×scscale/25 */
+    const G = s.G, SC = G.SC;
+    /* 定稿: 分到份额 = 模板里领到的位置份额; 刷钱能力只限制派法(名次最多高一位) */
+    for (let q = 0; q < 5; q++) { const cb = (b0 + q) * 10; let ve = s.sumC[cb + scBin(G, _sh[q])]; if (b0 + q === addSeat && addP >= 0) ve += SC[addP * 10 + scBin(G, _sh[q])]; _VE[q] = ve;
+      for (let b = 0; b < 10; b++) { let v = s.sumC[cb + b]; if (b0 + q === addSeat && addP >= 0) v += SC[addP * 10 + b]; _KC[q * 10 + b] = v; } }
+    for (let q = 0; q < 5; q++) { let c = 0; for (let r = 0; r < 5; r++) if (_sbvRaw[r] > _sbvRaw[q] || (_sbvRaw[r] === _sbvRaw[q] && r < q)) c++; _cr[q] = c; }
+    /* v1.47.1 提速: 模板号位的份额档预先算好; 最优派法用 32 状态子集 DP 代替 120 种排列逐个试(结果逐位相同) */
+    if (!G.TPLB) G.TPLB = TPL.map(L => L.map(x => scBin(G, x)));
+    let best = -1e300;
+    for (let ti = 0; ti < TPL.length; ti++) { const TB = G.TPLB[ti];
+      _DP.fill(-1e300); _DP[0] = 0;
+      for (let m = 0; m < 31; m++) { const dv = _DP[m]; if (dv <= -1e299) continue; const q = _POP[m], lo = _cr[q] - 1, kb = q * 10;
+        for (let r = 0; r < 5; r++) { if (m & (1 << r) || r < lo) continue; const nm = m | (1 << r), v = dv + _KC[kb + TB[r]]; if (v > _DP[nm]) _DP[nm] = v; } }
+      if (_DP[31] > best) best = _DP[31]; }
+    tot += Math.max(0, best - (_VE[0] + _VE[1] + _VE[2] + _VE[3] + _VE[4])) * G.SCS / 25;   // 09-29: 最优不低于自然分配
+  }
+  return tot;
+}
+const _DP = new Float64Array(32), _POP = Uint8Array.from({ length: 32 }, (_, m) => { let c = 0; for (let b = 0; b < 5; b++) if (m & (1 << b)) c++; return c; });
+const _sh = new Float64Array(5), _sbvRaw = new Float64Array(5), _V = new Float64Array(25), _VE = new Float64Array(5), _KC = new Float64Array(50), _W = new Float64Array(5);
+function scBin(G, sh) { const E = G.SCE; let b = 0; while (b < 9 && sh >= E[b + 1]) b++; return b; }
 /* 往当前行动座位放候选 i 的 Δlogit(左方为正)。不改状态。 */
 function deltaOf(s, i) {
   const G = s.G, p = s.items[i].p;
   const seat = s.order[s.step], t = seat < 5 ? 0 : 1, g = t === 0 ? 1 : -1;
   if (p < 0) return 0;
+  if (G.DEAD) { const si0 = s.seatItems[seat]; if (deadIn(G, si0, p)) return 0; const kl = killsIn(G, si0, p); if (kl) return rebuildSim(s, seat, p, kl).z - s.z; }
   const K = G.K, KS = G.KS, E = G.E, o = p * K, base = seat * K;
   let d = G.W[p];
   for (let k = 0; k < KS; k++) d += s.SA[base + k] * E[o + k];
@@ -182,6 +275,7 @@ function deltaOf(s, i) {
   const si = s.seatItems[seat];
   for (let q = 0; q < si.length; q++) d += G.cpair(p, si[q]) + G.sqd(p, si[q], si);
   d += G.condBack(p, si);
+  d += G.trioDelta(p, si);
   let z = g * d;
   if (G.FW) z += G.seg(s.gold[t] + G.FW[p]) * (t === 0 ? 1 : -1) - G.seg(s.gold[t]) * (t === 0 ? 1 : -1);
   if (G.AV) { const NAX = G.NAX, ao = p * NAX, ub = (1 - t) * NAX, ab = (1 - t) * NAX;
@@ -189,16 +283,20 @@ function deltaOf(s, i) {
     for (let k = 0; k < NAX; k++) { mine += G.AV[ao + k] * s.uu[ub + k]; theirs += s.A[ab + k] * G.SAXn[ao + k]; }
     z += (t === 0 ? (mine - theirs) : (theirs - mine)); }
   if (G.TQG) z += tqDelta(s, p, seat, null);
+  if (G.SB) z += (t === 0 ? 1 : -1) * (shareTeam(s, t, seat, G.SB[p], G.SD[p], p) - shareTeam(s, t, -1, 0, 0, -1));
   return z;
 }
 /* 把一件东西播种进某座位的全部累加量(不碰 taken/slot/step/z)。
    simFrom 之类"从既有局面重建"的场景用它,免得漏掉 tq 那几个累加量。 */
 function seedItem(s, seat, p) {
   const G = s.G; if (p < 0) return;
+  if (G.DEAD && deadIn(G, s.seatItems[seat], p)) return;          // 死件不进任何累加量(槽位由调用方记)
   const K = G.K, o = p * K, base = seat * K, t = seat < 5 ? 0 : 1;
   for (let k = 0; k < K; k++) s.SA[base + k] += G.E[o + k];
   s.seatItems[seat].push(p);
   if (G.FW) s.gold[t] += G.FW[p];
+  if (G.SB) { s.sumB[seat] += G.SB[p]; s.sumD[seat] += G.SD[p]; }
+  if (G.SC) { const cb = seat * 10, pb = p * 10; for (let b = 0; b < 10; b++) s.sumC[cb + b] += G.SC[pb + b]; }
   if (G.AV) { const NAX = G.NAX, ao = p * NAX;
     for (let k = 0; k < NAX; k++) { s.A[t * NAX + k] += G.AV[ao + k]; s.uu[t * NAX + k] += G.SAXn[ao + k]; } }
   if (G.TQG) {
@@ -214,11 +312,13 @@ function seedItem(s, seat, p) {
     }
   }
 }
-/* 这一手没有任何合法候选(座位该拿的那一类在池子里已经被拿光了,比如只差英雄但英雄格全没了):
-   这手空过 —— 局面不变, 只推进 step。批量推演里必须"空过"而不是 break, 否则同一批的各局步数会错开。 */
-function passSim(s) { s.step++; }
+function passSim(s) { if (!simDone(s)) s.step++; }
 function applySim(s, i) {
   const p = s.items[i].p, seat = s.order[s.step];
+  if (s.G.DEAD && p >= 0) {
+    const si0 = s.seatItems[seat], kl = deadIn(s.G, si0, p) ? [] : killsIn(s.G, si0, p);
+    if (kl) { if (kl.length) adoptSim(s, rebuildSim(s, seat, p, kl)); s.taken[i] = 1; s.slot[seat * 3 + s.items[i].kind]++; s.step++; return; }
+  }
   s.z += deltaOf(s, i);
   s.taken[i] = 1; s.slot[seat * 3 + s.items[i].kind]++;
   seedItem(s, seat, p);
@@ -285,13 +385,18 @@ function deltaParts(s, i, out) {
   let cp = 0; const si = s.seatItems[seat];
   for (let q = 0; q < si.length; q++) cp += G.cpair(p, si[q]) + G.sqd(p, si[q], si);
   cp += G.condBack(p, si);
+  cp += G.trioDelta(p, si);
   out[0] = g * G.W[p]; out[1] = g * syn; out[2] = g * cp;
   if (G.FW) { const sgn = t === 0 ? 1 : -1; out[3] = sgn * (G.seg(s.gold[t] + G.FW[p]) - G.seg(s.gold[t])); }
+  if (G.SB) out[3] += (t === 0 ? 1 : -1) * (shareTeam(s, t, seat, G.SB[p], G.SD[p], p) - shareTeam(s, t, -1, 0, 0, -1));   // 份额层并入'阵容构成'分量
   if (G.AV) { const NAX = G.NAX, ao = p * NAX, ub = (1 - t) * NAX;
     let mine = 0, theirs = 0;
     for (let k = 0; k < NAX; k++) { mine += G.AV[ao + k] * s.uu[ub + k]; theirs += s.A[ub + k] * G.SAXn[ao + k]; }
     out[4] = t === 0 ? (mine - theirs) : (theirs - mine); }
   if (G.TQG) out[5] = tqDelta(s, p, seat, null);
+  if (G.DEAD) { const si0 = s.seatItems[seat];
+    if (deadIn(G, si0, p)) out.fill(0);
+    else if (killsIn(G, si0, p)) { const tot = deltaOf(s, i); let sm = 0; for (let q = 0; q < 6; q++) sm += out[q]; out[2] += tot - sm; } }
   return out;
 }
 /* 按性格权重给全部合法候选打分(行动方视角为正)。裁判不走这条路。 */
@@ -310,5 +415,5 @@ function scoreAllBy(s, wts, outIdx, outVal) {
   return n;
 }
 
-module.exports = { loadModel, deltaParts, scoreAllBy, seedItem, buildEngine, makeSim, cloneSim, simDone, moverSeat, moverSign,
+module.exports = { HERO_DEAD, loadModel, deltaParts, scoreAllBy, seedItem, buildEngine, makeSim, cloneSim, simDone, moverSeat, moverSign, setShareMode, getShareMode, shareTeam,
                    deltaOf, applySim, passSim, scoreAll, policyBonus, setPolicyFix, setDepPen, depBlocked, CAP };

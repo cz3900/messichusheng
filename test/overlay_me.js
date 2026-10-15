@@ -11,7 +11,7 @@ const ctx = new Proxy({}, { get: (t, k) => k === "measureText" ? () => ({ width:
 const canvas = { getContext: () => ctx, width: 0, height: 0 }; const handlers = {};
 const document = { getElementById: id => id === "c" ? canvas : el(id) };
 const setTimeout = () => 0, clearTimeout = () => {};
-new Function("document", "ad", "addEventListener", "innerWidth", "innerHeight", "setTimeout", "clearTimeout", code)(document, { on: (ch, f) => handlers[ch] = f }, () => {}, 1920, 864, setTimeout, clearTimeout);
+new Function("document", "ad", "addEventListener", "innerWidth", "innerHeight", "setTimeout", "clearTimeout", "requestAnimationFrame", "setInterval", code)(document, { on: (ch, f) => handlers[ch] = f }, () => {}, 1920, 864, setTimeout, clearTimeout, () => {}, () => {});
 handlers.cfg({ scale: 0.75, all: false, paused: false, hidden: false, plname: "1 团队", version: "1.22.0", hotkey: {} });
 let ok = true; const check = (what, cond, got) => { console.log(`${cond ? "✓" : "✗"} ${what}${cond ? "" : "\n   实际: " + got}`); ok = ok && cond; };
 const base = { type: "state", phase: "active", ms: 20, current: { side: "L", idx: 0 }, taken: 3, poolOk: true, board: true };

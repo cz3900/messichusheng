@@ -24,11 +24,78 @@ window.ADScore = (function () {
   /* 小样本正配合收缩(2026-09-09):同座位共现 n 少的对,正配合分乘 g=n/(n+60);负的不动。
      GK 是上三角 uint8(g×255),下标 a<b: a*(2n−a−1)/2+(b−a−1)。改总分。 */
   var GK = null;
+  /* 逐对修正层(2026-09-25, tools/build-pf.py):线上底座冻结,每对一个固定修正 δ 直接加进座位配合项(不进 g 收缩)。
+     训练时用"人类认可度"(有机会凑时真的凑的比例)当先验:认可度高的对默认偏强、少收缩。PF 是上三角 Int16(δ/pfs),下标同 GK。改总分。 */
+  var PF = null, PFS = 1e-4;
+  /* 全数据保守三件修正: A+B 的调整与 C 到齐的增量分别计入同座分。 */
+  var TRP = null, TRT = null;
+  function trioPairKey(a, b) { if (a > b) { var t = a; a = b; b = t; } return a * M.n + b; }
+  function trioKey(a, b, c) { var t; if (a > b) { t = a; a = b; b = t; } if (b > c) { t = b; b = c; c = t; } if (a > b) { t = a; a = b; b = t; } return (a * M.n + b) * M.n + c; }
   /* 条件收缩(2026-09-18):一对配合的证据六成以上来自带某第三件 c 的座位时,座位缺 c 就改用"缺 c 的共现局数"算 g。
      CCM: key(a*n+b, a<b) → {c: 条件件下标, g: g_wo}。只作用于 ic>0 的对。见 tools/build-cond.py。改总分。 */
   var CCM = null;
+  /* 主题门控(2026-09-18, 只在另外载入 window.AD_MOE 时生效; 网站的"新版"标签用): 座位方向 x = 单位化(Σ 单位化嵌入),
+     p = softmax(x·T/τ) 分到 K 个主题, 每件东西的单件分按主题加减 DW[件]·p。不载入时一个数都不变。 */
+  var MOE = null;
   var EN = null, TQAX = null, TQMUAX, TQHMU, TQHSD, TQG = null;  // 队伍级配比项
+  /* 份额层(2026-09-29): 每件 sb=刷钱上限, sd=吃资源斜率。每队 5 座位份额 = softmax(Σsb), 座位加 Σsd·(份额−0.2)·10。改总分。 */
+  var SB = null, SD = null, SC = null, SCE = null, SCS = 0.7;
+  /* 份额模式(09-29): expect=两队都按刷钱上限的期望份额(真人路人局口径, 默认);
+     optimalL/optimalR/optimalBoth=该队按"自己人配合"分配: 真人梯队 34/26/19/13/8% 按需求(Σsd)分给五座位,
+     约束: 一个座位的名次最多比它的刷钱上限名次高一位(刷不动的人当不了 1 号位)。 */
+  var SHARE_MODE = (typeof window !== 'undefined' && window.AD_SHARE_MODE) || 'expect';
+  var LADDER = [0.343, 0.255, 0.193, 0.132, 0.077];
+  /* 09-29 分工模板(真人 120 万队份额聚类 K=5): 一超四酱 / 双核三酱 / 单核半吊 / 三核两酱 / 平均分; 团队模式在 模板×派法 里取最优 */
+  var TPL = [[0.47,0.22,0.15,0.10,0.05],[0.38,0.31,0.16,0.10,0.05],[0.37,0.23,0.18,0.14,0.08],[0.33,0.28,0.23,0.11,0.05],[0.28,0.24,0.20,0.17,0.10]];
+  var PERMS = (function () { var out = [], a = [0, 1, 2, 3, 4];
+    (function rec(k) { if (k === 5) { out.push(a.slice()); return; } for (var i = k; i < 5; i++) { var t = a[k]; a[k] = a[i]; a[i] = t; rec(k + 1); t = a[k]; a[k] = a[i]; a[i] = t; } })(0); return out; })();
+  /* 给 5 座位的 (Σsb, Σsd) 返回最优分配下每座位的份额 */
+  function optimalShares(sbv, sdv) {
+    var capRank = [0, 0, 0, 0, 0], q, r;
+    for (q = 0; q < 5; q++) for (r = 0; r < 5; r++) if (sbv[r] > sbv[q] || (sbv[r] === sbv[q] && r < q)) capRank[q]++;
+    var best = -1e300, bp = null;
+    for (var i = 0; i < PERMS.length; i++) { var pm = PERMS[i], ok = true, v = 0;
+      for (q = 0; q < 5; q++) { if (pm[q] < capRank[q] - 1) { ok = false; break; } v += sdv[q] * LADDER[pm[q]]; }
+      if (ok && v > best) { best = v; bp = pm; } }
+    var out = [0, 0, 0, 0, 0]; for (q = 0; q < 5; q++) out[q] = LADDER[bp[q]]; return { share: out, rank: bp };
+  }
+  function scBin(sh) { var b = 0; while (b < 9 && sh >= SCE[b + 1]) b++; return b; }
+  /* 座位的曲线值(pp): 5 件在份额 sh 那一档的 真实−底座 之和 */
+  function kitCurve(idxs, sh) { var b = scBin(sh), v = 0; for (var i = 0; i < idxs.length; i++) v += SC[idxs[i] * 10 + b]; return v; }
+  /* 团队模式最优分配: 按曲线枚举 120 种, 约束名次≤上限名次+1 */
+  /* 09-29 定稿(用户): 分配 = 开局给每人一个定位, 分到份额就是模板里那个位置的份额(不再乘刷钱能力)。
+     刷钱能力只决定谁能领哪个位置: 定位名次最多比刷钱能力名次高一位。在 模板×派法 里取五套阵容曲线和最高的。 */
+  function optimalByCurve(idxList, sbv) {
+    var q, t, r, capRank = [0, 0, 0, 0, 0];
+    for (q = 0; q < 5; q++) for (r = 0; r < 5; r++) if (sbv[r] > sbv[q] || (sbv[r] === sbv[q] && r < q)) capRank[q]++;
+    var best = -1e300, bp = null, bt = 0, bs = null;
+    for (t = 0; t < TPL.length; t++) { var L = TPL[t];
+      for (var i = 0; i < PERMS.length; i++) { var pm = PERMS[i], w = [0, 0, 0, 0, 0], zs = 0, v = 0, ok = true;
+        for (q = 0; q < 5; q++) if (pm[q] < capRank[q] - 1) { ok = false; break; } if (!ok) continue;
+        for (q = 0; q < 5; q++) { w[q] = L[pm[q]]; v += kitCurve(idxList[q], w[q]); }
+        if (v > best) { best = v; bp = pm; bt = t; bs = w; } } }
+    return { rank: bp, tpl: bt, total: best, share: bs };
+  }
+  function optimalFor(t) { return SHARE_MODE === 'optimalBoth' || (t === 0 && SHARE_MODE === 'optimalL') || (t === 1 && SHARE_MODE === 'optimalR'); }
 
+  /* 主题门控: 返回 {h: 座位修正合计, per: 每件修正, p: 各主题比例} */
+  function themeOf(m) {
+    var o = [], j; for (j = 0; j < m.p.length; j++) o.push(j);
+    o.sort(function (a, b) { return m.p[b] - m.p[a]; });
+    return { h: m.h, top: o.slice(0, 2).map(function (j) { return { name: MOE.labels[j] || ('主题' + j), p: m.p[j] }; }) };
+  }
+  function moeOf(arr) {
+    var K_ = MOE.K, x = new Float64Array(K), i, k, j, n = 0;
+    for (i = 0; i < arr.length; i++) for (k = 0; k < K; k++) x[k] += MOE.E[arr[i] * K + k];
+    for (k = 0; k < K; k++) n += x[k] * x[k]; n = Math.sqrt(n);
+    var p = new Float64Array(K_), mx = -1e300, z = 0;
+    for (j = 0; j < K_; j++) { var a = 0; if (n > 1e-9) for (k = 0; k < K; k++) a += x[k] / n * MOE.T[j * K + k]; p[j] = a / MOE.tau; if (p[j] > mx) mx = p[j]; }
+    for (j = 0; j < K_; j++) { p[j] = Math.exp(p[j] - mx); z += p[j]; }
+    for (j = 0; j < K_; j++) p[j] /= z;
+    var per = new Float64Array(arr.length), h = 0;
+    for (i = 0; i < arr.length; i++) { var v = 0; for (j = 0; j < K_; j++) v += MOE.DW[arr[i] * K_ + j] * p[j]; per[i] = v; h += v; }
+    return { h: h, per: per, p: p };
+  }
   function b64f32(s) {
     var bin = atob(s), n = bin.length, b = new Uint8Array(n);
     for (var i = 0; i < n; i++) b[i] = bin.charCodeAt(i);
@@ -59,6 +126,20 @@ window.ADScore = (function () {
     /* 归因数据:rg=每件东西的"泛用配合"强度 r,rmu=全局 μ,tp=紧耦合对的收缩系数 κ 与实测值。
        见 tools/build-attr.py。非 PLAIN 模型(本体/技能分表)不适用,直接不开。 */
     if (M.gk) { var gb = atob(M.gk), gn = gb.length; GK = new Uint8Array(gn); for (var q5 = 0; q5 < gn; q5++) GK[q5] = gb.charCodeAt(q5); }
+    if (M.pfq) { var pb = atob(M.pfq), pn = pb.length, pbuf = new Uint8Array(pn); for (var q6 = 0; q6 < pn; q6++) pbuf[q6] = pb.charCodeAt(q6); PF = new Int16Array(pbuf.buffer); PFS = M.pfs || 1e-4; }
+    if (window.AD_TRIO && window.AD_TRIO.trios) {
+      TRP = new Map(); TRT = new Map();
+      window.AD_TRIO.trios.forEach(function (r) { var a = idx[r[0]], b = idx[r[1]], c = idx[r[2]];
+        if (a === undefined || b === undefined || c === undefined) throw new Error('三件修正表的技能不在模型里');
+        TRP.set(trioPairKey(a, b), r[3]); TRT.set(trioKey(a, b, c), r[4]); });
+    }
+    if (window.AD_MOE) {
+      var AM = window.AD_MOE, mk = AM.K, mT = b64f32(AM.T), mD = b64f32(AM.DW), mE = new Float64Array(M.n * K);
+      var eRaw = b64f32(M.e);
+      for (var q9 = 0; q9 < M.n; q9++) { var nn9 = 0; for (var k9 = 0; k9 < K; k9++) nn9 += eRaw[q9 * K + k9] * eRaw[q9 * K + k9];
+        nn9 = Math.sqrt(nn9); if (nn9 < 1e-9) nn9 = 1; for (k9 = 0; k9 < K; k9++) mE[q9 * K + k9] = eRaw[q9 * K + k9] / nn9; }
+      MOE = { K: mk, T: mT, DW: mD, tau: AM.tau, E: mE, labels: AM.labels || [] };
+    }
     if (M.cck && M.ccc && M.ccg) {
       var i32 = function (s0) { var bb = atob(s0), nb = bb.length, ub = new Uint8Array(nb); for (var q6 = 0; q6 < nb; q6++) ub[q6] = bb.charCodeAt(q6); return new Int32Array(ub.buffer); };
       var ck = i32(M.cck), cc = i32(M.ccc), cg = b64f32(M.ccg); CCM = new Map();
@@ -84,6 +165,8 @@ window.ADScore = (function () {
     /* 队伍级配比项:座位的 5 件求和后**单位化**(只留定位、不含强度),投到 8 条冻结轴上,
        全队 5 个座位相加,再过一个 36 项二次型。同轴扎堆 7/8 是负系数 ——
        "别在同一条轴上堆人";PC4(近战肉↔远程脆)罚得最狠,PC6(治疗)是唯一不罚的。 */
+    if (M.sb && M.sd) { SB = b64f32(M.sb); SD = b64f32(M.sd); }
+    if (M.sc) { SC = b64f32(M.sc); SCE = M.scedges; SCS = M.scscale == null ? 0.7 : M.scscale; }
     if (M.tqg) {
       TQAX = b64f32(M.tqax); TQMUAX = b64f32(M.tqmuax);
       TQHMU = b64f32(M.tqhmu); TQHSD = b64f32(M.tqhsd); TQG = b64f32(M.tqg);
@@ -115,6 +198,8 @@ window.ADScore = (function () {
   }
   function tpOf(a, b) { return TP ? (TP.get(a < b ? a * M.n + b : b * M.n + a) || null) : null; }
   function sqOf(a, b) { return SQ ? (SQ.get(a < b ? a * M.n + b : b * M.n + a) || null) : null; }
+  function pfOf(a, b) { if (!PF || a === b || a < 0 || b < 0) return 0; if (a > b) { var t = a; a = b; b = t; }
+    return PF[a * (2 * M.n - a - 1) / 2 + (b - a - 1)] * PFS; }
   function gOf(a, b) { if (!GK || a === b || a < 0 || b < 0) return 1; if (a > b) { var t = a; a = b; b = t; }
     return GK[a * (2 * M.n - a - 1) / 2 + (b - a - 1)] / 255; }
   /* 一对的最终配合分 = 真交互(扣泛用) + 压缩 → 正的再乘 g。返回 {v: 最终值, corr: 相对未收缩的差} */
@@ -175,12 +260,19 @@ window.ADScore = (function () {
       for (k = KS; k < K; k++) { var v3 = uA[o2 + k]; sq2 -= v3 * v3; }
     }
     fseat += .5 * (n2 - sq2);
-    if (CP || SQ || GK) {                      // 簇对项 + 压缩项 + 小样本收缩:座位内 C(5,2)=10 对
+    if (CP || SQ || GK || PF) {                // 簇对项 + 压缩项 + 小样本收缩 + 逐对修正:座位内 C(5,2)=10 对
       var all = ab; if (!PLAIN && h >= 0) { all = ab.slice(); all.push(h); }
       for (i = 0; i < all.length; i++) for (j = i + 1; j < all.length; j++) {
         fseat += cpair(all[i], all[j]);
         var sq0 = sqOf(all[i], all[j]); if (sq0) fseat += sq0.d;
+        fseat += pfOf(all[i], all[j]);
         if (GK && RG) fseat += pairFinal(all[i], all[j], all).corr;
+      }
+    }
+    if (TRP) { var ta = ab; if (!PLAIN && h >= 0) { ta = ab.slice(); ta.push(h); }
+      for (i = 0; i < ta.length; i++) for (j = i + 1; j < ta.length; j++) {
+        fseat += TRP.get(trioPairKey(ta[i], ta[j])) || 0;
+        for (k = j + 1; k < ta.length; k++) fseat += TRT.get(trioKey(ta[i], ta[j], ta[k])) || 0;
       }
     }
     var sHH = new Float64Array(K2), sHA = new Float64Array(K2),
@@ -205,15 +297,26 @@ window.ADScore = (function () {
       }
     }
     var _all = ab; if (!PLAIN && h >= 0) { _all = ab.slice(); _all.push(h); }
-    var _adj = attrOf(_all);
-    return { w: wsum, fseat: fseat, wAdj: wsum + _adj.shift, fAdj: fseat - _adj.shift, sHH: sHH, sHA: sHA, sAH: sAH, sAA: sAA, tq: tq };
+    var _adj = attrOf(_all), _moe = null;
+    if (MOE && _all.length) { _moe = moeOf(_all); wsum += _moe.h; }
+    return { w: wsum, fseat: fseat, wAdj: wsum + _adj.shift, fAdj: fseat - _adj.shift, sHH: sHH, sHA: sHA, sAH: sAH, sAA: sAA, tq: tq, moe: _moe };
   }
 
   var dot = function (a, b) { var s = 0; for (var k = 0; k < a.length; k++) s += a[k] * b[k]; return s; };
 
+  /* 09-29 英雄机制(用户裁定): 美杜莎座位上这几件按"空一个技能"算(不给分、不进配合)。与 server/mcts_fast.js HERO_DEAD 同源。 */
+  var HERO_DEAD = { "hero:94": { primal_beast_uproar: 1, tidehunter_kraken_shell: 1, huskar_berserkers_blood: 1 } };
+  var DEAD_ON = !(typeof window !== 'undefined' && window.AD_HERO_DEAD === 0);
+  function deadFilterSeat(s) {
+    if (!DEAD_ON || !s) return s; var d = null, j;
+    for (j = 0; j < s.length; j++) if (HERO_DEAD[s[j]]) d = HERO_DEAD[s[j]];
+    if (!d) return s; var f = []; for (j = 0; j < s.length; j++) if (!d[s[j]]) f.push(s[j]); return f.length === s.length ? s : f;
+  }
+  function deadFilter(seats) { var out = null; for (var i = 0; i < seats.length; i++) { var f = deadFilterSeat(seats[i]); if (f !== seats[i]) { if (!out) out = seats.slice(); out[i] = f; } } return out || seats; }
   /* seats: 10 × 5 的 key 数组。返回 {logit, prob, seatScore[10], teamScore[2]} */
   function evaluate(seats) {
     if (!init()) return null;
+    seats = deadFilter(seats);
     var S = [], t, k, i;
     for (i = 0; i < 10; i++) S.push(seatOf(seats[i] || []));
     var T = [];                                   // 每队的跨座位累加量
@@ -236,9 +339,33 @@ window.ADScore = (function () {
                 - .5 * (dot(s.sHH, s.sHH) + dot(s.sAA, s.sAA))
                 - dot(s.sHA, s.sAH);
       var v = s.w + s.fseat + cross;
-      seatScore.push({ main: s.w, syn: s.fseat, main2: s.wAdj, syn2: s.fAdj, cross: cross, ctr: 0, total: v });
+      seatScore.push({ main: s.w, syn: s.fseat, main2: s.wAdj, syn2: s.fAdj, cross: cross, ctr: 0, total: v, theme: s.moe ? themeOf(s.moe) : null });
       teamScore[t] += v;
       z += (t === 0 ? 1 : -1) * v;
+    }
+    /* ①b 份额层(09-29):每队 5 座位按 Σsb 做 softmax 得预测补刀份额, 座位加 Σsd·(份额−0.2)·10 */
+    var shL = 0, shR = 0;
+    if (SB) {
+      for (t = 0; t < 2; t++) {
+        var sbv = [0, 0, 0, 0, 0], sdv = [0, 0, 0, 0, 0], mx = -1e300, zs = 0, q;
+        for (q = 0; q < 5; q++) { var kq = seats[t * 5 + q] || [];
+          for (var z5 = 0; z5 < kq.length; z5++) { var pq = at(kq[z5]); if (pq >= 0) { sbv[q] += SB[pq]; sdv[q] += SD[pq]; } }
+          if (sbv[q] > mx) mx = sbv[q]; }
+        var ex = [0, 0, 0, 0, 0]; for (q = 0; q < 5; q++) { ex[q] = Math.exp(sbv[q] - mx); zs += ex[q]; }
+        var shArr = ex.map(function (v) { return v / zs; }), rkArr = null, idxList = null;
+        var tplArr = null;
+        if (optimalFor(t) && SC) { idxList = []; for (q = 0; q < 5; q++) { var kq2 = seats[t * 5 + q] || [], li = []; for (var z6 = 0; z6 < kq2.length; z6++) { var p6 = at(kq2[z6]); if (p6 >= 0) li.push(p6); } idxList.push(li); }
+          var ob = optimalByCurve(idxList, sbv); rkArr = ob.rank; tplArr = TPL[ob.tpl]; var optSh = ob.share; }
+        var useOpt = false;
+        if (rkArr) { var totOpt = 0, totNat = 0; for (q = 0; q < 5; q++) { totOpt += kitCurve(idxList[q], optSh[q]); totNat += kitCurve(idxList[q], shArr[q]); } useOpt = totOpt > totNat; }   /* 09-29: 最优梯队不高于自然分配就不动(超级大核+四酱油不扣) */
+        for (q = 0; q < 5; q++) { var shq = shArr[q], vq = sdv[q] * (shq - 0.2) * 10, pos = null;
+          /* 期望份额下的残差项(裁判口径) + 团队模式下"分到的位置 vs 平时"的曲线差值 */
+          if (rkArr) { var asg = optSh[q]; pos = useOpt ? (kitCurve(idxList[q], asg) - kitCurve(idxList[q], shq)) * SCS / 25 : 0; vq += pos; seatScore[t * 5 + q].optShare = asg; seatScore[t * 5 + q].roleShare = tplArr[rkArr[q]]; }
+          seatScore[t * 5 + q].share = vq; seatScore[t * 5 + q].shareP = shq; seatScore[t * 5 + q].shareRank = rkArr ? rkArr[q] + 1 : null; seatScore[t * 5 + q].posTerm = pos;
+          seatScore[t * 5 + q].sumB = sbv[q]; seatScore[t * 5 + q].sumD = sdv[q]; seatScore[t * 5 + q].total += vq;
+          teamScore[t] += vq; if (t === 0) shL += vq; else shR += vq; }
+      }
+      z += shL - shR;
     }
     /* ② 队伍构成项:各队打钱分总和 → 8 段分段线性,左减右 */
     var comp = 0, compL = 0, compR = 0, ctrL = 0, ctrR = 0;
@@ -305,7 +432,7 @@ window.ADScore = (function () {
     }
     return { logit: z, prob: 1 / (1 + Math.exp(-z)), seats: seatScore, team: teamScore,
              comp: comp, ctr: ctr, compL: compL, compR: compR, ctrL: ctrL, ctrR: ctrR,
-             tq: tq, tqL: tqL, tqR: tqR };
+             tq: tq, tqL: tqL, tqR: tqR, share: shL - shR, shareL: shL, shareR: shR };
   }
 
   /* 给某个座位挑候选:返回每个候选带来的 Δlogit(对该座位所属方为正=更好)。
@@ -330,6 +457,7 @@ window.ADScore = (function () {
      面板上那个座位总分就是这些数加起来的,点开能自己核对。 */
   function explain(items) {
     if (!init()) return null;
+    items = deadFilterSeat(items);
     var ks = [], i, j;
     for (i = 0; i < items.length; i++) if (at(items[i]) >= 0) ks.push(items[i]);
     var main = ks.map(function (k) { return { key: k, w: W[at(k)] }; });
@@ -347,24 +475,31 @@ window.ADScore = (function () {
       }
       var tp = tpOf(a, b), sq = sqOf(a, b);
       var pf = (GK && RG) ? pairFinal(a, b, seatIdx) : null;
-      var vv = s + cpair(a, b) + (sq ? sq.d : 0) + (pf ? pf.corr : 0);
+      var fx = pfOf(a, b), trp = TRP ? (TRP.get(trioPairKey(a, b)) || 0) : 0;
+      var vv = s + cpair(a, b) + (sq ? sq.d : 0) + (pf ? pf.corr : 0) + fx + trp;
       /* v2 = 归因修正后的"真配合":扣掉泛用强度 μ+r_a+r_b。扣掉的不会消失,已折进左边单件栏。 */
       var v2 = RG ? (vv - RMU - RG[a] - RG[b]) : vv;
-      pairs.push({ a: ks[i], b: ks[j], v: vv, v2: v2, f: sq ? sq.f : null, raw2: sq ? v2 - sq.d - (pf ? pf.corr : 0) : null,
+      pairs.push({ a: ks[i], b: ks[j], v: vv, v2: v2, f: sq ? sq.f : null, raw2: sq ? v2 - sq.d - (pf ? pf.corr : 0) - fx - trp : null, fix: fx, trioPair: trp,
                    g: (pf && pf.g < 0.999) ? pf.g : null, pre_g: pf ? v2 - pf.corr : null, cond: (pf && pf.cond != null) ? keyOfIdx(pf.cond) : null,
                    emp: tp ? tp.e : null, n: tp ? tp.n : 0,
                    pred: v2 * BREF });          // 模型预示的胜率增量,和 emp 同口径
     }
     pairs.sort(function (x, y) { return y.v2 - x.v2; });
-    var idxs = ks.map(at), adj = attrOf(idxs);
-    main.forEach(function (mm, t) { mm.w2 = mm.w + adj.per[t]; });
+    var idxs = ks.map(at), adj = attrOf(idxs), mo = (MOE && idxs.length) ? moeOf(idxs) : null;
+    main.forEach(function (mm, t) { if (mo) { mm.moe = mo.per[t]; mm.w += mo.per[t]; } mm.w2 = mm.w + adj.per[t]; });
     var ms = main.reduce(function (p, c) { return p + c.w; }, 0);
     var ps = pairs.reduce(function (p, c) { return p + c.v; }, 0);
     var ms2 = main.reduce(function (p, c) { return p + c.w2; }, 0);
     var ps2 = pairs.reduce(function (p, c) { return p + c.v2; }, 0);
-    return { main: main, pairs: pairs, mainSum: ms, pairSum: ps,
-             mainSum2: ms2, pairSum2: ps2, bref: BREF, total: ms + ps };
+    var triples = [], ts = 0;
+    if (TRT) for (i = 0; i < ks.length; i++) for (j = i + 1; j < ks.length; j++) for (var q = j + 1; q < ks.length; q++) {
+      var tv = TRT.get(trioKey(seatIdx[i], seatIdx[j], seatIdx[q])) || 0;
+      if (tv) { triples.push({ a: ks[i], b: ks[j], c: ks[q], v: tv }); ts += tv; }
+    }
+    return { main: main, pairs: pairs, triples: triples, tripleSum: ts, mainSum: ms, pairSum: ps,
+             mainSum2: ms2, pairSum2: ps2, bref: BREF, total: ms + ps + ts, theme: mo ? themeOf(mo) : null };
   }
 
-  return { evaluate: evaluate, rank: rank, explain: explain, ready: init };
+  function setShareMode(m) { SHARE_MODE = m || 'expect'; }
+  return { evaluate: evaluate, rank: rank, explain: explain, ready: init, setShareMode: setShareMode, getShareMode: function () { return SHARE_MODE; }, optimalShares: optimalShares, optimalByCurve: function (seatsKeys, sbv) { var il = seatsKeys.map(function (ks) { var li = []; for (var i = 0; i < ks.length; i++) { var p = at(ks[i]); if (p >= 0) li.push(p); } return li; }); return optimalByCurve(il, sbv); }, TPL: TPL, HERO_DEAD: HERO_DEAD, isDead: function (seatKeys, key) { var s = deadFilterSeat(seatKeys.concat([key])); return s.indexOf(key) < 0; }, shareItem: function (key) { var p = at(key); if (p < 0 || !SC) return null; var c = []; for (var b = 0; b < 10; b++) c.push(SC[p * 10 + b]); return { sb: SB[p], sd: SD[p], curve: c, edges: SCE }; }, kitCurve: function (keys, sh) { if (!SC) return null; var li = []; for (var i = 0; i < keys.length; i++) { var p = at(keys[i]); if (p >= 0) li.push(p); } return kitCurve(li, sh); } };
 })();

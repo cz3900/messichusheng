@@ -4,10 +4,12 @@
    没看到棋盘时只截半分辨率小图、1.5 s 一帧、覆盖窗隐藏;开局自动锁池子不用按 F10;日志落盘。 */
 const { app, BrowserWindow, screen, desktopCapturer, Tray, Menu, globalShortcut, nativeImage, shell, ipcMain, session } = require("electron");
 const path = require("path"), fs = require("fs"); const { Worker } = require("worker_threads");
+const AIModes = require("./ai_modes.js");
 const VERSION = require("./package.json").version;
 /* v1.30 优先独显: Chromium(截屏流/画布)用高性能显卡。必须在 app ready 之前设。 */
 app.commandLine.appendSwitch("force_high_performance_gpu");
 let overlay = null, tray = null, worker = null, timer = null, snapOnce = false, uploader = null, panelWin = null;
+const overlayState = require("./overlay_state.js").create();
 const ADFrames = require("./frames.js");   // 推荐框配色/范围/粗细(和覆盖层、设置面板共用)
 const HOTKEY = { "隐藏/显示": "F6", "切换显示模式": "F8", "暂停/继续": "F9", "重新识别": "F10", "团队/个人优先": "F7" };   // 实际注册成功的键(可能退让到 Alt+F8 等)
 /* 两个**互相独立**的开关:
@@ -19,32 +21,50 @@ let gpuPrio = null;   // v1.33 组合版抢显卡: { level, name, admin }
 let meShown = null;   // 最近一次状态里的本人座位(托盘菜单上显示)   // plevel 0..3 = 界面上的 1~4 档;hidden = 一键隐藏(只藏显示, 识别/计算照常跑)
 const PLN = ["1 团队", "2 略偏个人", "3 偏个人", "4 贪"]; let needFull = true, phase = "idle", lastStatus = "", boardSeen = false, capN = 0, capMs = 0, capMsFull = 0, capFull = 0;
 /* ---- 日志:%APPDATA%/ADAssistant/logs/ad_YYYYMMDD_HHMMSS.log,截图也放这里 ---- */
-const LOGDIR = path.join(app.getPath("userData"), "logs"); fs.mkdirSync(LOGDIR, { recursive: true });
+const LOGDIR = path.join(app.getPath("userData"), "logs"); try { fs.mkdirSync(LOGDIR, { recursive: true }); } catch (_) {}
 const stamp = d => `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}_${String(d.getHours()).padStart(2, "0")}${String(d.getMinutes()).padStart(2, "0")}${String(d.getSeconds()).padStart(2, "0")}`;
-const LOGFILE = path.join(LOGDIR, `ad_${stamp(new Date())}.log`); let logBuf = [], logTimer = null;
-function log(tag, msg) { const d = new Date(); const t = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}.${String(d.getMilliseconds()).padStart(3, "0")}`;
-  logBuf.push(`[${t}] ${tag.padEnd(7)} ${msg}\n`); if (!logTimer) logTimer = setTimeout(flushLog, 500); if (uploader) uploader.onLog(tag, msg); }
-function flushLog() { logTimer = null; if (!logBuf.length) return; const s = logBuf.join(""); logBuf = []; try { fs.appendFileSync(LOGFILE, s); } catch (e) { } }
+const LOGFILE = path.join(LOGDIR, `ad_${stamp(new Date())}.log`);
+const diagnosticLog = require("./bounded_log.js").create(LOGFILE);
+function log(tag, msg) { if (diagnosticLog.write(tag, msg) && uploader) { try { uploader.onLog(tag, msg); } catch (_) {} } }
+function flushLog() { return diagnosticLog.flush(); }
 function pruneLogs() { try { const now = Date.now(); const fsz = fs.readdirSync(LOGDIR).map(f => ({ f, p: path.join(LOGDIR, f), st: fs.statSync(path.join(LOGDIR, f)) }));
   for (const x of fsz) if ((x.f.endsWith(".log") || x.f.endsWith(".jsonl")) && now - x.st.mtimeMs > 7 * 86400e3) fs.unlinkSync(x.p);
   const pngs = fsz.filter(x => x.f.endsWith(".png")).sort((a, b) => b.st.mtimeMs - a.st.mtimeMs); for (const x of pngs.slice(12)) fs.unlinkSync(x.p); } catch (e) { } }
+async function pruneTextLogs() {
+  try {
+    const names = (await fs.promises.readdir(LOGDIR)).filter(f => /^ad_.*\.log$/.test(f));
+    const files = [];
+    for (const f of names) { try { const p = path.join(LOGDIR, f); const st = await fs.promises.stat(p); files.push({ p, st }); } catch (_) {} }
+    files.sort((a, b) => b.st.mtimeMs - a.st.mtimeMs);
+    let total = 8 * 1024 * 1024; // reserve full current-session allowance
+    for (const x of files) {
+      if (x.p === LOGFILE) continue;
+      total += x.st.size;
+      if (total > 64 * 1024 * 1024 || Date.now() - x.st.mtimeMs > 7 * 86400e3) { try { await fs.promises.unlink(x.p); } catch (_) {} }
+    }
+  } catch (_) {}
+}
 /* ---- 设置落盘(userData/settings.json):目前只有"自动上传日志"开关和随机安装号 —— 朋友关掉以后重启不能又自己打开 ---- */
 const SETFILE = path.join(app.getPath("userData"), "settings.json"); let settings = {};
 try { settings = JSON.parse(fs.readFileSync(SETFILE, "utf8")) || {}; } catch (e) { }
+AIModes.migrate(settings);
 if (!settings.installId) settings.installId = require("crypto").randomBytes(6).toString("hex");
 if (settings.uploadLogs === undefined) settings.uploadLogs = true;
 settings.look = ADFrames.norm(settings.look);   // v1.23:推荐框的颜色等, 缺的补默认、坏的丢掉
 if (settings.allowCapture === undefined) settings.allowCapture = false;   // v1.24 直播模式:让直播/录屏软件能抓到覆盖层
+let liveWaiting = true, liveEpoch = 0, liveChecking = false;
 const saveSettings = () => { try { fs.writeFileSync(SETFILE, JSON.stringify(settings, null, 1)); } catch (e) { } }; saveSettings();
 /* v1.32 一键更新(updater.js): 启动 20 秒后查一次、之后每 3 小时查一次, 只提示不自动装;点「立即更新」才下载替换并重启 */
 const updater = require("./updater.js").create({ appDir: __dirname, dataDir: app.getPath("userData"), version: VERSION, electron: process.versions.electron, log });
 updater.onChange(u => { sendPanel(); if (tray && (u.phase === "available" || u.phase === "needFull" || u.phase === "latest")) tray.setContextMenu(buildMenu());
-  if (u.phase === "done") setTimeout(() => { log("update", "重启插件"); flushLog(); app.relaunch(); app.exit(0); }, 1200); });
+  if (u.phase === "done") setTimeout(() => { log("update", "重启插件"); log("stop", "退出(更新重启)"); crashDiag.close("update-relaunch"); diagnosticLog.flushSync(); app.relaunch(); app.exit(0); }, 1200); });
 function doUpdate() { const u = updater.state();
   if (u.phase === "needFull" && u.fullUrl) { log("update", "打开完整包下载 " + u.fullUrl); shell.openExternal(u.fullUrl); return; }
   if (phase === "active") log("update", "选技中点了更新(面板已确认)");
   updater.apply().then(r => { if (r.phase === "needFull") sendPanel(); }); }
-uploader = require("./logupload.js").create({ logdir: LOGDIR, logfile: LOGFILE, version: VERSION, installId: settings.installId, log, flush: () => flushLog(), enabled: () => settings.uploadLogs });
+uploader = require("./logupload.js").create({ logdir: LOGDIR, logfile: LOGFILE, version: VERSION, installId: settings.installId, log, flush: () => flushLog(), enabled: () => settings.uploadLogs, collectNativeEvidence: previous => require("./native_evidence").collect({logdir:LOGDIR,previous,crashDir:app.getPath("crashDumps")}) });
+let diagnosticLastWorker = null, diagnosticCapture = null, lastVisibilityCause = null;
+const crashDiag = require("./crash_diagnostics.js").install({ app, crashReporter: require("electron").crashReporter, file: path.join(LOGDIR, path.basename(LOGFILE).replace(/^ad_/, "diag_main_").replace(/\.log$/, ".jsonl")), context: () => ({ version: VERSION, phase, waiting: liveWaiting, mode: settings.aimode, core: cfg.core, paused: cfg.paused, hidden: cfg.hidden, status: lastStatus, worker: !!worker, lastWorker: diagnosticLastWorker, capture:diagnosticCapture, visibilityCause:lastVisibilityCause }), log, flush: () => diagnosticLog.flushSync(), onFault: () => uploader && uploader.crash() });
 /* ---- 托盘图标 ---- */
 function makeTrayIcon() { const { PNG } = require("pngjs"); const p = new PNG({ width: 16, height: 16 });
   for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) { const i = (y * 16 + x) * 4; const on = (x > 1 && x < 14 && y > 1 && y < 14); p.data[i] = on ? 0xff : 0; p.data[i + 1] = on ? 0xd7 : 0; p.data[i + 2] = on ? 0x6a : 0; p.data[i + 3] = on ? 255 : 0; }
@@ -59,23 +79,30 @@ function createOverlay() {
   overlay = new BrowserWindow({ x: b.x, y: b.y, width: b.width, height: ovH, frame: false, transparent: true, alwaysOnTop: true, skipTaskbar: true, hasShadow: false, resizable: false, focusable: false, show: false, paintWhenInitiallyHidden: true,
     webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true, nodeIntegration: false, backgroundThrottling: false } });
   overlay.setAlwaysOnTop(true, "screen-saver"); overlay.setIgnoreMouseEvents(true); overlay.setContentProtection(true);   // 不出现在截屏里(直播模式下窗口捕获接通后才放开);不要 forward:true
-  overlay.loadFile("overlay.html"); overlay.webContents.on("did-finish-load", () => { overlay.showInactive(); sendCfg(); });
+  overlay.loadFile("overlay.html"); overlay.webContents.on("did-finish-load", () => { setVisible(phase === "active"); sendCfg(); overlayState.replay((ch, m) => overlay.webContents.send(ch, m)); });
   /* v1.39 覆盖层卡死/崩溃自救。覆盖层常驻显示、置顶、鼠标穿透, "隐藏"只是让它画空白 ——
      它的页面一旦卡住, 最后一帧就一直钉在屏幕最上层, F6 也清不掉, 只能任务管理器(09-23 飞刀反馈)。以前主进程对此没有任何监听。 */
   const me = overlay; ovPingAt = Date.now(); ovUnresp = 0;
   me.on("unresponsive", () => { if (overlay !== me) return; ovUnresp = Date.now(); log("error", "覆盖层无响应(页面卡住), 3 秒后还不恢复就重建");
-    setTimeout(() => { if (overlay === me && ovUnresp) recreateOverlay("无响应超过 3 秒"); }, 3000); });
+    setTimeout(() => { if (overlay === me && ovUnresp && overlayWanted()) recreateOverlay("无响应超过 3 秒"); }, 3000); });
   me.on("responsive", () => { if (overlay !== me || !ovUnresp) return; log("error", `覆盖层恢复响应(卡了 ${((Date.now() - ovUnresp) / 1000).toFixed(1)}s)`); ovUnresp = 0; });
   me.webContents.on("render-process-gone", (e, d) => { if (overlay !== me) return; recreateOverlay(`渲染进程没了(${d && d.reason} ${d && d.exitCode})`); });
   if (ovTimer) return; ovTimer = true;
   /* 游戏切换独占全屏/别的置顶窗口出现后,置顶属性可能被顶掉,定期重申一次 */
-  setInterval(() => { if (overlay && !overlay.isDestroyed()) { if (!overlay.isVisible()) overlay.showInactive(); overlay.setAlwaysOnTop(true, "screen-saver"); } }, 5000);
+  setInterval(() => { if (overlayWanted() && overlay && !overlay.isDestroyed()) { if (!overlay.isVisible()) overlay.showInactive(); overlay.setAlwaysOnTop(true, "screen-saver"); } }, 5000);
   /* 报平安超时: 页面每 2 秒 ping 一次, 10 秒收不到 → 重建(unresponsive 事件有时不来, 比如页面没卡但合成/绘制停了) */
-  setInterval(() => { if (!overlay || overlay.isDestroyed() || ovRebuilding) return; const age = Date.now() - ovPingAt;
+  setInterval(() => { if (!overlayWanted() || !overlay || overlay.isDestroyed() || ovRebuilding) return; const age = Date.now() - ovPingAt;
     if (age > 10e3) recreateOverlay(`${(age / 1000).toFixed(0)} 秒没收到覆盖层报平安`); }, 2000);
 }
-let ovPingAt = 0, ovFrames = -1, ovUnresp = 0, ovTimer = false, ovRebuilding = false, ovRebuilds = [];
-ipcMain.on("ov-ping", (e, n) => { if (overlay && !overlay.isDestroyed() && e.sender === overlay.webContents) { ovPingAt = Date.now(); ovFrames = n | 0; } });
+let ovPingAt = 0, ovFrames = -1, ovUnresp = 0, ovTimer = false, ovRebuilding = false, ovRebuilds = [], ovRender = null, ovRenderLogAt = 0;
+ipcMain.on("ov-ping", (e, n) => { if (overlay && !overlay.isDestroyed() && e.sender === overlay.webContents) {
+  ovPingAt = Date.now(); ovFrames = (typeof n === "object" ? n.frames : n) | 0;
+  if (n && typeof n === "object") {
+    ovRender = n;
+    if (Date.now() - ovRenderLogAt > 30e3 || n.error) { ovRenderLogAt = Date.now(); crashDiag.record("overlay-render", n, !!n.error); }
+    if (n.error && overlayWanted() && !ovRebuilding) { log("error", "覆盖层绘制失败: " + n.error); recreateOverlay("绘制失败: " + n.error); }
+  }
+} });
 function recreateOverlay(why) {
   const now = Date.now(); ovRebuilds = ovRebuilds.filter(t => now - t < 600e3);
   if (ovRebuilds.length >= 5) { if (!ovRebuilding) log("error", `覆盖层 10 分钟内已重建 5 次, 不再自动重建(原因: ${why}); 托盘"重建悬浮窗"或重启插件`); ovPingAt = now; return; }
@@ -85,11 +112,20 @@ function recreateOverlay(why) {
   try { createOverlay(); } catch (e) { log("error", "建新覆盖层出错 " + (e && e.stack || e)); }
   ovRebuilding = false; uploader && uploader.crash();
 }
-const send = (ch, m) => { if (overlay && !overlay.isDestroyed()) overlay.webContents.send(ch, m); };
+const send = (ch, m) => { overlayState.accept(ch, m); if (overlay && !overlay.isDestroyed()) overlay.webContents.send(ch, m); };
 /* scale = 识别坐标(≤2560 宽) → 覆盖窗 DIP 坐标 的比例 */
-function sendCfg() { const cs = capSize(); send("cfg", { scale: cs.w / cs.dipW, all: cfg.all, paused: cfg.paused, hidden: cfg.hidden, showPlayerScores: cfg.showPlayerScores, plevel: cfg.plevel, plname: PLN[cfg.plevel], aimode: (["net", "combo"].includes(settings.aimode) ? settings.aimode : "mcts"), version: VERSION, phase, hotkey: HOTKEY, test: cfg.test, core: cfg.core, meSeat: cfg.meSeat, look: settings.look, live: liveInfo() }); sendPanel(); }
-function setVisible(v) { if (!overlay || overlay.isDestroyed()) return; if (!overlay.isVisible()) overlay.showInactive();
-  if (v) overlay.setAlwaysOnTop(true, "screen-saver"); else send("clear", {}); }
+function sendCfg() { if (capWin && !capWin.isDestroyed()) capWin.webContents.send("cap-rate", { active: phase === "active" && !cfg.paused }); const cs = capSize(); send("cfg", { scale: cs.w / cs.dipW, all: cfg.all, paused: cfg.paused, hidden: cfg.hidden, showPlayerScores: cfg.showPlayerScores, plevel: cfg.plevel, plname: PLN[cfg.plevel], aimode: AIModes.normalize(settings.aimode), version: VERSION, phase, hotkey: HOTKEY, test: cfg.test, core: cfg.core, meSeat: cfg.meSeat, look: settings.look, live: liveInfo() }); sendPanel(); }
+let recognitionNotice = false, visibilityNoticeUntil = 0;
+function overlayWanted() { return !liveWaiting && !cfg.paused && (Date.now() < visibilityNoticeUntil || (!cfg.hidden && (phase === "active" || recognitionNotice))); }
+function setVisible(v) {
+  if (!overlay || overlay.isDestroyed()) return;
+  const wanted=overlayWanted();
+  if(overlay.isVisible()!==wanted)crashDiag.record("overlay-visibility",{visible:wanted,reason:liveWaiting?"capture-waiting":cfg.paused?"paused":Date.now()<visibilityNoticeUntil?"visibility-toast":cfg.hidden?"hidden":recognitionNotice?"recognition-pending":phase,hidden:cfg.hidden,phase,waiting:liveWaiting},true);
+  if (!wanted) { overlay.hide(); overlay.webContents.setBackgroundThrottling(true); send("clear", {}); return; }
+  overlay.webContents.setBackgroundThrottling(false);
+  if (!overlay.isVisible()) { ovPingAt = Date.now(); overlay.showInactive(); }
+  overlay.setAlwaysOnTop(true, "screen-saver");
+}
 /* ---- 截屏 ----
    首选:常驻屏幕视频流(隐藏窗口里的 getDisplayMedia,和 OBS/Discord 一样),取一帧只是一次 GPU 缩放 + 像素读回。
    回退:老的 desktopCapturer.getSources(),每次都要重新枚举屏幕并整屏拷贝,实测一次 ~235ms —— 这是 v0.5 吃 CPU 的元凶。
@@ -98,71 +134,163 @@ let capWin = null, capReady = false, capDead = false, capSeq = 0; const capWait 
 function createCapture() {
   capWin = new BrowserWindow({ show: false, width: 200, height: 120, webPreferences: { preload: path.join(__dirname, "cap_preload.js"), contextIsolation: true, nodeIntegration: false, backgroundThrottling: false } });
   capWin.loadFile("capture.html");
-  session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
-    const d = screen.getPrimaryDisplay();
-    try {
-      /* 直播模式:抓**游戏窗口**而不是整个屏幕 —— 窗口捕获只拿那个窗口自己的画面, 盖在上面的覆盖层不会进来,
-         这样覆盖层才能放开防捕获(让直播软件抓到)而不污染自己的识别。找不到游戏窗口就先抓屏幕、覆盖层继续防捕获, 每 5 秒再找。 */
-      if (settings.allowCapture && !liveBlocked) { const w = await findGameWindow();
-        if (w) { setCapMode("window", `已捕获游戏窗口「${w.name}」, 覆盖层可被直播/录屏软件抓到`); log("cap", `视频流选定窗口: ${w.name} (${w.id})`); return callback({ video: w }); }
-        setCapMode("screen", "没找到 Dota 2 窗口, 先抓屏幕(覆盖层暂时仍不可被抓到), 进游戏后自动切换"); }
-      else setCapMode("screen", liveBlocked ? liveMsg : "");
-      const src = await desktopCapturer.getSources({ types: ["screen"], thumbnailSize: { width: 1, height: 1 } });
-      const s = src.find(x => String(x.display_id) === String(d.id)) || src[0]; log("cap", `视频流选定屏幕: ${s ? s.name : "无"}`); callback(s ? { video: s } : {});
-    } catch (e) { log("cap", "选源失败 " + e); callback({}); }
-  }, { useSystemPicker: false });
-  ipcMain.on("cap-ready", (e, m) => { capReady = true; capDead = false; capRestartAt = 0; capRetryGap = 10e3; log("cap", `${capMode === "window" ? "窗口" : "屏幕"}视频流已就绪 ${m.w}x${m.h}(常驻流模式)`); });
-  ipcMain.on("cap-bench", (e, m) => log("cap", "截屏测速 " + String(m && m.msg).slice(0, 600)));
-  ipcMain.on("cap-frame", (e, m) => { const w = capWait.get(m.id); if (w) { capWait.delete(m.id); w({ w: m.w, h: m.h, buf: m.buf, bgra: false }); } });
-  ipcMain.on("cap-fail", (e, m) => { const w = m.id != null && capWait.get(m.id); if (w) { capWait.delete(m.id); w(null); }
-    if (m.id == null && capRestartAt && Date.now() - capRestartAt < 3000) return;   // 重开流时旧页面的收尾消息, 不算流坏
-    if (!capDead) { capDead = true; capReady = false; log("cap", `视频流不可用(${m.msg}),回退到 desktopCapturer 逐帧截屏`); } });
   armCapTimeout();
 }
-function armCapTimeout() { setTimeout(() => { if (!capReady && !capDead) { capDead = true; log("cap", "视频流 8 秒未就绪,回退到 desktopCapturer 逐帧截屏"); } }, 8000); }
+function installCaptureHandlers() {
+  session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
+    const owner = capWin, epoch = liveEpoch;
+    const valid = () => (!request.frame || request.frame === owner?.webContents.mainFrame) && owner && owner === capWin && !owner.isDestroyed() && epoch === liveEpoch && !liveWaiting;
+    try {
+      if (!valid()) return callback({});
+      if (settings.allowCapture) {
+        const w = await findGameWindow();
+        if (!valid()) return callback({});
+        if (!w || liveBlocked) {
+          callback({});
+          suspendLive(liveBlocked ? liveMsg : "没找到 Dota 2 窗口，已停止捕获，等待游戏启动");
+          return;
+        }
+        log("cap", `视频流选定窗口: ${w.name} (${w.id})`);
+        return callback({ video: w });
+      }
+      const d = screen.getPrimaryDisplay();
+      const src = await sourcesT({ types: ["screen"], thumbnailSize: { width: 1, height: 1 } });
+      if (!valid()) return callback({});
+      const source = src.find(x => String(x.display_id) === String(d.id)) || src[0];
+      setCapMode("screen", ""); callback(source ? { video: source } : {});
+    } catch (e) { log("cap", "选源失败 " + e); callback({}); }
+  }, { useSystemPicker: false });
+  const current = e => !liveWaiting && capWin && !capWin.isDestroyed() && e.sender === capWin.webContents;
+  ipcMain.on("cap-ready", (e, m) => {
+    if (!current(e)) return;
+    capReady = true; capDead = false; capRestartAt = 0;
+    capWin.webContents.send("cap-rate", { active: phase === "active" }); capRetryGap = 10e3;
+    liveReadyAt = Date.now();
+    if (settings.allowCapture) setCapMode("window", "已捕获游戏窗口，覆盖层可被直播/录屏软件抓到");
+    log("cap", `${capMode === "window" ? "窗口" : "屏幕"}视频流已就绪 ${m.w}x${m.h}(常驻流模式)`);
+  });
+  ipcMain.on("cap-bench", (e, m) => { if (current(e)) log("cap", "截屏测速 " + String(m && m.msg).slice(0, 600)); });
+  ipcMain.on("cap-frame", (e, m) => { if (!current(e)) return; const w = capWait.get(m.id); if (w) { capWait.delete(m.id); w({ w: m.w, h: m.h, buf: m.buf, bgra: false }); } });
+  ipcMain.on("cap-fail", (e, m) => {
+    if (!current(e)) return;
+    const w = m.id != null && capWait.get(m.id); if (w) { capWait.delete(m.id); w(null); }
+    if (!capDead) {
+      capDead = true; capReady = false;
+      log("cap", `视频流不可用(${m.msg}),${settings.allowCapture ? "主播模式停止捕获并等待重连" : "回退到 desktopCapturer 逐帧截屏"}`);
+      if (settings.allowCapture) suspendLive("游戏窗口流断开，已停止捕获，等待重连");
+    }
+  });
+}
+function armCapTimeout() {
+  const owner = capWin;
+  setTimeout(() => {
+    if (liveWaiting || owner !== capWin || !owner || owner.isDestroyed() || capReady || capDead) return;
+    capDead = true;
+    if (settings.allowCapture) suspendLive("窗口视频流 8 秒未就绪，已停止捕获，等待重连");
+    else log("cap", "视频流 8 秒未就绪,回退到 desktopCapturer 逐帧截屏");
+  }, 8000);
+}
 /* ---- 直播模式(v1.24) ----
    覆盖窗的防捕获(setContentProtection)是 Windows 的 SetWindowDisplayAffinity, 对**所有**捕获一视同仁:直播软件抓不到, 插件自己也抓不到。
    要让直播软件抓到, 就得放开它;放开后插件自己的截屏就会看见自己画的框(胜率条压在格子底部、徽章压在角上), 识别会被污染。
    出路:直播模式下插件自己改抓**游戏窗口**(窗口捕获只拿那个窗口自己的画面), 接通后再放开防捕获。
-   独占全屏的游戏窗口捕获拿到的是黑屏 → 连续 40 帧近黑就退回屏幕捕获 + 重新防捕获, 提示改无边框窗口。 */
+   独占全屏连续 40 帧近黑 → 停止捕获并提示无边框窗口；主播模式不回退桌面。 */
 let capMode = "screen", liveMsg = "", liveBlocked = false, capRestartAt = 0, livePoll = null, blackRun = 0;
 function liveInfo() { return { on: !!settings.allowCapture, mode: capMode, msg: liveMsg }; }
 function setCapMode(mode, msg) { const changed = mode !== capMode || msg !== liveMsg; capMode = mode; liveMsg = msg;
   if (overlay && !overlay.isDestroyed()) overlay.setContentProtection(!(settings.allowCapture && mode === "window"));
   if (changed) { log("live", `捕获源=${mode} 防捕获=${!(settings.allowCapture && mode === "window") ? "开" : "关"} ${msg}`); sendCfg(); } }
 /* v1.40 截屏调用加超时: desktopCapturer.getSources 偶尔一直不返回(09-23 飞刀两次卡死前截屏越来越慢), 3 秒放弃这一帧 */
-function sourcesT(opt, ms = 3000) { return Promise.race([desktopCapturer.getSources(opt), new Promise((_, rej) => setTimeout(() => rej(new Error(`getSources ${ms}ms 没返回`)), ms))]); }
+function sourceTimeout(pending, ms = 3000) {
+  let timeout;
+  return Promise.race([pending, new Promise((_, reject) => {
+    timeout = setTimeout(() => reject(new Error(`getSources ${ms}ms 没返回`)), ms);
+  })]).finally(() => clearTimeout(timeout));
+}
+function sourcesT(opt, ms = 3000) { return sourceTimeout(desktopCapturer.getSources(opt), ms); }
+let gameWindowQuery = null;
 async function findGameWindow() {
-  const src = await sourcesT({ types: ["window"], thumbnailSize: { width: 1, height: 1 }, fetchWindowIcons: false });
-  const own = /AD 选技助手|ADAssistant|^cap$/;
-  return src.find(x => /^dota\s*2$/i.test(x.name.trim()) && !own.test(x.name)) || src.find(x => /dota\s*2/i.test(x.name) && !own.test(x.name)) || null; }
-function restartCapture(why) { if (!capWin || capWin.isDestroyed()) return; log("cap", `重开视频流: ${why}`);
-  for (const [id, w] of capWait) { capWait.delete(id); w(null); }
-  capReady = false; capDead = false; capRestartAt = Date.now(); blackRun = 0; capWin.webContents.reload(); armCapTimeout(); }
-/* v1.40 视频流断了(capDead)定期重连: 10s 起, 每失败一次间隔翻倍, 最多 60s; 流恢复(cap-ready)后清零。
-   以前只有直播模式的 livePoll 会重开流, 而它在 capMode==="window" 时直接跳过 —— 逐帧退路把 capMode 设成 window 后就永远回不去了。 */
+  // 超时只结束等待，原生枚举不一定取消；复用未完成请求，避免每次轮询再堆一个。
+  if (!gameWindowQuery) gameWindowQuery = desktopCapturer.getSources({ types: ["window"], thumbnailSize: { width: 0, height: 0 }, fetchWindowIcons: false })
+    .finally(() => { gameWindowQuery = null; });
+  const src = await sourceTimeout(gameWindowQuery);
+  // 不匹配包含 Dota 2 的网页/直播标题，避免退游戏后误抓浏览器。
+  return src.find(x => /^dota\s*2$/i.test(x.name.trim())) || null; }
+function disposeCapture() {
+  liveEpoch++;
+  capReady = false; capDead = false; capRestartAt = 0;
+  for (const [id, resolve] of capWait) { capWait.delete(id); resolve(null); }
+  const old = capWin; capWin = null;
+  if (old && !old.isDestroyed()) old.destroy(); // 销毁捕获页面，释放其 MediaStream/画布
+}
+function restartCapture(why) {
+  if (liveWaiting || quitting) return;
+  log("cap", `重开视频流: ${why}`);
+  disposeCapture(); blackRun = 0; capRestartAt = Date.now(); createCapture();
+}
+let liveRetryAt = 0, liveRetryGap = 3000, liveReadyAt = 0, windowMisses = 0, windowMissingSince = 0, stoppingRecognition = null;
+function suspendLive(msg) {
+  const wasWaiting = liveWaiting;
+  liveWaiting = true;
+  disposeCapture();
+  if (!wasWaiting) { liveRetryAt = Date.now() + liveRetryGap; liveRetryGap = Math.min(60000, liveRetryGap * 2); }
+  phase = "idle"; boardSeen = false; recognitionNotice = false; visibilityNoticeUntil = 0; needFull = true; sameRun = 0; lastHash = 0;
+  const oldWorker = worker; worker = null;
+  if (oldWorker) { const p = require("./worker_lifecycle").stop(oldWorker,{reason:msg,log,record:(...args)=>crashDiag.record(...args)});stoppingRecognition=p;
+    p.then(()=>{if(stoppingRecognition===p){stoppingRecognition=null;if(!liveWaiting&&!cfg.paused&&!quitting)startWorker();}}); }
+  send("clear", {}); setVisible(false);
+  setCapMode("waiting", msg); uploader.onPhase("idle");
+}
+async function pollLive() {
+  if (cfg.paused || quitting || liveChecking || Date.now() < liveRetryAt) return;
+  liveChecking = true; const epoch = liveEpoch;
+  try {
+    const w = await findGameWindow(); // 零尺寸缩略图：仅枚举窗口，不截图、不识别
+    if (cfg.paused || quitting || epoch !== liveEpoch) return;
+    if (w && capReady && Date.now() - liveReadyAt > 30000) liveRetryGap = 3000;
+    if (!w) {
+      liveBlocked = false; liveRetryGap = 3000;
+      if (!liveWaiting) { if(!windowMisses)windowMissingSince=Date.now();windowMisses++;log("live", `窗口暂未检出 连续${windowMisses}次 持续${Date.now()-windowMissingSince}ms`);
+        if(windowMisses>=3&&Date.now()-windowMissingSince>=4000)suspendLive("连续确认 Dota 2 窗口已关闭，已停止捕获，等待游戏启动"); }
+    } else if (liveWaiting && !liveBlocked) {
+      windowMisses=0;windowMissingSince=0;
+      liveWaiting = false; needFull = true; liveRetryAt = 0;
+      setCapMode("connecting", "发现 Dota 2 窗口，正在连接");
+      if (!worker) startWorker();
+      setVisible(false); restartCapture("检测到游戏窗口，恢复捕获");
+    } else if(w) { if(windowMisses)log("live","窗口恢复检出，保留现有识别和GPU会话");windowMisses=0;windowMissingSince=0; }
+  } catch (e) {
+    if (epoch === liveEpoch && !quitting) {
+      // 查询超时不等于游戏退出，不终止可能正在进行的 DirectML 调用。
+      log("live", "窗口检测失败 " + e);
+    }
+  } finally { liveChecking = false; }
+}
+/* 普通模式保留原有逐帧退路；主播模式仅重连游戏窗口，禁止回退桌面。 */
 let capRetryAt = 0, capRetryGap = 10e3;
-setInterval(() => { if (!capDead) { capRetryAt = 0; return; }   // 间隔只在真正就绪(cap-ready)时复位
+setInterval(() => {
+  if (settings.allowCapture || liveWaiting || quitting) return;
+  if (!capDead) { capRetryAt = 0; return; }
   if (!capRetryAt) { capRetryAt = Date.now() + capRetryGap; return; }
   if (Date.now() < capRetryAt) return;
-  capRetryAt = Date.now() + (capRetryGap = Math.min(60e3, capRetryGap * 2)); restartCapture("视频流断了, 定期重连"); }, 2000);
-function applyLive(why, restart = true) { liveBlocked = false; blackRun = 0;
+  capRetryAt = Date.now() + (capRetryGap = Math.min(60e3, capRetryGap * 2)); restartCapture("视频流断了, 定期重连");
+}, 2000);
+function applyLive(why, restart = true) {
+  liveBlocked = false; blackRun = 0; liveRetryAt = 0; liveRetryGap = 3000; windowMisses=0;windowMissingSince=0;
   if (livePoll) { clearInterval(livePoll); livePoll = null; }
-  if (settings.allowCapture) {
-    /* 还没进游戏时找不到窗口:每 5 秒再找, 找到就重开流切到窗口捕获 */
-    livePoll = setInterval(async () => { if (!settings.allowCapture || liveBlocked || capMode === "window") return;
-      try { const w = await findGameWindow(); if (w) restartCapture("直播模式找到了游戏窗口"); } catch (e) { } }, 5000);
-  }
-  if (restart) restartCapture(why); if (!settings.allowCapture) setCapMode("screen", ""); }
+  suspendLive(cfg.paused ? "已暂停捕获" : "等待 Dota 2 窗口，未捕获桌面");
+  liveRetryAt = 0; livePoll = setInterval(pollLive, 3000);
+  if (!cfg.paused) pollLive();
+}
 /* 窗口捕获拿到黑屏(独占全屏)的看门狗:只看扫描帧, 每 64 个像素采一个 */
 function liveBlackCheck(f) { if (capMode !== "window" || !f || liveBlocked) return; const u8 = new Uint8Array(f.buf); let sum = 0, n = 0;
   for (let i = 0; i < u8.length; i += 256) { sum += u8[i] + u8[i + 1] + u8[i + 2]; n++; }
-  if (sum / (3 * n) < 3) { if (++blackRun >= 40) { liveBlocked = true; log("live", "窗口捕获连续 40 帧黑屏(独占全屏?), 退回屏幕捕获并重新防捕获");
-      restartCapture("窗口捕获黑屏"); setCapMode("screen", "窗口捕获拿到的是黑屏(游戏是独占全屏?), 已退回屏幕捕获、覆盖层重新不可被抓到。把游戏改成无边框窗口, 再关开一次直播模式"); } }
+  if (sum / (3 * n) < 3) { if (++blackRun >= 40) { liveBlocked = true; log("live", "窗口捕获连续 40 帧黑屏(独占全屏?), 停止捕获");
+      suspendLive("窗口捕获持续黑屏，已停止捕获。请将游戏改为无边框窗口，再关开一次直播模式"); } }
   else blackRun = 0; }
 function grabStream(tw, th) {   // 从常驻流取一帧;1.5 秒没回来就判定流坏了
   return new Promise(resolve => { const id = ++capSeq; capWait.set(id, resolve);
-    setTimeout(() => { if (capWait.delete(id)) { if (!capDead) { capDead = true; capReady = false; log("cap", "取帧超时,回退到 desktopCapturer 逐帧截屏"); } resolve(null); } }, 1500);
+    setTimeout(() => { if (capWait.delete(id)) { if (!capDead) { capDead = true; capReady = false; log("cap", "取帧超时"); if (settings.allowCapture) suspendLive("窗口取帧超时，已停止捕获，等待重连"); } resolve(null); } }, 1500);
     capWin.webContents.send("cap-grab", { id, w: tw, h: th }); });
 }
 /* 扫描帧的缩小倍数:选技中只用来量 60 格明暗 → 1/8 就够(2560×1440 → 320×180, 一帧 230KB);
@@ -173,12 +301,15 @@ const scanDiv = () => (phase === "active" ? 8 : 4);
 function capSize() { const d = screen.getPrimaryDisplay(); const W = Math.round(d.bounds.width * d.scaleFactor), H = Math.round(d.bounds.height * d.scaleFactor);
   const w = Math.min(W, 2560); return { w, h: Math.round(H * w / W), W, H, dipW: d.bounds.width }; }
 async function grab(full) {
+  if (liveWaiting) return null;
   const cs = capSize(), W0 = cs.w, H0 = cs.h;
   const n = scanDiv();
   if (capReady && !capDead) { const f = await grabStream(full ? W0 : Math.round(W0 / n), full ? H0 : Math.round(H0 / n)); if (f) return f; }
+  if (settings.allowCapture || liveWaiting) return null;
   return grabLegacy(full);
 }
 async function grabLegacy(full) {
+  if (settings.allowCapture || liveWaiting) return null;
   const d = screen.getPrimaryDisplay(); const { w: W, h: H } = capSize();
   const n = scanDiv(); const tw = full ? W : Math.round(W / n), th = full ? H : Math.round(H / n);
   let s = null;
@@ -193,13 +324,17 @@ async function grabLegacy(full) {
 }
 let workerRestarts = [], quitting = false, workerMsgAt = 0;
 function startWorker() {
+  if (liveWaiting || quitting || worker) return;
+  if(stoppingRecognition)return;
+  needFull=true;
   worker = new Worker(path.join(__dirname, "worker.js"));
-  worker.postMessage({ type: "logdir", dir: LOGDIR });   // 观测轨迹和日志/截图放一起
+  worker.postMessage({ type: "logdir", dir: LOGDIR });
+  worker.postMessage({ type: "visibility", hidden: cfg.hidden });   // 观测轨迹和日志/截图放一起
   { const cs = capSize(); worker.postMessage({ type: "display", w: cs.w, h: cs.h }); }
-  worker.on("message", m => { workerMsgAt = Date.now();
+  worker.on("message", m => { if (worker !== me || liveWaiting || quitting) return; workerMsgAt = Date.now(); diagnosticLastWorker = { ts: workerMsgAt, type: m.type, tag: m.tag, message: m.type === "log" ? String(m.msg).slice(0, 500) : undefined };
     if (m.type === "log") return log(m.tag, m.msg);
     if (m.type === "meManualReset") { cfg.meSeat = "auto"; sync(); return; }   // 换了一局, 手动指定的座位作废
-    if (m.type === "want") { if (m.full) needFull = true; if (m.phase && m.phase !== phase) { phase = m.phase; uploader.onPhase(phase); log("cap", phase === "active" ? "选技中: 每 250ms 一张半分辨率扫描帧, 需要时补全分辨率" : "空闲: 每 1.5s 一张半分辨率"); setVisible(phase === "active"); sendCfg(); } return; }
+    if (m.type === "want") { if (m.full) needFull = true; if (m.phase && m.phase !== phase) { phase = m.phase; uploader.onPhase(phase); log("cap", phase === "active" ? "选技中: 每 250ms 一张半分辨率扫描帧, 需要时补全分辨率" : "空闲: 每 2s 一张 1/4 分辨率"); setVisible(phase === "active"); sendCfg(); } return; }
     /* 截图由工作线程送来**裸像素**(它只做一次拷贝就转移过来), PNG 编码放在这里做 ——
        编码要几百毫秒, 放在工作线程会卡住识别, 放这里最多让截屏拍子晚一拍。 */
     if (m.type === "snapshot") { const f = path.join(LOGDIR, `snap_${stamp(new Date())}_${m.why}.png`);
@@ -207,7 +342,7 @@ function startWorker() {
         const p = new PNG({ width: m.w, height: m.h, deflateLevel: 1 }); p.data = Buffer.from(m.raw);
         fs.writeFileSync(f, PNG.sync.write(p, { deflateLevel: 1 })); log("snap", `已存 ${path.basename(f)} (${m.why}, ${m.w}x${m.h})`);
       } catch (e) { log("snap", "存失败 " + e); } }); return; }
-    if (m.type === "state") { if (m.phase && m.phase !== phase) { phase = m.phase; uploader.onPhase(phase); setVisible(phase === "active"); sendCfg(); }
+    if (m.type === "state") { const near = !!(m.idle && m.board && m.near); if (near !== recognitionNotice) { recognitionNotice = near; setVisible(phase === "active"); } if (m.phase && m.phase !== phase) { phase = m.phase; uploader.onPhase(phase); setVisible(phase === "active"); sendCfg(); }
       if (!m.idle) { const ms = m.me ? `${m.me.side === "L" ? "左" : "右"}${m.me.idx + 1}` : null; if (ms !== meShown) { meShown = ms; tray && tray.setContextMenu(buildMenu()); } }
       if (!!m.board !== boardSeen) boardSeen = !!m.board;
       const st = m.idle ? `idle 亮${m.pres && m.pres.bright} 暗${m.pres && m.pres.dark}` : `active 当前${m.current.side}${m.current.idx + 1} 我${m.me ? m.me.side + (m.me.idx + 1) + (m.meSource === "manual" ? "(手动)" : "") : "未确定"}`; if (st !== lastStatus) { lastStatus = st; tray && tray.setToolTip(`AD 选技助手 v${VERSION}${cfg.hidden ? " · 已隐藏" : ""} · ${st}`); sendPanel(); } }
@@ -216,30 +351,33 @@ function startWorker() {
   });
   /* v1.30 识别线程崩了: 以前只显示报错、画面永远停在最后一帧(09-18 飞刀那局)。现在立刻上传日志 + 自动重启(10 分钟内最多 5 次) */
   const me = worker;
-  worker.on("error", e => { log("error", "worker " + (e && e.stack || e)); send("error", { msg: String(e) + " —— 识别线程已自动重启" }); });
-  worker.on("exit", c => { log("error", "worker 退出 " + c); if (worker !== me || quitting) return;
+  worker.on("error", e => { if (worker !== me || liveWaiting || quitting) return; log("error", "worker " + (e && e.stack || e)); send("error", { msg: String(e) + " —— 识别线程已自动重启" }); });
+  worker.on("exit", c => { if (worker !== me || quitting) return; log("error", "worker 退出 " + c); crashDiag.record("recognition-worker-exit", { code: c, last: diagnosticLastWorker }, true); diagnosticLog.flushSync();
     uploader && uploader.crash();
     const now = Date.now(); workerRestarts = workerRestarts.filter(t => now - t < 600e3);
     if (workerRestarts.length >= 5) { log("error", "识别线程 10 分钟内崩了 5 次, 不再自动重启(托盘重启插件)"); return; }
-    workerRestarts.push(now); worker = null; phase = "idle";
+    workerRestarts.push(now); worker = null; phase = "idle"; recognitionNotice = false;
     setTimeout(() => { log("error", `识别线程自动重启(第 ${workerRestarts.length} 次)`); startWorker(); }, 1000); });
 }
 let inflight = false, sameRun = 0, lastHash = 0;
 const frameHash = buf => { const u8 = new Uint8Array(buf); let h = 0; for (let i = 0; i < u8.length; i += 997) h = (h * 31 + u8[i]) | 0; return h; };
 async function loop() {
-  if (cfg.paused || inflight) return; inflight = true;
+  if (cfg.paused || liveWaiting || inflight) return; inflight = true;
+  const epoch = liveEpoch;
   const full = needFull; needFull = false;
-  try { const t0 = Date.now(); const f = await grab(full); const dt = Date.now() - t0; capN++;
+  try { const t0 = Date.now(); const f = await grab(full); const dt = Date.now() - t0; if (epoch !== liveEpoch || liveWaiting) return; capN++;
     if (full) { capFull++; capMsFull += dt; } else capMs += dt;
     if (capN % 240 === 0) log("cap", `近 ${capN} 次截屏(${capReady && !capDead ? "常驻流" : "逐帧"}): 扫描帧 ${capN - capFull} 次均 ${(capMs / Math.max(1, capN - capFull)).toFixed(0)}ms, 全分辨率 ${capFull} 次均 ${(capMsFull / Math.max(1, capFull)).toFixed(0)}ms`);
     if (f && !full) liveBlackCheck(f);
+    if (epoch !== liveEpoch || liveWaiting) return;
     if (f && capReady && !capDead) {   // 流冻结(隐藏窗口被系统暂停)不会报错, 只会一直给同一帧 → 靠"画面一动不动"识破
       const h = frameHash(f.buf); if (h === lastHash) sameRun++; else { sameRun = 0; lastHash = h; }
-      if (sameRun >= 60 && phase === "active") { capDead = true; capReady = false; sameRun = 0; log("cap", "视频流连续 60 帧一模一样, 判定已冻结, 回退到逐帧截屏"); } }
+      if (sameRun >= 60 && phase === "active") { capDead = true; capReady = false; sameRun = 0; log("cap", "视频流连续 60 帧一模一样, 判定已冻结"); if (settings.allowCapture) { suspendLive("窗口视频流冻结，已停止捕获，等待重连"); return; } } }
+    diagnosticCapture={ts:Date.now(),frame:capN,source:capMode,full,ms:dt,width:f?.w,height:f?.h,epoch,ready:capReady,frozenFrames:sameRun};
     /* 鼠标位置(换算到识别用的全分辨率坐标):鼠标悬停的那一格游戏会弹介绍框/变样子, 识别端把它当"看不清" */
     let cursor = null; try { const cp = screen.getCursorScreenPoint(), d = screen.getPrimaryDisplay(), cs = capSize();
       cursor = [(cp.x - d.bounds.x) * cs.w / d.bounds.width, (cp.y - d.bounds.y) * cs.h / d.bounds.height]; } catch (e) { }
-    if (f && worker) { const snap = snapOnce; snapOnce = false; worker.postMessage({ type: "frame", ...f, full, all: cfg.all, plevel: cfg.plevel, arrive: !!settings.arrive, aimode: (["net", "combo"].includes(settings.aimode) ? settings.aimode : "mcts"), combo: { K: settings.comboK || 8, R: settings.comboR || 16, sec: settings.comboSec || 8, refine: settings.comboRefine !== false }, meSeat: cfg.meSeat, snap, cursor, test: cfg.test, core: cfg.core }, [f.buf]); } }
+    if (f && worker) { const snap = snapOnce; snapOnce = false; worker.postMessage({ type: "frame", ...f, full, all: cfg.all, plevel: cfg.plevel, arrive: !!settings.arrive, aimode: AIModes.normalize(settings.aimode), combo: { K: settings.comboK || 8, R: settings.comboR || 16, sec: settings.comboSec || 8, refine: settings.comboRefine !== false }, meSeat: cfg.meSeat, snap, cursor, test: cfg.test, core: cfg.core, shareOpt: !!settings.shareOpt }, [f.buf]); } }
   catch (e) { needFull = needFull || full; log("error", "截屏 " + e); send("error", { msg: String(e) }); }
   finally { inflight = false; }
 }
@@ -261,16 +399,18 @@ function openPanel() {
 }
 function sendPanel() { if (!panelWin || panelWin.isDestroyed()) return;
   panelWin.webContents.send("panel", { all: cfg.all, paused: cfg.paused, hidden: cfg.hidden, showPlayerScores: cfg.showPlayerScores, plevel: cfg.plevel, plname: PLN[cfg.plevel], version: VERSION, phase, hotkey: HOTKEY,
-    test: cfg.test, core: cfg.core, meSeat: cfg.meSeat, look: settings.look, uploadLogs: settings.uploadLogs, arrive: !!settings.arrive, aimode: (["net", "combo"].includes(settings.aimode) ? settings.aimode : "mcts"), combo: { K: settings.comboK || 8, R: settings.comboR || 16, sec: settings.comboSec || 8, refine: settings.comboRefine !== false }, allowCapture: settings.allowCapture, live: liveInfo(), meShown, status: lastStatus, upd: updater.state(), gpuPrio }); }
+    test: cfg.test, core: cfg.core, meSeat: cfg.meSeat, look: settings.look, uploadLogs: settings.uploadLogs, arrive: !!settings.arrive, aimode: AIModes.normalize(settings.aimode), combo: { K: settings.comboK || 8, R: settings.comboR || 16, sec: settings.comboSec || 8, refine: settings.comboRefine !== false }, allowCapture: settings.allowCapture, live: liveInfo(), meShown, status: lastStatus, upd: updater.state(), gpuPrio, shareOpt: !!settings.shareOpt }); }
 ipcMain.on("panel-ready", () => sendPanel());
 ipcMain.on("panel-set", (e, m) => { if (!m || typeof m !== "object") return; const { k, v } = m;
-  if (["all", "paused", "hidden", "showPlayerScores", "test"].includes(k)) cfg[k] = !!v;
+  if(k === "hidden")setHidden(!!v,"panel");
+  else if (["all", "paused", "showPlayerScores", "test"].includes(k)) cfg[k] = !!v;
   else if (k === "plevel") cfg.plevel = Math.min(3, Math.max(0, Math.round(+v) || 0));
   else if (k === "core") cfg.core = v === "v2" ? "v2" : "1x";
   else if (k === "meSeat") cfg.meSeat = /^[LR][1-5]$/.test(String(v)) ? String(v) : "auto";
   else if (k === "uploadLogs") { settings.uploadLogs = !!v; saveSettings(); }
   else if (k === "arrive") { settings.arrive = !!v; saveSettings(); }
-  else if (k === "aimode") { settings.aimode = ["net", "combo"].includes(v) ? v : "mcts"; saveSettings(); }
+  else if (k === "aimode") { settings.aimode = AIModes.normalize(v); saveSettings(); }
+  else if (k === "shareOpt") { settings.shareOpt = !!v; saveSettings(); log("cfg", `双方团队分配=${settings.shareOpt ? "开" : "关"}`); }
   else if (k === "combo" && v && typeof v === "object") { settings.comboK = Math.max(2, Math.min(16, v.K | 0 || 8)); settings.comboR = Math.max(8, Math.min(128, v.R | 0 || 16));
     settings.comboSec = Math.max(2, Math.min(30, +v.sec || 8)); if (typeof v.refine === "boolean") settings.comboRefine = v.refine; saveSettings(); }
   else if (k === "look") { settings.look = ADFrames.norm(v); saveSettings(); }
@@ -292,7 +432,7 @@ function buildMenu() { return Menu.buildFromTemplate([
   ...(() => { const u = updater.state(); return u.phase === "available" ? [{ label: `⬆ 有新版本 v${u.latest} — 点击立即更新(自动重启)`, click: () => doUpdate() }]
     : u.phase === "needFull" ? [{ label: `⬆ 有新版本 v${u.latest} — 需下载完整包(点击打开下载)`, click: () => doUpdate() }] : [{ label: "检查更新", click: () => updater.check(false) }]; })(),
   { label: "⚙ 设置面板(颜色/模式/座位…, 双击托盘图标也能打开)", click: () => openPanel() },
-  { label: (cfg.hidden ? "👁 恢复显示" : "🙈 隐藏显示(识别照常运行)") + kk("隐藏/显示"), click: () => toggleHidden() },
+  { label: (cfg.hidden ? "👁 恢复显示" : "🙈 隐藏显示(识别照常运行)") + kk("隐藏/显示"), click: () => toggleHidden("tray") },
   { label: (cfg.all ? "● 团队模式(我方五人)" : "● 单人模式(只看我)") + " — 点击切换" + kk("切换显示模式"), click: () => { cfg.all = !cfg.all; sync(); } },
   { label: "显示双方组合明细", type: "checkbox", checked: cfg.showPlayerScores, click: () => { cfg.showPlayerScores = !cfg.showPlayerScores; sync(); } },
   { label: "📺 直播模式(让直播/录屏软件能抓到覆盖层)", type: "checkbox", checked: settings.allowCapture, click: () => { settings.allowCapture = !settings.allowCapture; saveSettings(); applyLive(`托盘${settings.allowCapture ? "开" : "关"}直播模式`); sync(); } },
@@ -319,10 +459,18 @@ function buildMenu() { return Menu.buildFromTemplate([
   { label: "打完一局自动上传日志(帮作者排查问题)", type: "checkbox", checked: settings.uploadLogs, click: () => { settings.uploadLogs = !settings.uploadLogs; saveSettings(); sync(); } },
   { label: "立即上传本次日志", click: () => uploader.now() },
   { type: "separator" }, { label: "退出", click: () => app.quit() }]); }
-function sync() { tray.setContextMenu(buildMenu()); sendCfg(); log("cfg", `all=${cfg.all} paused=${cfg.paused} hidden=${cfg.hidden} showPlayerScores=${cfg.showPlayerScores} 个人权重=${PLN[cfg.plevel]} 模式=${cfg.test ? "测试" : "正式"} 内核=${cfg.core} 自动上传日志=${settings.uploadLogs ? "开" : "关"} 本人座位=${cfg.meSeat} 安装号=${settings.installId} 配色=${settings.look.c1}/${settings.look.c2}/${settings.look.c3}/${settings.look.mid} 画到${settings.look.midN} 粗细${settings.look.thick} 直播模式=${settings.allowCapture ? "开" : "关"}(源=${capMode})`); }
+let lastPaused = false, lastHidden = cfg.hidden;
+function sync() { if (cfg.paused !== lastPaused) { lastPaused = cfg.paused; applyLive(cfg.paused ? "暂停" : "恢复"); }
+  if (cfg.hidden !== lastHidden) { lastHidden = cfg.hidden; visibilityNoticeUntil = Date.now() + 2200; setTimeout(() => setVisible(phase === "active"), 2250); }
+  if (worker) worker.postMessage({ type: "visibility", hidden: cfg.hidden });
+  setVisible(phase === "active"); tray.setContextMenu(buildMenu()); sendCfg(); log("cfg", `all=${cfg.all} paused=${cfg.paused} hidden=${cfg.hidden} showPlayerScores=${cfg.showPlayerScores} 个人权重=${PLN[cfg.plevel]} 模式=${cfg.test ? "测试" : "正式"} 内核=${cfg.core} 自动上传日志=${settings.uploadLogs ? "开" : "关"} 本人座位=${cfg.meSeat} 安装号=${settings.installId} 配色=${settings.look.c1}/${settings.look.c2}/${settings.look.c3}/${settings.look.mid} 画到${settings.look.midN} 粗细${settings.look.thick} 直播模式=${settings.allowCapture ? "开" : "关"}(源=${capMode})`); }
 /* 一键隐藏:覆盖层什么都不画(切换那一下闪 2 秒提示, 确认按键生效), 截屏/识别/引擎照常跑 —— 再按一次立刻显示最新结果,
    可以反复开关确认插件一直在正常工作 */
-function toggleHidden() { cfg.hidden = !cfg.hidden; sync(); tray.setToolTip(`AD 选技助手 v${VERSION}${cfg.hidden ? " · 已隐藏" : ""} · ${lastStatus}`); }
+function setHidden(value,source) { if(cfg.hidden===value)return;const previous=cfg.hidden;cfg.hidden=value;
+  lastVisibilityCause={ts:Date.now(),previous,hidden:value,source,key:source==="hotkey"?HOTKEY["隐藏/显示"]:null,phase,focusedWindow:BrowserWindow.getFocusedWindow?.()?.id||null,panelVisible:!!panelWin&&!panelWin.isDestroyed()&&panelWin.isVisible()};
+  log("visibility",JSON.stringify(lastVisibilityCause));crashDiag.record("visibility-change",lastVisibilityCause,true);
+}
+function toggleHidden(source) { setHidden(!cfg.hidden,source);sync();tray.setToolTip(`AD 选技助手 v${VERSION}${cfg.hidden ? " · 已隐藏" : ""} · ${lastStatus}`); }
 /* v1.30 强制独显: 和"设置 → 系统 → 显示 → 图形 → 高性能"是同一个注册表项(当前用户, 不要管理员),
    只对本程序 exe 生效;没设过或被设成"节能"(1)才改成 2。Windows 在进程启动时读 → 下次启动生效, 这次靠组合版逐块测速兜底。 */
 function preferDiscreteGpu() {
@@ -355,18 +503,20 @@ app.whenReady().then(() => {
   pruneLogs(); updater.cleanupOld(); const d = screen.getPrimaryDisplay();
   log("start", `v${VERSION} electron ${process.versions.electron} ${process.platform} ${process.arch} 主屏 ${d.bounds.width}x${d.bounds.height} 缩放 ${d.scaleFactor} 物理 ${Math.round(d.bounds.width * d.scaleFactor)}x${Math.round(d.bounds.height * d.scaleFactor)} 日志 ${LOGFILE}`);
   logGpu(); preferDiscreteGpu();
-  require("./gpuprio.js").raise(process.pid, log, r => { gpuPrio = r; sendPanel(); });
+  require("./gpuprio.js").configure(process.pid, log, r => { gpuPrio = r; crashDiag.record("gpu-priority", r || { supported: false }, true); sendPanel(); }, { target: process.env.AD_GPU_PRIORITY === "normal" ? 2 : 3 });
   if (Math.round(d.bounds.height * d.scaleFactor) !== 1440) log("warn", "主屏不是 1440p, 版式按高度等比缩放(16:9 可用, 带鱼屏未验证)");
   tray = new Tray(makeTrayIcon()); tray.setToolTip(`AD 选技助手 v${VERSION}`); tray.setContextMenu(buildMenu());
   tray.on("double-click", () => openPanel());
-  createOverlay(); createCapture(); startWorker(); schedule();
-  if (settings.allowCapture) { log("live", "启动时直播模式已开"); applyLive("启动时直播模式已开", false); }
+  createOverlay(); installCaptureHandlers();
+  schedule();
+  if (settings.allowCapture) log("live", "启动时直播模式已开");
+  applyLive("启动时检测游戏", false);
   /* F8/F9/F10 常被别的常驻程序(截图工具/WeGame 之类)全局占用 —— 用户实测三个全注册失败。
      依次退让到 Alt+ / Ctrl+Alt+ 组合,注册成功的那个写进日志和托盘菜单。 */
   const reg = (list, fn, what) => { for (const k of list) { let ok = false; try { ok = globalShortcut.register(k, fn); } catch (e) { ok = false; }
       if (ok) { HOTKEY[what] = k; log("key", `${what} 注册成功: ${k}`); return k; } log("key", `${what} 注册 ${k} 失败(被别的程序占用)`); }
     HOTKEY[what] = null; log("key", `${what} 全部候选键都被占用, 只能用托盘菜单`); return null; };
-  reg(["F6", "Alt+F6", "CommandOrControl+Alt+F6"], () => toggleHidden(), "隐藏/显示");
+  reg(["F6", "Alt+F6", "CommandOrControl+Alt+F6"], () => toggleHidden("hotkey"), "隐藏/显示");
   reg(["F8", "Alt+F8", "CommandOrControl+Alt+F8"], () => { cfg.all = !cfg.all; sync(); }, "切换显示模式");
   reg(["F9", "Alt+F9", "CommandOrControl+Alt+F9"], () => { cfg.paused = !cfg.paused; sync(); }, "暂停/继续");
   reg(["F7", "Alt+F7", "CommandOrControl+Alt+F7"], () => { cfg.plevel = (cfg.plevel + 1) % 4; sync(); }, "团队/个人优先");
@@ -375,10 +525,14 @@ app.whenReady().then(() => {
   reg(["F12", "Alt+F12", "CommandOrControl+Alt+F12"], () => { cfg.core = cfg.core === "v2" ? "1x" : "v2"; sync(); }, "切换内核");
   tray.setContextMenu(buildMenu());
   setInterval(flushLog, 2000);
+  pruneTextLogs(); setInterval(pruneTextLogs, 3600e3);
+  setInterval(() => { try { const ms = app.getAppMetrics();
+    log("perf", `进程CPU合计 ${ms.reduce((s, p) => s + (p.cpu?.percentCPUUsage || 0), 0).toFixed(1)}% 工作集 ${Math.round(ms.reduce((s, p) => s + (p.memory?.workingSetSize || 0), 0) / 1024)}MB 阶段=${phase} waiting=${liveWaiting} paused=${cfg.paused} hidden=${cfg.hidden} stream=${!!capWin} worker=${!!worker} mode=${settings.allowCapture ? "streamer" : "normal"} capMode=${capMode} ready=${capReady} pendingFrames=${capWait.size} overlayVisible=${!!overlay && !overlay.isDestroyed() && overlay.isVisible()} processes=${ms.map(p => `${p.type}:${(p.cpu?.percentCPUUsage || 0).toFixed(1)}%/${Math.round((p.memory?.workingSetSize || 0) / 1024)}MB`).join(",")} logger=${JSON.stringify(diagnosticLog.stats())}`);
+  } catch (e) { log("perf", "采样失败 " + e.message); } }, 30000);
   /* v1.39 心跳: 下次再卡死, 看日志断在哪、谁先没了消息(主进程停了 → 心跳断; 识别线程卡 → 线程那一项变大; 覆盖层卡 → 覆盖层那一项变大) */
-  setInterval(() => log("hb", `主进程正常 | 识别线程 ${workerMsgAt ? ((Date.now() - workerMsgAt) / 1000).toFixed(0) + "s 前有消息" : "还没消息"} | 覆盖层 ${((Date.now() - ovPingAt) / 1000).toFixed(0)}s 前报平安(2 秒画了 ${ovFrames} 帧) | 阶段 ${phase}`), 30e3);
+  setInterval(() => log("hb", `主进程正常 | 识别线程 ${workerMsgAt ? ((Date.now() - workerMsgAt) / 1000).toFixed(0) + "s 前有消息" : "还没消息"} | 覆盖层 ${((Date.now() - ovPingAt) / 1000).toFixed(0)}s 前报平安(2 秒动画回调 ${ovFrames} 次) | 阶段 ${phase}`), 30e3);
   if (app.isPackaged) { setTimeout(() => updater.check(true), 20e3); setInterval(() => updater.check(true), 3 * 3600e3); }
 });
 app.on("window-all-closed", () => {});
-app.on("before-quit", () => { quitting = true; log("stop", "退出"); flushLog(); });
-process.on("uncaughtException", e => { log("error", "主进程 " + (e && e.stack || e)); flushLog(); });
+app.on("before-quit", () => { quitting = true; if (livePoll) clearInterval(livePoll); disposeCapture(); log("stop", "退出"); diagnosticLog.flushSync(); });
+process.on("uncaughtException", e => { log("error", "主进程 " + (e && e.stack || e)); diagnosticLog.flushSync(); });

@@ -19,6 +19,11 @@ onPanel(st);
 check("状态推来: 控件按状态刷新(第一名色/画到第几名/座位/权重档/内核)", $("k-c1").value === "#123456" && String($("k-midN").value) === "6" && $("s-me").value === "R5" && $("seg-pl").children[2].className === "on" && $("v-1x").className === "on" && $("k-rest").checked === false);
 check("look 缺的项补默认(第二名黄)", $("k-c2").value === "#ffd038");
 check("快捷键区: 被占用的写明用面板", /被占用/.test($("keys").innerHTML) && /F6/.test($("keys").innerHTML));
+for (const mode of ["mcts", "net", "combo", "combo-team", "duel", "duel-fast"]) {
+  onPanel({ ...st, aimode: mode }); $("ai-" + mode).onclick();
+  check("版本切换 " + mode, $("ai-" + mode).className === "on" && sent.at(-1)[0] === "aimode" && sent.at(-1)[1] === mode);
+}
+sent.length = 0;
 $("b-hidden").onclick(); $("m-all").onclick(); $("seg-pl").children[3].onclick(); $("s-me").value = "L2"; $("s-me").onchange({ target: $("s-me") }); $("c-up").onchange({ target: { checked: false } }); $("v-v2").onclick(); $("c-live").onchange({ target: { checked: true } });
 check("点开关 → 发对应的 set", JSON.stringify(sent) === JSON.stringify([["hidden", true], ["all", true], ["plevel", 3], ["meSeat", "L2"], ["uploadLogs", false], ["core", "v2"], ["allowCapture", true]]));
 onPanel({ ...st, allowCapture: true, live: { on: true, mode: "window", msg: "已捕获游戏窗口「Dota 2」" } });

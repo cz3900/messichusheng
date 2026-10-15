@@ -5,9 +5,11 @@ const { loadModel } = require("./engine/server/mcts_fast.js");
 function createPlayerScorer() {
   const win = loadModel(path.join(__dirname, "engine", "public"));
   win.ADScore.ready();
+  let MODE = "expect";   // 座位分口径(双方自然 expect / 双方团队 optimalBoth); 位置建议一律按双方最优分配算
+  const LADDER = [0.343, 0.255, 0.193, 0.132, 0.077];
   const heroes = new Map(win.AD_HEROES.map(h => [h.key, "hero:" + h.id]));
   const known = k => Object.prototype.hasOwnProperty.call(win.AD_MODEL.index, k);
-  return (panels, layout) => {
+  const fn = (panels, layout) => {
     const seats = Array.from({ length: 10 }, () => []);
     const rows = seats.map((_, i) => ({ side: i < 5 ? "L" : "R", idx: i % 5, heroKnown: false, skillCount: 0, unknown: 0 }));
     for (const p of panels || []) {
@@ -25,7 +27,12 @@ function createPlayerScorer() {
         seen.add(s.key); seats[i].push(s.key); row.skillCount++;
       }
     }
-    const score = win.ADScore.evaluate(seats);
+    let score, opt = null;
+    if (win.ADScore.setShareMode) { win.ADScore.setShareMode(MODE); score = win.ADScore.evaluate(seats); win.ADScore.setShareMode("optimalBoth"); opt = win.ADScore.evaluate(seats); win.ADScore.setShareMode(MODE); }
+    else score = win.ADScore.evaluate(seats);
+    /* 位置建议: 预计几号刷钱位 = 期望份额在队内的名次; 建议 = 双方最优分配下这个座位该排第几; gain = 排到建议位比顺其自然多多少(logit) */
+    const expRank = new Array(10).fill(null);
+    for (let t = 0; t < 2; t++) { const sh = []; for (let q = 0; q < 5; q++) sh.push([q, score.seats[t * 5 + q].shareP == null ? -1 : score.seats[t * 5 + q].shareP]); sh.sort((a, b) => b[1] - a[1]); sh.forEach(([q], r) => { expRank[t * 5 + q] = r + 1; }); }
     return rows.map((row, i) => {
       const p = layout.panels[row.side], r = layout.res[1] / 1440;
       // 放在面板朝棋盘的一侧，避开英雄、昵称和技能图标。
@@ -33,9 +40,13 @@ function createPlayerScorer() {
       const box = [row.side === "L" ? p.x0 + 429 * r : p.x0 - width - 10 * r,
         p.y_top + row.idx * p.pitch + 12 * r, width, 176 * r];
       const v = score.seats[i], hasItems = seats[i].length > 0;
-      const parts = hasItems ? { main: v.main2, synergy: v.syn2, team: v.cross, counter: v.ctr } : null;
-      return { ...row, total: hasItems ? v.total : null, parts, box };
+      const parts = hasItems ? { main: v.main2, synergy: v.syn2, team: v.cross, counter: v.ctr, share: v.share || 0 } : null;
+      const enough = seats[i].length >= 2, o = opt ? opt.seats[i] : null;
+      const pos = (enough && v.shareP != null) ? { shareP: v.shareP, expRank: expRank[i], optRank: o && o.shareRank ? o.shareRank : null, optShare: o && o.shareRank ? LADDER[o.shareRank - 1] : null, gain: o && o.posTerm != null ? o.posTerm : null } : null;
+      return { ...row, total: hasItems ? v.total : null, parts, box, pos };
     });
   };
+  fn.setShareMode = m => { MODE = ["optimalL", "optimalR", "optimalBoth"].includes(m) ? m : "expect"; };
+  return fn;
 }
 module.exports = { createPlayerScorer };

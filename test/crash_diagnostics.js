@@ -1,0 +1,17 @@
+"use strict";
+const assert=require("assert/strict"),fs=require("fs"),os=require("os"),path=require("path"),{EventEmitter}=require("events");
+const D=require("../crash_diagnostics"),dir=fs.mkdtempSync(path.join(os.tmpdir(),"ad-crash-")),file=path.join(dir,"diag.jsonl");
+const app=new EventEmitter(),proc=new EventEmitter(),messages=[];app.getPath=()=>dir;
+let options;const diag=D.install({app,process:proc,crashReporter:{start:o=>options=o},file,context:()=>({mode:"duel",job:12}),log:(...a)=>messages.push(a),flush:()=>messages.push(["flush"])});
+assert.equal(options.uploadToServer,false);
+const wc=new EventEmitter();wc.id=7;app.emit("web-contents-created",null,wc);wc.emit("render-process-gone",null,{reason:"crashed",exitCode:-1073741819});
+app.emit("child-process-gone",null,{type:"GPU",reason:"oom",exitCode:1});proc.emit("uncaughtExceptionMonitor",Error("native-boundary"));proc.emit("unhandledRejection",Error("async-fault"));
+app.emit("before-quit");const rows=fs.readFileSync(file,"utf8").trim().split("\n").map(JSON.parse);
+for(const kind of ["render-process-gone","child-process-gone","uncaught-exception","unhandled-rejection","normal-exit"])assert(rows.some(r=>r.event===kind),kind);
+assert.equal(rows.find(r=>r.event==="render-process-gone").details.exitCode,-1073741819);assert(rows.every(r=>r.context.mode==="duel"&&r.memory.rss>0));assert(messages.some(r=>r[0]==="flush"));
+const capped=D.create(path.join(dir,"cap.jsonl"),{cap:1});capped.record("initial");capped.record("routine");capped.record("fatal",{},true);assert.equal(fs.readFileSync(path.join(dir,"cap.jsonl"),"utf8").trim().split("\n").length,2);
+assert.doesNotThrow(()=>D.create(path.join(dir,"missing","no.jsonl")).record("fault",{},true));
+const rotating=path.join(dir,'rolling.jsonl'),roll=D.create(rotating,{cap:128,rotate:true});
+for(let i=0;i<20;i++)roll.record('stage',{i});roll.record('fatal',{fault:'current'},true);
+assert(fs.existsSync(path.join(dir,'rolling.previous.jsonl')));assert(fs.readFileSync(rotating,'utf8').includes('current'));
+fs.rmSync(dir,{recursive:true,force:true});console.log("通过：渲染/GPU退出、异常与拒绝现场、退出码与内存、同步落盘、文件限额及日志失败隔离。");

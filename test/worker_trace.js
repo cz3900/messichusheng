@@ -35,7 +35,7 @@ const frame = cur => S.render({ heroes: H, cur: [cur < 5 ? "L" : "R", cur % 5], 
     for (let f = 0; f < 2; f++) { send(frame(x)); await new Promise(r => setTimeout(r, 200)); } }
   await new Promise(r => setTimeout(r, 600));
   await w.terminate();
-  const files = fs.readdirSync(DIR).filter(f => f.endsWith(".jsonl"));
+  const files = fs.readdirSync(DIR).filter(f => /^trace_.*\.jsonl$/.test(f));
   console.log(`模式=${TEST ? "测试" : "正式"} 内核=${CORE} | 锁池 ${locked ? "✓" : "✗"} | 送入 ${sent} 帧 | 轨迹 ${files.length} 个 | 截图 ${snaps} 张 | 点位/分歧 ${points.length} 条`);
   if (points.length) console.log("    " + points.slice(0, 3).join("\n    "));
   if (!locked || !files.length) { console.log("✗ 没有产出轨迹"); console.log(logs.slice(0, 12).join("\n")); process.exit(1); }

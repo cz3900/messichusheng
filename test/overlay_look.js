@@ -8,7 +8,7 @@ let strokes = [], texts = [];
 const ctx = new Proxy({}, { get: (t, k) => k === "measureText" ? () => ({ width: 100 }) : k === "strokeRect" ? () => { strokes.push(t.strokeStyle); } : k === "fillText" ? (s) => { texts.push([s, t.fillStyle]); } : k === "clearRect" ? () => { strokes = []; texts = []; } : (typeof t[k] !== "undefined" ? t[k] : () => {}), set: (t, k, v) => { t[k] = v; return true; } });
 const canvas = { getContext: () => ctx, width: 0, height: 0 }; const handlers = {};
 const document = { getElementById: id => id === "c" ? canvas : el(id) };
-new Function("document", "ad", "addEventListener", "innerWidth", "innerHeight", "setTimeout", "clearTimeout", code)(document, { on: (ch, f) => handlers[ch] = f }, () => {}, 1920, 864, () => 1, () => {});
+new Function("document", "ad", "addEventListener", "innerWidth", "innerHeight", "setTimeout", "clearTimeout", "requestAnimationFrame", "setInterval", code)(document, { on: (ch, f) => handlers[ch] = f }, () => {}, 1920, 864, () => 1, () => {}, () => {}, () => {});
 const rows = Array.from({ length: 12 }, (_, i) => ({ key: "k" + i, name: "技" + i, p: 0.6 - i * 0.01, d: 0.05 - i * 0.01, box: [100 + i * 70, 100, 60, 60] }));
 const adv = { type: "advice", side: "R", seat: 7, my_turn: true, base: 0.55, rows };
 const active = { type: "state", phase: "active", ms: 20, current: { side: "L", idx: 0 }, me: { side: "R", idx: 2 }, taken: 3, poolOk: true, board: true };

@@ -5,15 +5,18 @@
 let video = null, cv = null, ctx = null, ready = false;
 const say = (ch, m) => cap.send(ch, m);
 async function start() {
-  const stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 10, max: 15 } }, audio: false });
+  const stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 1, max: 1 } }, audio: false });
   video = document.createElement("video"); video.srcObject = stream; video.muted = true; video.playsInline = true;
   await video.play();
   if (!video.videoWidth) await new Promise(r => { video.onloadedmetadata = r; setTimeout(r, 3000); });
   cv = document.createElement("canvas"); ctx = cv.getContext("2d", { willReadFrequently: true, alpha: false });
   ready = true; say("cap-ready", { w: video.videoWidth, h: video.videoHeight });
-  if (!benched) { benched = true; setTimeout(bench, 3000); }
+  // Benchmark is opt-in; reconnecting must not perform extra full-screen readbacks.
   stream.getVideoTracks()[0].addEventListener("ended", () => { ready = false; say("cap-fail", { msg: "视频流被结束(可能是分辨率切换或权限变化)" }); });
 }
+cap.on("cap-rate", m => { const track = video && video.srcObject && video.srcObject.getVideoTracks()[0];
+  if (track) track.applyConstraints({ frameRate: m.active ? { ideal: 10, max: 15 } : { ideal: 1, max: 1 } }).catch(e => say("cap-bench", { msg: "设置流帧率失败: " + e }));
+});
 cap.on("cap-grab", m => {
   try {
     if (!ready) return say("cap-fail", { id: m.id, msg: "流未就绪" });
