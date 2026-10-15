@@ -1,0 +1,11 @@
+'use strict';
+const assert=require('assert/strict'),{checkpoint}=require('../draft_checkpoint');
+const pool={heroBoxes:[{hero:'axe',state:'N',takenStable:false}]},ref={nativePixels(){throw Error('must not clone full screenshot');}};
+const owner={a:['L',0]},known=new Set(['a']),log=[['skill','a']],prev={taken:{a:true}};
+const tracker={pool,ref,owner,known,log,prev,icoRef:new Float32Array([.2,.3]),orderSeat:()=>0};
+const undo=checkpoint(tracker);tracker.owner.a=['R',4];tracker.known.add('bad');tracker.log.push(['bad']);tracker.prev.taken.a=false;
+tracker.newPartialField={bad:true};tracker.pool.heroBoxes[0].state='T';tracker.pool.heroBoxes[0].partial=true;
+undo();assert.equal(tracker.pool,pool);assert.equal(tracker.ref,ref);assert.equal(tracker.owner,owner);assert.equal(tracker.known,known);assert.equal(tracker.log,log);assert.equal(tracker.prev,prev);
+assert.deepEqual(owner,{a:['L',0]});assert.deepEqual([...known],['a']);assert.deepEqual(log,[['skill','a']]);assert(prev.taken.a);assert(!('newPartialField' in tracker));
+assert.deepEqual(pool.heroBoxes,[{hero:'axe',state:'N',takenStable:false}]);assert(tracker.icoRef instanceof Float32Array);assert.equal(tracker.orderSeat(),0);
+console.log('PASS recovery checkpoint: confirmed object identities; nested state/set/log rollback; hero flags; partial fields; typed arrays; no reference-image clone');

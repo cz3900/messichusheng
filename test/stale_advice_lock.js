@@ -15,7 +15,7 @@ const a=current.indexOf('  fastPicks.set(k,'),b=current.indexOf('\n  pickedAtCur
 let wants=0;const c=vm.createContext({fastPicks:new Map(),k:'dark',Date,S:{me:{side:'L',idx:0},current:{side:'L',idx:0}},seatIdx:p=>(p.side==='L'?0:5)+p.idx,lastS:null,log(){},want(){wants++;}});
 assert.equal(vm.runInContext('(function(){'+current.slice(a,b)+';return false;})()',c),true);
 assert.equal(wants,1);assert.equal(c.lastS,null,'A speculative dark cell must not replace the confirmed state');
-const loopStart=current.indexOf('    for (const [k, fp] of [...fastPicks])'),loopEnd=current.indexOf('    const ultimateKeys',loopStart);
+const loopStart=current.indexOf('    for (const [k, fp] of [...fastPicks])'),loopEnd=current.indexOf('    const confirmedFull',loopStart);
 const state={me:{side:'L',idx:0},current:{side:'L',idx:0},taken_heroes:[],skills:[{key:'phantom',taken:false}]};
 const slow=vm.createContext({fastPicks:new Map([['phantom',{t:Date.now(),n:0}]]),S:state,tracker:{pool:{heroBoxes:[]}},rawNow:{phantom:'?'},Date,seatIdx:p=>(p.side==='L'?0:5)+p.idx});
 vm.runInContext(current.slice(loopStart,loopEnd),slow);assert.equal(state.skills[0].taken,false,'Unconfirmed fast evidence cannot cancel the ongoing self-turn job');

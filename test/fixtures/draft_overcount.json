@@ -1,0 +1,458 @@
+{
+  "skills": [
+    {
+      "key": "luna_lucent_beam",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "luna_moon_glaive",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "luna_lunar_orbit",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "chaos_knight_chaos_bolt",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "chaos_knight_reality_rift",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "chaos_knight_chaos_strike",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "tinker_laser",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "tinker_march_of_the_machines",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "tinker_deploy_turrets",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "invoker_deafening_blast_ad",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "invoker_cold_snap_ad",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "invoker_forge_spirit_ad",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "necrolyte_death_pulse",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "necrolyte_ghost_shroud",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "necrolyte_heartstopper_aura",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "slark_dark_pact",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "slark_pounce",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "slark_saltwater_shiv",
+      "taken": false,
+      "ultslot": false
+    },
+    {
+      "key": "riki_smoke_screen",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "riki_blink_strike",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "riki_tricks_of_the_trade",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "tusk_ice_shards",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "tusk_snowball",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "tusk_tag_team",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "shadow_shaman_ether_shock",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "shadow_shaman_voodoo",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "shadow_shaman_shackles",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "gyrocopter_rocket_barrage",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "gyrocopter_homing_missile",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "gyrocopter_flak_cannon",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "slardar_sprint",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "slardar_slithereen_crush",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "slardar_bash",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "kez_falcon_rush_ad",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "kez_talon_toss_ad",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "kez_shodo_sai_ad",
+      "taken": true,
+      "ultslot": false
+    },
+    {
+      "key": "shadow_shaman_mass_serpent_ward",
+      "taken": true,
+      "ultslot": true
+    },
+    {
+      "key": "luna_eclipse",
+      "taken": false,
+      "ultslot": true
+    },
+    {
+      "key": "gyrocopter_call_down",
+      "taken": true,
+      "ultslot": true
+    },
+    {
+      "key": "kez_raptor_dance",
+      "taken": false,
+      "ultslot": true
+    },
+    {
+      "key": "slardar_amplify_damage",
+      "taken": true,
+      "ultslot": true
+    },
+    {
+      "key": "tusk_walrus_punch",
+      "taken": false,
+      "ultslot": true
+    },
+    {
+      "key": "riki_backstab",
+      "taken": true,
+      "ultslot": true
+    },
+    {
+      "key": "tinker_rearm",
+      "taken": true,
+      "ultslot": true
+    },
+    {
+      "key": "necrolyte_reapers_scythe",
+      "taken": true,
+      "ultslot": true
+    },
+    {
+      "key": "slark_shadow_dance",
+      "taken": true,
+      "ultslot": true
+    },
+    {
+      "key": "chaos_knight_phantasm",
+      "taken": true,
+      "ultslot": true
+    },
+    {
+      "key": "storm_spirit_ball_lightning",
+      "taken": true,
+      "ultslot": true
+    }
+  ],
+  "panels": [
+    {
+      "side": "L",
+      "idx": 0,
+      "hero": "npc_dota_hero_riki",
+      "skills": [
+        {
+          "key": "luna_moon_glaive"
+        },
+        {
+          "key": "chaos_knight_phantasm"
+        },
+        {
+          "key": "chaos_knight_chaos_strike"
+        },
+        {
+          "key": "riki_tricks_of_the_trade"
+        }
+      ],
+      "filled": 4
+    },
+    {
+      "side": "L",
+      "idx": 1,
+      "hero": "npc_dota_hero_tinker",
+      "skills": [
+        {
+          "key": "tinker_rearm"
+        },
+        {
+          "key": "tusk_snowball"
+        },
+        {
+          "key": "shadow_shaman_voodoo"
+        }
+      ],
+      "filled": 3
+    },
+    {
+      "side": "L",
+      "idx": 2,
+      "hero": null,
+      "skills": [
+        {
+          "key": "shadow_shaman_shackles"
+        },
+        {
+          "key": "invoker_cold_snap_ad"
+        },
+        {
+          "key": "necrolyte_reapers_scythe"
+        },
+        {
+          "key": "shadow_shaman_ether_shock"
+        }
+      ],
+      "filled": 4
+    },
+    {
+      "side": "L",
+      "idx": 3,
+      "hero": null,
+      "skills": [
+        {
+          "key": "riki_backstab"
+        },
+        {
+          "key": "chaos_knight_chaos_bolt"
+        },
+        {
+          "key": "tusk_ice_shards"
+        },
+        {
+          "key": "tinker_laser"
+        }
+      ],
+      "filled": 4
+    },
+    {
+      "side": "L",
+      "idx": 4,
+      "hero": "npc_dota_hero_necrolyte",
+      "skills": [
+        {
+          "key": "storm_spirit_ball_lightning"
+        },
+        {
+          "key": "necrolyte_death_pulse"
+        },
+        {
+          "key": "slark_dark_pact"
+        }
+      ],
+      "filled": 3
+    },
+    {
+      "side": "R",
+      "idx": 0,
+      "hero": "npc_dota_hero_shadow_shaman",
+      "skills": [
+        {
+          "key": "invoker_forge_spirit_ad"
+        },
+        {
+          "key": "riki_smoke_screen"
+        },
+        {
+          "key": "invoker_deafening_blast_ad"
+        }
+      ],
+      "filled": 3
+    },
+    {
+      "side": "R",
+      "idx": 1,
+      "hero": "npc_dota_hero_kez",
+      "skills": [
+        {
+          "key": "slark_shadow_dance"
+        },
+        {
+          "key": "gyrocopter_homing_missile"
+        },
+        {
+          "key": "gyrocopter_rocket_barrage"
+        }
+      ],
+      "filled": 3
+    },
+    {
+      "side": "R",
+      "idx": 2,
+      "hero": "npc_dota_hero_luna",
+      "skills": [
+        {
+          "key": "gyrocopter_flak_cannon"
+        },
+        {
+          "key": "slardar_sprint"
+        },
+        {
+          "key": "luna_lucent_beam"
+        }
+      ],
+      "filled": 3
+    },
+    {
+      "side": "R",
+      "idx": 3,
+      "hero": "npc_dota_hero_gyrocopter",
+      "skills": [
+        {
+          "key": "slardar_bash"
+        },
+        {
+          "key": "kez_falcon_rush_ad"
+        },
+        {
+          "key": "luna_lunar_orbit"
+        }
+      ],
+      "filled": 3
+    },
+    {
+      "side": "R",
+      "idx": 4,
+      "hero": "npc_dota_hero_tusk",
+      "skills": [
+        {
+          "key": "necrolyte_heartstopper_aura"
+        },
+        {
+          "key": "slardar_slithereen_crush"
+        },
+        {
+          "key": "riki_blink_strike"
+        }
+      ],
+      "filled": 4
+    }
+  ],
+  "taken_heroes": [
+    "npc_dota_hero_tusk",
+    "npc_dota_hero_necrolyte",
+    "npc_dota_hero_gyrocopter",
+    "npc_dota_hero_luna",
+    "npc_dota_hero_shadow_shaman",
+    "npc_dota_hero_tinker",
+    "npc_dota_hero_kez",
+    "npc_dota_hero_riki"
+  ],
+  "extraPicks": 0,
+  "current": {
+    "side": "L",
+    "idx": 2
+  },
+  "me": {
+    "side": "R",
+    "idx": 4
+  },
+  "pool_heroes": [
+    "npc_dota_hero_luna",
+    "npc_dota_hero_chaos_knight",
+    "npc_dota_hero_tinker",
+    "npc_dota_hero_invoker",
+    "npc_dota_hero_necrolyte",
+    "npc_dota_hero_slark",
+    "npc_dota_hero_riki",
+    "npc_dota_hero_tusk",
+    "npc_dota_hero_shadow_shaman",
+    "npc_dota_hero_gyrocopter",
+    "npc_dota_hero_slardar",
+    "npc_dota_hero_kez"
+  ]
+}

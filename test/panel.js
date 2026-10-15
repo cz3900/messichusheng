@@ -34,9 +34,12 @@ timers.splice(0).forEach(f => f && f());
 check("合并后发出的 look 是规范化过的(新色 + 原有 midN 6)", sent.length === 1 && sent[0][0] === "look" && sent[0][1].c1 === "#00ff00" && sent[0][1].midN === 6 && sent[0][1].thick === 0.7);
 sent.length = 0; $("k-reset").onclick();
 check("恢复默认: 发默认配色, 控件回默认", sent[0][1].c1 === "#ff4d4f" && sent[0][1].midN === 8 && $("k-c1").value === "#ff4d4f");
-$("b-reset").onclick(); $("b-snap").onclick(); $("b-logs").onclick(); $("b-upload").onclick(); $("b-quit").onclick();
-check("按钮 → act", acts.join() === "reset,snap,logs,upload,quit");
+$("b-recover").onclick(); $("b-auto-end").onclick(); $("b-reset").onclick(); $("b-snap").onclick(); $("b-logs").onclick(); $("b-upload").onclick(); $("b-quit").onclick();
+check("按钮 → act", acts.join() === "recover,auto-end,reset,snap,logs,upload,quit");
+onPanel({ ...st, manualRecovery:true, recoveryNotice:"原池复核中" });
+check("人工恢复状态和自动判断入口", !$("b-auto-end").disabled && $("recovery-note").textContent === "原池复核中");
 onPanel({ version: "1.23.0", look: null, hotkey: null });
+check("普通状态不提供释放人工恢复", $("b-auto-end").disabled);
 check("残缺状态(look/hotkey 为空)不炸", $("k-c1").value === "#ff4d4f");
 /* v1.32 更新区 */
 acts.length = 0;

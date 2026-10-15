@@ -4,9 +4,9 @@ function create() {
   let state = null, advice = null, computing = null;
   return {
     accept(ch, m) {
-      if (ch === "state") { state = m; if (m.idle || m.phase !== "active") { advice = null; computing = null; } }
-      if (ch === "advice") { advice = m; computing = null; }
-      if (ch === "computing") computing = m;
+      if (ch === "state") { state = m; if (m.idle || m.phase !== "active" || m.advicePaused) { advice = null; computing = null; } }
+      if (ch === "advice" && !state?.advicePaused) { advice = m; computing = null; }
+      if (ch === "computing" && !state?.advicePaused) computing = m;
       if (ch === "clear") { advice = null; computing = null; }
     },
     replay(send) {

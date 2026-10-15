@@ -32,10 +32,9 @@ m.cfg.hidden=true;m.visibilityNoticeUntil=Date.now()+2000;vm.runInContext('setVi
 m.visibilityNoticeUntil=0;vm.runInContext('setVisible(false)',m);assert(!visible&&throttled);
 console.log('✓ 空闲、手动隐藏、游戏退出均隐藏覆盖窗，选技恢复显示');
 // Completion needs ten unique heroes and forty unique known skills with one ultimate per seat.
-const completion=worker.slice(worker.indexOf('    const ultimateKeys ='),worker.indexOf('    completedFrames = confirmedFull'));
-const panels=Array.from({length:10},(_,i)=>({hero:'hero'+i,skills:Array.from({length:4},(_,j)=>({key:`s${i*4+j}`}))}));
+const panels=Array.from({length:10},(_,i)=>({side:i<5?'L':'R',idx:i%5,hero:'hero'+i,skills:Array.from({length:4},(_,j)=>({key:`s${i*4+j}`}))}));
 const skills=Array.from({length:40},(_,i)=>({key:'s'+i,ultslot:i%4===3}));
-const complete=S=>vm.runInNewContext(completion+'\nconfirmedFull',{S});
+const complete=require('../draft_lifecycle').fullRoster;
 assert(complete({panels,skills}));assert(!complete({panels:panels.slice(1),skills}));
 const bad=structuredClone(panels);bad[0].skills[0].key='?pick';assert(!complete({panels:bad,skills}));
 const dup=structuredClone(panels);dup[1].hero=dup[0].hero;assert(!complete({panels:dup,skills}));
@@ -45,14 +44,14 @@ function wake(completed,oldSig,newSig,evidence=true,lockOK=true){
  let locks=0;
  const c=vm.createContext({phase:'idle',forceReset:false,tracker:{boxesNow:[],lastBoardSig:oldSig},draftComplete:completed,
   R:{boardSig:()=>newSig,sigDiff:(a,b)=>Math.max(...a.map((x,i)=>Math.abs(x-b[i]))),draftBoardEvidence:()=>evidence},
-  img:{},pres:{},retryAt:0,presentRun:2,lastNd:0,lastQuick:null,pendingNext:false,
-  Date,parentPort:{postMessage(){}},log(){},trStop(){},want(){},tryLock(){locks++;if(lockOK){c.phase='active';c.draftComplete=false;}}});
+  img:{},pres:{},scene:{stage:'drafting'},lifecycle:{review(){}},holdDraft(){c.phase='active';},retryAt:0,presentRun:2,lastNd:0,lastQuick:null,pendingNext:false,
+  Date,parentPort:{postMessage(){}},log(){},trStop(){},want(){},tryLock(){locks++;if(lockOK){c.phase='active';c.draftComplete=false;}return lockOK;}});
  vm.runInContext('(function(){'+idleBranch+'})()',c);return {phase:c.phase,locks};
 }
-assert.deepEqual(wake(true,Array(60).fill(10),Array(60).fill(10)),{phase:'idle',locks:0});
+assert.deepEqual(wake(true,Array(60).fill(10),Array(60).fill(10)),{phase:'active',locks:1});
 assert.deepEqual(wake(true,Array(60).fill(10),Array(60).fill(100)),{phase:'active',locks:1});
 assert.deepEqual(wake(false,Array(60).fill(100),Array(60).fill(20)),{phase:'active',locks:0});
 assert.deepEqual(wake(true,Array(60).fill(100),Array(60).fill(20)),{phase:'active',locks:1});
 assert.deepEqual(wake(true,Array(60).fill(10),Array(60).fill(100),false),{phase:'idle',locks:0});
-assert.deepEqual(wake(true,Array(60).fill(10),Array(60).fill(100),true,false),{phase:'idle',locks:1});
-console.log('✓ 结束后菜单不重锁；新棋盘才探测；失败保持结束态；未结束的遮挡恢复保留原局');
+assert.deepEqual(wake(true,Array(60).fill(10),Array(60).fill(100),true,false),{phase:'active',locks:1});
+console.log('✓ 选技提示和棋盘证据一起允许探测；重锁失败保留原池复核；遮挡恢复沿用原局');
