@@ -102,13 +102,14 @@ function buildEngineInner(win) {
   const TPAIR = new Map(), TTRIPLE = new Map();
   const trioPairKey = (a, b) => a < b ? a * M.n + b : b * M.n + a;
   const trioKey = (a, b, c) => { if (a > b) [a, b] = [b, a]; if (b > c) [b, c] = [c, b]; if (a > b) [a, b] = [b, a]; return (a * M.n + b) * M.n + c; };
+  if (win.AD_TRIO) for (const row of win.AD_TRIO.pairs || []) TPAIR.set(trioPairKey(at(row[0]), at(row[1])), row[2]);
   if (win.AD_TRIO) for (const row of win.AD_TRIO.trios) {
     const a = at(row[0]), b = at(row[1]), c = at(row[2]);
     if (a < 0 || b < 0 || c < 0) throw new Error("三件修正表的技能不在模型里");
-    TPAIR.set(trioPairKey(a, b), row[3]); TTRIPLE.set(trioKey(a, b, c), row[4]);
+    if (!win.AD_TRIO.pairs) TPAIR.set(trioPairKey(a, b), row[3]); TTRIPLE.set(trioKey(a, b, c), row[4]);
   }
   const trioDelta = (p, si) => {
-    if (!TPAIR.size) return 0;
+    if (!TPAIR.size && !TTRIPLE.size) return 0;
     let v = 0;
     for (let q = 0; q < si.length; q++) {
       v += TPAIR.get(trioPairKey(p, si[q])) || 0;
@@ -137,7 +138,7 @@ function buildEngineInner(win) {
   /* sax_p/ASD 预先除好,省得每次除 */
   const SAXn = SAX ? new Float32Array(SAX.length) : null;
   if (SAX) for (let p = 0; p < M.n; p++) for (let k = 0; k < NAX; k++) SAXn[p * NAX + k] = SAX[p * NAX + k] / ASD[k];
-  return { K, KS, W, E, FW, KNOT, TH, AV, SAXn, AMU, ASD, NAX, CP, cpair, sqd, condBack, trioDelta, seg, at, n: M.n,
+  return { ALCH: win.AD_TRIO && win.AD_TRIO.alchemist, K, KS, W, E, FW, KNOT, TH, AV, SAXn, AMU, ASD, NAX, CP, cpair, sqd, condBack, trioDelta, seg, at, n: M.n,
            EN, TQAX, TQMUAX, TQHMU, TQHSD, TQG, PA, RG: RGV, MEANFW, SB, SD, SC, SCE, SCS };
 }
 
@@ -152,11 +153,14 @@ function rebuildSim(s, seat, addP, drop) {
   for (let q = 0; q < 10; q++) for (const p of s.seatItems[q]) if (!(q === seat && drop.includes(p))) seq.push([q, p]);
   if (addP >= 0) seq.push([seat, addP]);
   const items = seq.map(x => ({ p: x[1], kind: 0 })), order = seq.map(x => x[0]);
-  const r = makeSim(G, items, order);
+  const r = makeSim({ ...G, ALCH: null }, items, order);
   for (let j = 0; j < seq.length; j++) { r.z += deltaOf(r, j); seedItem(r, order[j], items[j].p); r.step++; }
+  r.G = G; r.rawSeatItems = s.rawSeatItems.map(x => x.slice());
+  if (addP >= 0) r.rawSeatItems[seat].push(addP);
+  r.z += alchTotal(r);
   return r;
 }
-function adoptSim(s, r) { for (const k of ["SA", "seatItems", "gold", "A", "uu", "z", "U", "Usq", "ac8", "tq8", "TC", "sumB", "sumD", "sumC"]) s[k] = r[k]; }
+function adoptSim(s, r) { for (const k of ["SA", "seatItems", "rawSeatItems", "gold", "A", "uu", "z", "U", "Usq", "ac8", "tq8", "TC", "sumB", "sumD", "sumC"]) s[k] = r[k]; }
 
 /* ---- 模拟状态 ---- */
 function makeSim(G, items, order) {
@@ -165,6 +169,7 @@ function makeSim(G, items, order) {
     G, items, order, step: 0, nItems: items.length,
     taken: new Uint8Array(items.length),
     SA: new Float64Array(NS * K),          // 每座位的 Σe
+    rawSeatItems: Array.from({ length: NS }, () => []),
     seatItems: Array.from({ length: NS }, () => []),   // 权重表下标
     slot: new Int8Array(NS * 3),
     gold: new Float64Array(2),
@@ -186,7 +191,7 @@ function makeSim(G, items, order) {
 const CAP = [1, 3, 1];
 function cloneSim(s) {
   return { G: s.G, items: s.items, order: s.order, step: s.step, nItems: s.nItems,
-    taken: s.taken.slice(), SA: s.SA.slice(), seatItems: s.seatItems.map(x => x.slice()),
+    rawSeatItems: s.rawSeatItems.map(x => x.slice()), taken: s.taken.slice(), SA: s.SA.slice(), seatItems: s.seatItems.map(x => x.slice()),
     slot: s.slot.slice(), gold: s.gold.slice(), A: s.A.slice(), uu: s.uu.slice(), z: s.z,
     U: s.U && s.U.slice(), Usq: s.Usq && s.Usq.slice(), ac8: s.ac8 && s.ac8.slice(),
     tq8: s.tq8 && s.tq8.slice(), TC: s.TC && s.TC.slice(), sumB: s.sumB && s.sumB.slice(), sumD: s.sumD && s.sumD.slice(), sumC: s.sumC && s.sumC.slice() };
@@ -263,11 +268,29 @@ const _DP = new Float64Array(32), _POP = Uint8Array.from({ length: 32 }, (_, m) 
 const _sh = new Float64Array(5), _sbvRaw = new Float64Array(5), _V = new Float64Array(25), _VE = new Float64Array(5), _KC = new Float64Array(50), _W = new Float64Array(5);
 function scBin(G, sh) { const E = G.SCE; let b = 0; while (b < 9 && sh >= E[b + 1]) b++; return b; }
 /* 往当前行动座位放候选 i 的 Δlogit(左方为正)。不改状态。 */
+function alchTotal(s, addSeat = -1, addP = -1) {
+  const a = s.G.ALCH; if (!a) return 0;
+  let total = 0;
+  for (let i = 0; i < 10; i++) {
+    if (!s.rawSeatItems[i].includes(a.index) && !(i === addSeat && addP === a.index)) continue;
+    let count = 0, people = 0, ready = true;
+    for (let j = Math.floor(i / 5) * 5; j < Math.floor(i / 5) * 5 + 5; j++) if (j !== i) {
+      const row = s.rawSeatItems[j], extra = j === addSeat && addP >= 0;
+      if (row.length + (extra ? 1 : 0) !== 5) { ready = false; break; }
+      let sc = extra ? a.eligible[addP] || 0 : 0;
+      for (const p of row) sc += a.eligible[p] || 0;
+      count += sc; if (sc > 0) people++;
+    }
+    if (ready) total += (i < 5 ? 1 : -1) * a.bias[Math.min(16, count)][people];
+  }
+  return total;
+}
+function alchDelta(s, seat, p) { return s.G.ALCH ? alchTotal(s, seat, p) - alchTotal(s) : 0; }
 function deltaOf(s, i) {
   const G = s.G, p = s.items[i].p;
   const seat = s.order[s.step], t = seat < 5 ? 0 : 1, g = t === 0 ? 1 : -1;
   if (p < 0) return 0;
-  if (G.DEAD) { const si0 = s.seatItems[seat]; if (deadIn(G, si0, p)) return 0; const kl = killsIn(G, si0, p); if (kl) return rebuildSim(s, seat, p, kl).z - s.z; }
+  if (G.DEAD) { const si0 = s.seatItems[seat]; if (deadIn(G, si0, p)) return alchDelta(s, seat, p); const kl = killsIn(G, si0, p); if (kl) return rebuildSim(s, seat, p, kl).z - s.z; }
   const K = G.K, KS = G.KS, E = G.E, o = p * K, base = seat * K;
   let d = G.W[p];
   for (let k = 0; k < KS; k++) d += s.SA[base + k] * E[o + k];
@@ -276,7 +299,7 @@ function deltaOf(s, i) {
   for (let q = 0; q < si.length; q++) d += G.cpair(p, si[q]) + G.sqd(p, si[q], si);
   d += G.condBack(p, si);
   d += G.trioDelta(p, si);
-  let z = g * d;
+  let z = g * d + alchDelta(s, seat, p);
   if (G.FW) z += G.seg(s.gold[t] + G.FW[p]) * (t === 0 ? 1 : -1) - G.seg(s.gold[t]) * (t === 0 ? 1 : -1);
   if (G.AV) { const NAX = G.NAX, ao = p * NAX, ub = (1 - t) * NAX, ab = (1 - t) * NAX;
     let mine = 0, theirs = 0;
@@ -290,6 +313,7 @@ function deltaOf(s, i) {
    simFrom 之类"从既有局面重建"的场景用它,免得漏掉 tq 那几个累加量。 */
 function seedItem(s, seat, p) {
   const G = s.G; if (p < 0) return;
+  s.rawSeatItems[seat].push(p);
   if (G.DEAD && deadIn(G, s.seatItems[seat], p)) return;          // 死件不进任何累加量(槽位由调用方记)
   const K = G.K, o = p * K, base = seat * K, t = seat < 5 ? 0 : 1;
   for (let k = 0; k < K; k++) s.SA[base + k] += G.E[o + k];
@@ -317,7 +341,7 @@ function applySim(s, i) {
   const p = s.items[i].p, seat = s.order[s.step];
   if (s.G.DEAD && p >= 0) {
     const si0 = s.seatItems[seat], kl = deadIn(s.G, si0, p) ? [] : killsIn(s.G, si0, p);
-    if (kl) { if (kl.length) adoptSim(s, rebuildSim(s, seat, p, kl)); s.taken[i] = 1; s.slot[seat * 3 + s.items[i].kind]++; s.step++; return; }
+    if (kl) { if (kl.length) adoptSim(s, rebuildSim(s, seat, p, kl)); else { s.z += alchDelta(s, seat, p); s.rawSeatItems[seat].push(p); } s.taken[i] = 1; s.slot[seat * 3 + s.items[i].kind]++; s.step++; return; }
   }
   s.z += deltaOf(s, i);
   s.taken[i] = 1; s.slot[seat * 3 + s.items[i].kind]++;
@@ -394,8 +418,9 @@ function deltaParts(s, i, out) {
     for (let k = 0; k < NAX; k++) { mine += G.AV[ao + k] * s.uu[ub + k]; theirs += s.A[ub + k] * G.SAXn[ao + k]; }
     out[4] = t === 0 ? (mine - theirs) : (theirs - mine); }
   if (G.TQG) out[5] = tqDelta(s, p, seat, null);
+  out[3] += alchDelta(s, seat, p);
   if (G.DEAD) { const si0 = s.seatItems[seat];
-    if (deadIn(G, si0, p)) out.fill(0);
+    if (deadIn(G, si0, p)) { out.fill(0); out[3] = alchDelta(s, seat, p); }
     else if (killsIn(G, si0, p)) { const tot = deltaOf(s, i); let sm = 0; for (let q = 0; q < 6; q++) sm += out[q]; out[2] += tot - sm; } }
   return out;
 }

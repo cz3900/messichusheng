@@ -129,9 +129,10 @@ window.ADScore = (function () {
     if (M.pfq) { var pb = atob(M.pfq), pn = pb.length, pbuf = new Uint8Array(pn); for (var q6 = 0; q6 < pn; q6++) pbuf[q6] = pb.charCodeAt(q6); PF = new Int16Array(pbuf.buffer); PFS = M.pfs || 1e-4; }
     if (window.AD_TRIO && window.AD_TRIO.trios) {
       TRP = new Map(); TRT = new Map();
+      (window.AD_TRIO.pairs || []).forEach(function (r) { TRP.set(trioPairKey(idx[r[0]], idx[r[1]]), r[2]); });
       window.AD_TRIO.trios.forEach(function (r) { var a = idx[r[0]], b = idx[r[1]], c = idx[r[2]];
         if (a === undefined || b === undefined || c === undefined) throw new Error('三件修正表的技能不在模型里');
-        TRP.set(trioPairKey(a, b), r[3]); TRT.set(trioKey(a, b, c), r[4]); });
+        if (!window.AD_TRIO.pairs) TRP.set(trioPairKey(a, b), r[3]); TRT.set(trioKey(a, b, c), r[4]); });
     }
     if (window.AD_MOE) {
       var AM = window.AD_MOE, mk = AM.K, mT = b64f32(AM.T), mD = b64f32(AM.DW), mE = new Float64Array(M.n * K);
@@ -316,6 +317,7 @@ window.ADScore = (function () {
   /* seats: 10 × 5 的 key 数组。返回 {logit, prob, seatScore[10], teamScore[2]} */
   function evaluate(seats) {
     if (!init()) return null;
+    var rawSeats = seats;
     seats = deadFilter(seats);
     var S = [], t, k, i;
     for (i = 0; i < 10; i++) S.push(seatOf(seats[i] || []));
@@ -429,6 +431,21 @@ window.ADScore = (function () {
       }
       tq = tqL - tqR; z += tq;
       teamScore[0] += tqL; teamScore[1] += tqR;
+    }
+    // Alchemist depends on the four teammates' actual occupied slots.
+    var al = window.AD_TRIO && window.AD_TRIO.alchemist;
+    if (al) for (i = 0; i < 10; i++) {
+      if (!(rawSeats[i] || []).some(function (key) { return idx[key] === al.index; })) continue;
+      var count = 0, people = 0, ready = true;
+      for (var j = Math.floor(i / 5) * 5; j < Math.floor(i / 5) * 5 + 5; j++) if (j !== i) {
+        var raw = (rawSeats[j] || []).filter(function (key) { return idx[key] !== undefined; });
+        if (raw.length !== 5) ready = false;
+        var sc = raw.reduce(function (v, key) { return v + (al.eligible[idx[key]] || 0); }, 0);
+        count += sc; if (sc > 0) people++;
+      }
+      var bias = ready ? al.bias[Math.min(16, count)][people] : 0;
+      seatScore[i].alchemist = bias; seatScore[i].cross += bias; seatScore[i].total += bias;
+      teamScore[i < 5 ? 0 : 1] += bias; z += (i < 5 ? 1 : -1) * bias;
     }
     return { logit: z, prob: 1 / (1 + Math.exp(-z)), seats: seatScore, team: teamScore,
              comp: comp, ctr: ctr, compL: compL, compR: compR, ctrL: ctrL, ctrR: ctrR,

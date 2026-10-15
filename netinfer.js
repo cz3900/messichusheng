@@ -35,7 +35,7 @@ function create(prefix) {
   const nfeat = T["feat"].shape[1], KIDX = new Int8Array(60); for (let i = 0; i < 60; i++) KIDX[i] = i < 12 ? 0 : i < 48 ? 1 : 2;
   const h = new Float32Array(S * d), a = new Float32Array(S * d), qkv = new Float32Array(S * 3 * d), att = new Float32Array(S * d),
         ao = new Float32Array(S * d), f1 = new Float32Array(S * 4 * d), f2 = new Float32Array(S * d), sc = new Float32Array(S), tmp = new Float32Array(d);
-  function forward(ids, code, dl, legal, t, seat, slot) {
+  function forward(ids, code, dl, legal, t, seat, slot, ext) {
     const E = (name, i) => T[name].a.subarray(i * d, i * d + d);
     // 局面 token
     linear(T["slot.weight"].a, T["slot.bias"].a, Float32Array.from(slot), 1, 3, d, tmp);
@@ -45,9 +45,10 @@ function create(prefix) {
     const featA = T["feat"].a, fw = T["fin.weight"].a, fb = T["fin.bias"].a, dxw = T["dx.weight"].a, dxb = T["dx.bias"].a;
     for (let i = 0; i < 60; i++) {
       const o = (i + 1) * d, id = ids[i], fo = id * nfeat, ie = E("idemb.weight", id), ow = E("own.weight", code[i]), kd = E("kind.weight", KIDX[i]);
-      const x0 = dl[i] * 4, x1 = legal[i] ? 1 : 0;
+      const x0 = dl[i] * 4, x1 = legal[i] ? 1 : 0, ndx = T["dx.weight"].shape[1];
+      if (ndx === 5 && (!ext || ext.length !== 180)) throw new Error("新网络缺少组合特征 ext");
       for (let r = 0; r < d; r++) { let s = fb[r]; const wo = r * nfeat; for (let c = 0; c < nfeat; c++) s += fw[wo + c] * featA[fo + c];
-        h[o + r] = s + ie[r] + ow[r] + kd[r] + dxw[r * 2] * x0 + dxw[r * 2 + 1] * x1 + dxb[r]; }
+        h[o + r] = s + ie[r] + ow[r] + kd[r] + dxw[r * ndx] * x0 + dxw[r * ndx + 1] * x1 + dxb[r] + (ndx === 5 ? 4 * (dxw[r * ndx + 2] * ext[i * 3] + dxw[r * ndx + 3] * ext[i * 3 + 1] + dxw[r * ndx + 4] * ext[i * 3 + 2]) : 0); }
     }
     for (let l = 0; l < L; l++) {
       const p = `tf.layers.${l}.`;
@@ -70,7 +71,7 @@ function create(prefix) {
     }
     layerNorm(T["ln.weight"].a, T["ln.bias"].a, h, S, d, a);
     const logits = new Float64Array(60), pw = T["pi.weight"].a, pb = T["pi.bias"].a[0];
-    for (let i = 0; i < 60; i++) { if (!legal[i]) { logits[i] = -Infinity; continue; } let s = pb; const o = (i + 1) * d; for (let k = 0; k < d; k++) s += pw[k] * a[o + k]; logits[i] = s; }
+    for (let i = 0; i < 60; i++) { if (!legal[i]) { logits[i] = -Infinity; continue; } let s = pb; const o = (i + 1) * d; for (let k = 0; k < d; k++) s += pw[k] * a[o + k]; logits[i] = s + (T.beta_d ? T.beta_d.a[0] * dl[i] : 0); }
     const v0 = new Float32Array(d); linear(T["v.0.weight"].a, T["v.0.bias"].a, a.subarray(0, d), 1, d, d, v0);
     let v = T["v.2.bias"].a[0]; for (let k = 0; k < d; k++) v += T["v.2.weight"].a[k] * gelu(v0[k]);
     return { logits, v };

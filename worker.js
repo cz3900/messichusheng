@@ -241,8 +241,10 @@ const REFINE_K = 6, REFINE_M = +process.env.REFINE_M || 512;   // 决赛加时:�
 const ARRIVE_N = 200, ARRIVE_T = +process.env.AI_T || 0.05;
 /* v1.28「网络档」: 自博弈训练出的选技网络(第 550 轮, 对现役 AI 模型口径胜率约 52%)。
    排序改用网络的出手概率;格子上的胜率数字仍是原推演算的(网络自己的估值不准, 不显示)。设置面板「AI 档位」切换, 默认现役。 */
-let NETM = null; const NETNAME = "netB300";   /* 网络档/预估(CPU netinfer)仍用 netB300 */
-const COMBO_NET = "netS300";   /* v1.45 份额裁判下自博弈重训 320 轮(runS, 热启动自 runD): 新裁判判 对 runD 51.8%/整局 56.6%; 阵容 ≥4 陡 3.2→1.7%; 之前 v1.42 起用 netC_pf100 */ const COMBO_NET_OLD = "netC_pf100"; const COMBO_NET_TEAM = "netS300";   /* v1.47: 团队裁判下续训的 netT300 过门失败(团队裁判下对 runS 49.44%, z−0.024±0.007), 团队模式继续用 netS300, 只换推演打分口径 */   /* v1.42 GPU 版推演网络换成新打分(逐对修正)下续训 100 轮的 netC_pf100(新打分判 对 netC300 真实池 +0.021z); v1.40 起用 netC300 */ const DEP_NET = Math.exp(-4);
+let NETM = null; let NETPAIR = null; const NETNAME = "netS_f21_60";
+// v1.49: CPU 网络档和各推演档统一使用 f21 裁判下通过验证的 60 轮网络。
+const COMBO_NET = NETNAME, COMBO_NET_TEAM = NETNAME, COMBO_NET_OLD = "netC_pf100";
+const DEP_NET = Math.exp(-4);
 function netModel() { if (NETM === null) { try { NETM = require(path.join(D, "..", "netinfer.js")).create(path.join(D, NETNAME)); log("engine", "网络档模型已载入(" + NETNAME + ")"); }
   catch (e) { NETM = false; log("error", "网络档模型载入失败, 退回现役排序: " + String(e && e.message || e)); } } return NETM || null; }
 function netProbs(st, cur, t) {
@@ -270,7 +272,15 @@ function netProbs(st, cur, t) {
   const blocked = new Array(60).fill(false); if (F.depBlocked) for (let i = 0; i < 60; i++) if (legal[i]) blocked[i] = F.depBlocked(sim, i);
   sim.order = saveOrder; sim.step = saveStep;
   const slot = [sim.slot[cur * 3], sim.slot[cur * 3 + 1], sim.slot[cur * 3 + 2]];
-  const r = M.forward(ids, code, dl, legal, Math.max(0, Math.min(49, t)), cur, slot);
+  if (!NETPAIR) {
+    const pairBuf = require("fs").readFileSync(path.join(D, "pairP.bin"));
+    NETPAIR = new Float32Array(pairBuf.buffer.slice(pairBuf.byteOffset, pairBuf.byteOffset + pairBuf.byteLength));
+  }
+  const C = require(path.join(D, "..", "combo_local.js"));
+  C._setPair(NETPAIR, 640);
+  const extBuf = { legal, ext: new Float32Array(180) };
+  C.extFill(sim, seatOf.map((o, i) => o < 0 && sim.taken[i] ? (mySide ? 5 + cur % 5 : cur % 5) : o), cur, extBuf, 0);
+  const r = M.forward(ids, code, dl, legal, Math.max(0, Math.min(49, t)), cur, slot, extBuf.ext);
   let mx = -Infinity; for (const x of r.logits) if (x > mx) mx = x;
   let Z = 0; const ex = r.logits.map((x, i) => x === -Infinity ? 0 : Math.exp(x - mx) * (blocked[i] ? DEP_NET : 1)); for (const x of ex) Z += x;
   const out = {}; items.forEach((it, i) => { if (legal[i]) out[it.key] = ex[i] / Z; }); return out;

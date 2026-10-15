@@ -1,0 +1,22 @@
+{
+  "version": "1.49.0",
+  "judge_id": "f21_alch2d_20261015",
+  "checkpoint_sha256": "870c78e4a63f0034fb3de6de9e2203f34ff8e4acfa7f0d5ab3fcf773889f3fd5",
+  "iterations": 60,
+  "training_drafts": 30720,
+  "evaluation": {
+    "heldout_pools": 4096,
+    "side_swapped": true,
+    "argmax_judge_probability": 0.502373,
+    "sampling_judge_probability": 0.502107,
+    "meaning": "Model-judged outcome; not observed Dota win rate."
+  },
+  "artifacts": {
+    "data/netS_f21_60.bin": "e963d303a37275e1e434e537cdca989aac82f02496f00cda508b04b9ea3a5100",
+    "data/netS_f21_60.json": "f4d74cc33841396a2213bcfb695c3be0fa7b523253a585dc03f1e85e06f481ed",
+    "data/netS_f21_60.onnx": "ecde4115570ab6a284b1952b4b38fdd62cf42f8b5b44aeaeda50ad27efce74e7",
+    "data/pairP.bin": "54cdba28a4b8b14e1084f77e96d2d3636a36ef5f3e74e3305c0b5f0073356458",
+    "engine/public/ad_model.js": "b0d65afe8f5d825ad0b6b64482855e109a07616028813641fe0ea72ae909e6fa",
+    "engine/public/ad_trio.js": "9a184003a857876f3deb07043d66f7fc05f75e0820326b9b7259e5ea41bba8bc"
+  }
+}

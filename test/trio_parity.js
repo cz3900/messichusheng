@@ -8,11 +8,12 @@ const bare = {}, atob = s => Buffer.from(s, "base64").toString("binary");
 for (const f of ["ad_data.js", "ad_model.js", "ad_score.js"])
   new Function("window", "atob", fs.readFileSync(path.join(pub, f), "utf8"))(bare, atob);
 assert(win.ADScore.ready() && bare.ADScore.ready());
-assert(win.AD_TRIO.trios.length === 98);
+assert(win.AD_TRIO.judge_id === "f21_alch2d_20261015");
 const pairMap = new Map(), tripleMap = new Map();
 const sortedKey = xs => xs.slice().sort().join('|');
+for (const [a,b,v] of win.AD_TRIO.pairs || []) pairMap.set(sortedKey([a,b]),v);
 for (const [a,b,c,pair,triple] of win.AD_TRIO.trios) {
-  pairMap.set(sortedKey([a,b]), pair);
+  if (!win.AD_TRIO.pairs) pairMap.set(sortedKey([a,b]), pair);
   tripleMap.set(sortedKey([a,b,c]), triple);
 }
 const correctionOf = ks => {
