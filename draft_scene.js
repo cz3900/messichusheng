@@ -5,7 +5,7 @@ const data = require("./data/draft_scene.json");
 const templates = data.templates.map(t => {
   const bytes = Buffer.from(t.pixels, "base64"), samples = [];
   for (let y = 0; y < t.box[3]; y += 2) for (let x = 0; x < t.box[2]; x += 2)
-    samples.push([x, y, Math.max(0, bytes[y * t.box[2] + x] - 100)]);
+    samples.push([x, y, bytes[y * t.box[2] + x]]);
   const mean = samples.reduce((n, s) => n + s[2], 0) / samples.length;
   let norm = 0; for (const s of samples) { s[2] -= mean; norm += s[2] * s[2]; }
   return { ...t, samples, norm };
@@ -70,7 +70,9 @@ function detect(img) {
   if (img.w < 960 || img.h < 540) return { stage: "unknown" };
   const read = reader(img), scores = { drafting: 0, strategy: 0 }, header = new Uint8Array(640 * 72);
   for (let y = 40; y < 112; y++) for (let x = 320; x < 960; x++)
-    header[(y - 40) * 640 + x - 320] = Math.max(0, Math.max(...read(x, y)) - 100);
+    // Correlation subtracts the local mean and divides by contrast. A fixed
+    // brightness cutoff destroys that invariance by clipping dim glyph strokes.
+    header[(y - 40) * 640 + x - 320] = Math.max(...read(x, y));
   for (const t of templates) scores[t.stage] = Math.max(scores[t.stage], textScore(header, t));
   if (scores.drafting >= 0.70) return { stage: "drafting", scores };
   if (scores.strategy >= 0.78) return { stage: "strategy", scores };
