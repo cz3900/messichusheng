@@ -1,0 +1,25 @@
+'use strict';
+const assert=require('assert/strict'),{DraftLifecycle,fullRoster}=require('../draft_lifecycle');
+const R=require('./_env').init(),bad=require('./fixtures/draft_overcount.json');
+assert.equal(R.pickedCount(bad),52);assert(!fullRoster(bad));
+const life=new DraftLifecycle();
+life.observeScene({stage:'drafting'},0,1);
+assert.equal(life.observeState(bad,52,0),'review');assert(life.advicePaused);
+const recovered=structuredClone(bad);recovered.skills.forEach(s=>{if(!bad.panels.some(p=>p.skills.some(x=>x.key===s.key)))s.taken=false;});
+assert.equal(life.observeState(recovered,41,100),'review');assert.equal(life.observeState(recovered,41,1000),'drafting');
+const skills=Array.from({length:40},(_,i)=>({key:'s'+i,ultslot:i%4===3}));
+const panels=Array.from({length:10},(_,i)=>({side:i<5?'L':'R',idx:i%5,hero:'h'+i,skills:skills.slice(i*4,i*4+4).map(x=>({key:x.key}))}));const full={skills,panels};
+assert(fullRoster(full));
+for(let t=0;t<=3000;t+=1000){life.observeScene({stage:'drafting'},t,t+10);assert.equal(life.observeState(full,50,t),'drafting','choice UI vetoes a falsely complete roster');}
+life.observeScene({stage:'unknown'},4000,20);for(const t of [4000,4500,5600])life.observeState(full,50,t);
+assert.equal(life.mode,'full');assert(life.advicePaused);
+life.observeScene({stage:'strategy'},6000,21);assert.equal(life.mode,'full');
+life.observeScene({stage:'strategy'},7000,21);assert.equal(life.mode,'full','same captured frame cannot confirm a stage');
+life.observeScene({stage:'strategy'},7100,22);assert.equal(life.mode,'strategy');
+life.observeScene({stage:'unknown'},8000,23);assert.equal(life.mode,'strategy','covered stage text cannot restart computation');
+for(const [t,id] of [[9000,24],[9500,25],[10600,26]])life.observeScene({stage:'game'},t,id);
+assert.equal(life.mode,'away');life.observeScene({stage:'drafting'},11000,27);assert.equal(life.mode,'drafting');
+const incomplete=structuredClone(full);incomplete.panels[0].skills[0].key='?pick';assert(!fullRoster(incomplete));
+const duplicate=structuredClone(full);duplicate.panels[1].hero=duplicate.panels[0].hero;assert(!fullRoster(duplicate));
+const sameSeat=structuredClone(full);sameSeat.panels[1].idx=0;assert(!fullRoster(sameSeat));
+console.log('PASS: real 52-count review/recovery; choice veto; timed roster/strategy/game confirmation; duplicate-frame rejection');

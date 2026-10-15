@@ -21,4 +21,9 @@ fail=true;handlers.state(state);intervals[0]();assert.match(reports.at(-1).error
 assert.equal(reports.at(-1).hasAdvice,true);assert.equal(reports.at(-1).stamp,42);
 fail=false;intervals[0]();assert.equal(reports.at(-1).error,null);assert(texts.some(t=>t.includes("回光返照")),"periodic repaint recovers without a new recommendation");
 handlers.clear();intervals[0]();assert.equal(reports.at(-1).hasAdvice,false);
+const hold={...state,advicePaused:true,notice:'画面复核中',playerScores:[{box:[0,100,120,176],total:7,skillCount:3,heroKnown:true}]};
+handlers.state(hold);handlers.advice(advice);handlers.computing({});intervals[0]();
+assert.equal(reports.at(-1).hasAdvice,false);assert(texts.includes('画面复核中'));assert(texts.includes('组合明细'));
+cache.accept('state',hold);cache.accept('advice',advice);cache.accept('computing',{});replay();
+assert.deepEqual(events.map(x=>x[0]),['state'],'review and strategy reload retain scores without stale advice');
 console.log("PASS: reload replay, clear/idle invalidation, canvas error diagnostics and repaint recovery");

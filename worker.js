@@ -8,6 +8,8 @@
    开局自动:棋盘出现 → 读池子 → 12 英雄齐就锁定, 不需要按键。中途加入/误按 F10 也能重锁(黑格用库亮度回退)。 */
 const { parentPort } = require("worker_threads"); const fs = require("fs"), path = require("path");
 const AIModes = require("./ai_modes.js");
+const DraftState = require("./draft_lifecycle.js"), DraftScene = require("./draft_scene.js");
+const { createHash } = require("crypto");
 const R = require("./recog.js"); const D = path.join(__dirname, "data");
 const TR = require("./trace.js");   // 观测轨迹:把每帧**看到了什么**写下来, 真机对局才能离线回放
 const V2 = require("./v2.js");      // 2.0 状态估计(证据累加 + 带容量指派), 由内核开关决定用不用
@@ -74,6 +76,8 @@ function buildState(S, startIdx) {
 function treeState(S, index) { const { st } = buildState(S, index); st.order = FULL_ORDER.slice(0, index).concat(st.order); st.step = index; return st; }
 /* ---- 状态 ---- */
 let draftComplete = false, completedFrames = 0;
+const lifecycle = new DraftState.DraftLifecycle();
+let lastGoodState = null, draftHoldMode = "", lastSceneCheck = 0, lastHoldFull = 0, lastSceneImage = "";
 let phase = "idle", tracker = null, seq = 0, busy = false;
 let lastSig = null;        // 上次触发引擎的局面签名(有效座位/已选走/归属)
 let lastQuick = null;      // 上次完整识别那一帧的画面签名
@@ -174,6 +178,7 @@ function tryLock(img, pres) {
     log("pool", `同一池子重锁, 保留归属 ${Object.keys(t.owner).length} 技能 ${Object.keys(t.heroOf).length} 英雄`); }
   else logIdx = 0;
   t.fullOrder = FULL_ORDER; t.orderSeat = n => { const x = FULL_ORDER[Math.max(0, Math.min(n, FULL_ORDER.length - 1))]; return [x < 5 ? "L" : "R", x % 5]; };   // 第 n 手归谁
+  lifecycle.reset(); lastGoodState = null; draftHoldMode = "";
   tracker = t; draftComplete = false; completedFrames = 0; phase = "active"; forceReset = false; lastSig = null; lockSig = null; fastPicks.clear(); lastCal = -999; if (!samePool) endSnapped = false; lastQuick = null; lastCur = ""; lastTaken = -1; seq++; pendingNext = true;
   lastSeat = -1; pickedAtCur = false; lastAdvice = null; curCtx = null; myTurn = null; myEv.clear(); SCREEN = null; lastS = null; turnLock = null; fastDarkPrev = null; sinceFull = 0;
   log("pool", "池子: " + poolSummary(t));
@@ -188,6 +193,23 @@ function cancelComputations(reason = "state-reset", resetSearch = true) {
 }
 function goIdle(why) { cancelComputations("idle: "+why); if (COMBO_OFF === "slow") COMBO_OFF = ""; trFlush(); if (phase !== "idle") log("phase", "→ idle: " + why); if (POOL) POOL.cancel(); phase = "idle"; lastNd = 0; lockSig = null; lastQuick = null; cachedState = null; lastS = null; fastDarkPrev = null; seq++;
   parentPort.postMessage({ type: "clear" }); want(false); }
+/* Pause computation independently of session/display lifetime. Never discard the locked pool here. */
+function holdDraft(mode, reason) {
+  if (draftHoldMode !== mode) { cancelComputations("draft-" + mode); draftHoldMode = mode; log("phase", reason); }
+  phase = "active";
+  const previous = lastGoodState || {};
+  cachedState = { ...previous, type: "state", phase, idle: false, board: true, poolOk: !!tracker,
+    taken: previous.taken == null ? Math.max(0, lastTaken) : previous.taken, ms: previous.ms || 0,
+    current: previous.current || { side: "L", idx: 0 }, me: previous.me || null,
+    playerScores: previous.playerScores || [], draftStage: mode, advicePaused: true, notice: reason };
+  parentPort.postMessage(cachedState);
+  const now = Date.now(); if (now - lastHoldFull >= 900) { lastHoldFull = now; want(true); }
+}
+function resumeDraft() {
+  if (!draftHoldMode) return;
+  draftHoldMode = ""; lastQuick = null; pendingNext = true;
+  log("phase", "本局复核恢复，继续识别和推荐");
+}
 /* ---- 出建议 ---- */
 /* 同一个决策点("这一局的第 j 手")永远用同一套随机数:同一局面必然算出同一结果, 局面有真变化时结果只随变化本身变。
    实测:同一局面只换随机数, 前三每次都不一样(前几名只差 0.1~1 个百分点, 在模拟噪声以内), 同一套随机数算两遍逐位相同。
@@ -520,7 +542,7 @@ function advise(S, startIdx, pre, ms, ahead, lockInfo) {
 let turnLock = null;   // {cur: 当前选人座位, j: 目标下标, keys: 显示中的前十}
 function isTarget(seat, S) { const side = seat < 5 ? "L" : "R"; return ALL ? side === S.me.side : (side === S.me.side && seat % 5 === S.me.idx); }
 function chooseAdvice(S, startIdx, picked, ms) {
-  if (suppressAdvice) return;
+  if (suppressAdvice || lifecycle.advicePaused) return;
   const n = R.pickedCount(S);
   if (n >= 50) { if (lastSig !== "finished") { cancelComputations(); lastSig = "finished"; parentPort.postMessage({ type: "clear" }); } return; }
   /* 还没认出本人座位(v1.22):不猜, 不出推荐 —— 状态行提示"未确定你是几号位", 托盘可以手动指定 */
@@ -740,44 +762,86 @@ parentPort.on("message", async m => {
     if (isFull && (!DISP || DISP[0] !== img.w || DISP[1] !== img.h)) {   // 分辨率变了(或主进程没报过)→ 按实际帧重新缩放
       DISP = [img.w, img.h]; const r = R.rescale(img.w, img.h); trStop(); tracker = null; phase = "idle"; 
       log("disp", `按全分辨率帧重设版式 ${img.w}x${img.h} 比例 ${r.scale.toFixed(4)}${r.sixteenNine ? "" : " ⚠ 非 16:9"}`); }
+    const now = m.capturedAt == null ? Date.now() : m.capturedAt; let scene = { stage: "unknown" };
+    if (isFull && now - lastSceneCheck >= 700 && !(m.frozenFrames >= 8)) {
+      lastSceneCheck = now;
+      const digest = createHash("sha256").update(img.data).digest("hex");
+      if (digest !== lastSceneImage) {
+        lastSceneImage = digest; scene = DraftScene.detect(img);
+        lifecycle.observeScene(scene, now, m.captureId == null ? frames : m.captureId);
+      }
+    }
+    if (tracker && lifecycle.mode === "away") {
+      draftComplete = true;
+      if (phase !== "idle") goIdle("已确认进入游戏，保留本局资料");
+      if (now - lastHoldFull >= 1500) { lastHoldFull = now; want(true); }
+      parentPort.postMessage({ type: "state", phase, idle: true, board: false }); return;
+    }
+    if (tracker && lifecycle.mode === "strategy") {
+      draftComplete = true; holdDraft("strategy", lifecycle.reason); return;
+    }
     const pres = R.quickPresence(img);
+    if (tracker && draftComplete && scene.stage === "drafting") {
+      const next = R.boardSig(img, tracker.boxesNow), prev = tracker.lastBoardSig || [];
+      let up = 0; for (let i = 0; i < 60 && i < next.length && i < prev.length; i++) if (next[i] - prev[i] > 25) up++;
+      if ((pres.bright >= 45 || up >= 10) && R.draftBoardEvidence(img, tracker.boxesNow)) {
+        forceReset = true; retryAt = 0;
+      } else if (prev.length >= 60 && (R.sigDiff(next, prev) < 25 || up < 10)) {
+        // Contradictory choice text on the same late board revokes an earlier end.
+        draftComplete = false; phase = "active"; lastQuick = null; pendingNext = true; tracker.allowBulk = 1;
+      } else {
+        lifecycle.review("选技画面待确认，保留原池复核"); holdDraft("review", lifecycle.reason); return;
+      }
+    }
     /* 锁池前要求严(格子间隙必须暗, 免得在别的界面上乱锁);已经锁上之后只要格子还亮着就认为棋盘还在 ——
        实测有一次格子 59 亮却因 间隙0.37 被判"没有棋盘"而退出追踪(多半是有面板压住了格子之间的缝) */
-    const boardLike = phase === "active"
+    const boardLike = scene.stage === "drafting" || (phase === "active"
       ? (pres.bright + pres.dark >= 50 && pres.bright >= 8)
-      : (pres.bright >= 8 && pres.bright + pres.dark >= 50 && pres.gapDark >= 0.75);
+      : (pres.bright >= 8 && pres.bright + pres.dark >= 50 && pres.gapDark >= 0.75));
     if (frames % 120 === 1) log("stat", `帧${frames} 完整识别${heavy}次均${heavy ? Math.round(tHeavy / heavy) : 0}ms 快扫${scans}次均${scans ? (tScan / scans).toFixed(1) : 0}ms 阶段${phase} 亮格${pres.bright} 暗格${pres.dark} 间隙${pres.gapDark.toFixed(2)} 帧宽${img.w}`);
     if (!boardLike) { presentRun = 0; absentRun++;
-      if (phase === "active" && absentRun >= 4) goIdle(`连续 ${absentRun} 帧没有棋盘(亮${pres.bright} 暗${pres.dark} 间隙${pres.gapDark.toFixed(2)})`);
+      if (tracker && !draftComplete) {
+        lifecycle.review("画面暂时遮挡，保留本局等待复核");
+        holdDraft("review", lifecycle.reason); return;
+      }
       lastNd = 0; lockSig = null; parentPort.postMessage({ type: "state", phase, idle: true, pres, board: false }); return; }
     absentRun = 0; presentRun++;
+    /* Scan frames never release a review/full hold or run speculative advice. */
+    if (phase === "active" && tracker && !isFull && lifecycle.advicePaused) {
+      holdDraft(lifecycle.mode, lifecycle.reason); return;
+    }
     /* active + 扫描帧:走快通道 */
     if (phase === "active" && tracker && lastS && !isFull) {
       sinceFull++; const hit = fastTick(img);
-      if (!hit && sinceFull >= 4 && (pendingNext || sinceFull >= 8)) want(true);   // 有待确认的变化最快 1 秒一张全图, 平时 2 秒一张
-        // (实测全分辨率一帧 99ms、扫描帧 22ms —— 全图张数才是 CPU 大头)
+      if (!hit && sinceFull >= 4 && (pendingNext || sinceFull >= 8)) want(true);
       if (cachedState) parentPort.postMessage({ ...cachedState, skipped: true, board: true }); return; }
     if (phase === "idle" && !forceReset && Date.now() < retryAt) { parentPort.postMessage({ type: "state", phase, idle: true, pres, board: false }); return; }
     if (!isFull) { want(true); parentPort.postMessage({ type: "state", phase, idle: true, pres, board: true, near: lastNd >= 40 }); return; }   // 需要全图才能继续
-    /* 新一局:棋盘暗格数比已确认的已选走数少 4 个以上,且连续 2 帧 */
+    /* A candidate new pool must lock successfully before replacing the old one. */
     if (phase === "active" && lastTaken >= 4 && pres.dark <= 2 && pres.dark <= lastTaken - 4) dropRun++; else dropRun = 0;
-    if (dropRun >= 3) { log("phase", `棋盘几乎全亮(暗格 ${pres.dark})而记账里已选走 ${lastTaken}, 连续 ${dropRun} 帧 → 新的一局`); trStop(); tracker = null; phase = "idle"; presentRun = 2; retryAt = 0; seq++; dropRun = 0; parentPort.postMessage({ type: "clear" }); }
+    if (dropRun >= 3) { log("phase", "疑似新局开局，先确认新池再替换旧池"); forceReset = true; presentRun = 2; retryAt = 0; dropRun = 0; }
     if (phase === "idle" || forceReset) {
-      if (tracker && !forceReset) {   // 之前那局的棋盘回来了(切屏回来)还是换了一局?比 60 格亮度签名
+      if (tracker && !forceReset) {
         const sigNow = R.boardSig(img, tracker.boxesNow), sigOld = tracker.lastBoardSig || [];
         const d = R.sigDiff(sigNow, sigOld);
-        /* v1.37:光看"最大单格差"不够 —— 离开期间队友选走一件, 那一格亮度就掉几十, d 直接超 25, 整局记账被当成新一局清掉
-           (09-19 那局实测 d=88.7, 其实只是 2 格被选走)。同一局的棋盘只会**越选越暗**, 换了一局才会大片变亮:
-           实测 同一局离开再回来 变亮 0 格 / 开局到局末 变亮 0 格 / 换一局 变亮 59 格。所以加一条"没有大片变亮 = 还是这一局"。 */
         let up = 0; for (let i = 0; i < 60 && i < sigNow.length && i < sigOld.length; i++) if (sigNow[i] - sigOld[i] > 25) up++;
         if (draftComplete) {
-          if ((d < 25 && up < 10) || !R.draftBoardEvidence(img, tracker.boxesNow)) { retryAt = Date.now() + 5000; parentPort.postMessage({ type: "state", phase, idle: true, pres, board: false }); return; }
-          // Keep the completed tracker until a new pool actually locks. A failed
-          // probe or flip animation must not discard the sleeping end state.
-        } else if (d < 25 || up < 10) { phase = "active"; lastQuick = null; pendingNext = true; tracker.allowBulk = 1;   // 离开期间可能已经选走好几件, 允许一次批量更新
-          log("phase", `棋盘回来了(签名差 ${d.toFixed(0)}, 变亮 ${up} 格), 继续上一局追踪`); want(true); }
-        else { log("phase", `棋盘变了(签名差 ${d.toFixed(0)}, 变亮 ${up} 格) → 当新一局重锁`); trStop(); tracker = null; presentRun = Math.max(presentRun, 2); retryAt = 0; } }
-      if ((phase !== "active" || forceReset) && presentRun >= 1 && Date.now() >= retryAt) tryLock(img, pres);   // 不再要求"看到棋盘第 2 帧":tryLock 里"连续两帧画面一样"本身就证明棋盘真在, 两条叠加会多等一帧
+          if (scene.stage !== "drafting" || !R.draftBoardEvidence(img, tracker.boxesNow)) {
+            retryAt = Date.now() + 1500; parentPort.postMessage({ type: "state", phase, idle: true, pres, board: false }); return;
+          }
+        } else if (d < 25 || up < 10) {
+          phase = "active"; lastQuick = null; pendingNext = true; tracker.allowBulk = 1;
+          log("phase", "画面恢复，保留原池继续本局"); want(true);
+        } else if (scene.stage !== "drafting" || !R.draftBoardEvidence(img, tracker.boxesNow)) {
+          lifecycle.review("画面变化，保留本局等待复核"); holdDraft("review", lifecycle.reason); return;
+        }
+      }
+      if ((phase !== "active" || forceReset) && presentRun >= 1 && Date.now() >= retryAt) {
+        const hadTracker = !!tracker;
+        if (!tryLock(img, pres) && hadTracker) {
+          lifecycle.review("重锁未确认，保留原池复核"); holdDraft("review", lifecycle.reason); return;
+        }
+      }
       if (phase !== "active") { parentPort.postMessage({ type: "state", phase, idle: true, pres, waiting: true, board: true, near: lastNd >= 40 }); return; }
     }
     /* 托盘手动指定的本人座位:只对指定时的这一局有效(座位每局都变) —— 换了一局就作废, 通知主进程把菜单改回"自动" */
@@ -788,7 +852,7 @@ parentPort.on("message", async m => {
       if (String(man) !== String(tracker.meManual)) { log("me", man ? `手动指定本人座位 ${ME_PICK}` : "本人座位改回自动识别"); tracker.meManual = man; tracker.meSeat = man || tracker.meAuto || null; pendingNext = true; } }   // 变了就强制做一次完整识别, 不等画面变化
     /* ---- 慢通道:完整识别 ---- */
     const qs = R.quickSig(img, tracker.boxesNow); const diff = R.sigDiff(qs, lastQuick);
-    if (diff < 10 && cachedState && !pendingNext && completedFrames === 0) { parentPort.postMessage({ ...cachedState, skipped: true }); return; }
+    if (diff < 10 && cachedState && !pendingNext && completedFrames === 0 && !lifecycle.advicePaused) { parentPort.postMessage({ ...cachedState, skipped: true }); return; }
     lastQuick = qs; tracker.lastBoardSig = qs.slice(0, 60); sinceFull = 0; wantFull = false;
     /* 技能槽贴框标定:面板是平的 UI, 同一侧所有槽偏移一样。标一次平均匹配 0.62→0.84(真实 1080p 截图),
        之前那些"面板图标认不准"(0.2~0.5)基本都是框没贴准。等有人拿到技能后才能标, 之后每 200 帧复标一次 */
@@ -832,22 +896,19 @@ parentPort.on("message", async m => {
       if (confirmed || Date.now() - fp.t > 20000 || fp.n >= 2) { fastPicks.delete(k); continue; }
       if(S.me&&seatIdx(S.current)===seatIdx(S.me))continue; // 暂存快扫暗格只过滤显示，不驱动本人回合重算。
       if (isH) S.taken_heroes.push(key); else { const r = S.skills.find(x => x.key === key); if (r) r.taken = true; } }
-    const ultimateKeys = new Set(S.skills.filter(x => x.ultslot).map(x => x.key));
-    const confirmedFull = S.panels.length === 10 && new Set(S.panels.map(p => p.hero)).size === 10 &&
-      new Set(S.panels.flatMap(p => p.skills.map(x => x.key))).size === 40 &&
-      S.panels.every(p => p.hero && p.skills.length === 4 && p.skills.every(x => x.key !== '?pick') && p.skills.filter(x => ultimateKeys.has(x.key)).length === 1);
+    const confirmedFull = DraftState.fullRoster(S);
     completedFrames = confirmedFull ? completedFrames + 1 : 0;
-    if (completedFrames >= 2) { draftComplete = true; goIdle("十个座位已选满，停止推荐，等待下一局"); return; }
     pendingNext = !!S.pending;
     flushTrackLog(img);
     if (S.bulkMsg) log("fast", S.bulkMsg);
     if (S.flakyMsg) log("fast", S.flakyMsg);
     if (S.offMsg) log("phase", S.offMsg);
-    /* v1.37:画面不是选技棋盘的那几帧(切回大厅打字/看记分板/选完转场), observe 里已经整帧当"看不清"、一个字不改,
-       所以这里**不**退出追踪 —— 退出会走下面的"棋盘回来了还是换了一局"比对, 而大厅画面过不了那个比对, 反倒把整局记账重置掉。
-       画面回来后那几手照常认得出(实测那局离开 11 秒、期间队友选了 3 手, 回来后 3 手全部补上)。 */
     const observedCount = R.pickedCount(S);
-    if (observedCount > 50) { goIdle("计数超过合法上限，停止推演并等待复核"); retryAt = Date.now() + 2000; parentPort.postMessage({ type: "state", phase, idle: true, pres, board: false }); return; }
+    lifecycle.observeState(S, observedCount, now);
+    if (lifecycle.advicePaused) {
+      holdDraft(lifecycle.mode, lifecycle.reason); return;
+    }
+    resumeDraft();
     const curStr = `${S.current.side}${S.current.idx + 1}`, nTaken = R.pickedCount(S), prevTaken = lastTaken;
     if (nTaken !== lastTaken && lastTaken >= 0) { log("board", `第 ${nTaken} 手 [1.x] ${tracker.snapshotLine()}`);
       if (EST) { const st = EST.state(), seats = [];
@@ -872,6 +933,8 @@ parentPort.on("message", async m => {
     lastS = S;
     syncShareMode(S.me);
     cachedState = { type: "state", playerScores: safeScore(S.panels, R.LAYOUT()), phase, ms, my_turn: S.my_turn, current: S.current, me: S.me, meSource: tracker.meManual ? "manual" : tracker.meAuto ? "auto" : null, align: S.align, taken: nTaken, poolOk: S.pool_heroes.length === 12, pre: pickedAtCur, nextIsMe: pickedAtCur && effIsMe, board: true };
+    cachedState.draftStage = "drafting"; cachedState.advicePaused = false;
+    lastGoodState = cachedState;
     parentPort.postMessage(cachedState);
     try { turnTick(S, startIdx, nTaken); } catch (e) { log("error", "回合账本出错(不影响推荐): " + String(e && e.message || e)); }
     if (S.pool_heroes.length === 12) chooseAdvice(S, startIdx, pickedAtCur, null);

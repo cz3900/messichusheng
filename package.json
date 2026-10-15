@@ -7,6 +7,7 @@
   "private": true,
   "scripts": {
     "start": "electron .",
+    "test:draft-lifecycle": "node test/draft_lifecycle.js && node test/draft_scene.js && node test/draft_worker.js && node test/overlay_recovery.js",
     "test:player-scores": "node test/player_scores.js && node test/player_scores_overlay.js && node test/player_scores_guard.js && node test/overlay_hide.js",
     "test:panel": "node test/overlay_look.js && node test/panel.js && node test/overlay_me.js",
     "pack": "electron-packager . ADAssistant --platform=win32 --arch=x64 --out=dist --overwrite --asar=false --prune=true --ignore='^/dist' --ignore='^/test($|/)' --ignore='^/test_.*' --ignore='^/prof\\.js' --ignore='^/old($|/)' --ignore='^/data/lib\\.bin$' --ignore='^/tools($|/)' --ignore='\\.v0[0-9]$' --ignore='\\.bak$'"
