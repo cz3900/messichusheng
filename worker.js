@@ -608,9 +608,10 @@ function chooseAdvice(S, startIdx, picked, ms) {
 function startIdxOf(S, picked, nTaken) { let i0 = orderIndex(seatIdx(S.current), nTaken - (picked ? 1 : 0));
   // At a snake boundary the highlight does not move between the two picks.
   // A delayed / extra dark cell must not move us back and forth between them.
-  // Resolve this local pair using our panel's completed picks instead.
-  if (S.me && seatIdx(S.current) === seatIdx(S.me)) {
-    const seat = seatIdx(S.me), n = panelCount(S, seat);
+  // Resolve this local pair using the target panel's completed picks. In team
+  // mode the target can be an ally rather than the observing player's own seat.
+  if (S.me && isTarget(seatIdx(S.current), S)) {
+    const seat = seatIdx(S.current), n = panelCount(S, seat);
     const first = FULL_ORDER[i0 - 1] === seat ? i0 - 1 : FULL_ORDER[i0 + 1] === seat ? i0 : -1;
     if (n != null && first >= 0) {
       const done = Math.max(0, Math.min(2, n - seatPicksBefore(seat, first)));

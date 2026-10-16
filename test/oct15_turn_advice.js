@@ -19,23 +19,47 @@ check('reported count50 cannot clear a still-open last turn',()=>{
 // The same highlight and ±1 global counting noise must not switch those turns.
 for(const [seat,first,before] of [[9,9,0],[9,29,2],[0,19,1],[0,39,3]]){
   const point={side:seat<5?'L':'R',idx:seat%5};
-  for(let done=0;done<=2;done++){
-    const count=before+done;
-    context.pair={current:point,me:point,panels:[{...point,hero:count?'hero':null,skills:Array.from({length:Math.max(0,count-1)},(_,i)=>({key:'s'+i}))}]};
-    for(const drift of [-1,0,1])for(const picked of [false,true]){
-      const n=first+done+drift;
-      check(`seat${seat} pair${first+1}/${first+2}, own${count}, total${n}, fastPick${picked}`,()=>
-        assert.equal(run(`startIdxOf(pair,${picked},${n})`),first+done));
-      pairChecks++;
+  // Single-player mode, then all five same-side observers in team mode.
+  for(const observer of [null,0,1,2,3,4]){
+    run(`ALL=${observer!==null}`);
+    const me=observer===null?point:{side:point.side,idx:observer};
+    for(let done=0;done<=2;done++){
+      const count=before+done;
+      context.pair={current:point,me,panels:[{...point,hero:count?'hero':null,skills:Array.from({length:Math.max(0,count-1)},(_,i)=>({key:'s'+i}))}]};
+      for(const drift of [-1,0,1])for(const picked of [false,true]){
+        const n=first+done+drift;
+        check(`seat${seat} observer${observer} pair${first+1}/${first+2}, own${count}, total${n}, fastPick${picked}`,()=>
+          assert.equal(run(`startIdxOf(pair,${picked},${n})`),first+done));
+        pairChecks++;
+      }
     }
   }
 }
+run('ALL=false');
 // Missing panel evidence retains the existing global-order fallback.
 context.pair={current:{side:'R',idx:4},me:{side:'R',idx:4},panels:[]};
 assert.equal(run('startIdxOf(pair,false,29)'),29);
 // Highlight outside our seat still follows normal observed ordering.
 context.pair={current:{side:'L',idx:4},me:{side:'R',idx:4},panels:[]};
 assert.equal(run('startIdxOf(pair,false,28)'),28);
+// Team mode still uses global ordering for an opponent and falls back when the
+// allied panel is missing. Neither case may borrow the observer's own panel.
+run('ALL=true');
+context.pair={current:{side:'R',idx:4},me:{side:'L',idx:0},panels:[{side:'L',idx:0,hero:'hero',skills:[]}]};
+assert.equal(run('startIdxOf(pair,false,31)'),31);
+context.pair={current:{side:'R',idx:4},me:{side:'R',idx:0},panels:[]};
+assert.equal(run('startIdxOf(pair,false,29)'),29);
+// End-to-end scheduling: the observer is R1, but the recommendation is for R5's
+// second consecutive pick, even when the global count is one ahead.
+context.teamS=structuredClone(context.S);
+context.teamS.current={side:'R',idx:4};context.teamS.me={side:'R',idx:0};
+context.teamS.panels.forEach(p=>{p.hero=null;p.skills=[];});
+const basics=context.teamS.skills.filter(s=>!s.ultslot).slice(0,2);
+Object.assign(context.teamS.panels.find(p=>p.side==='R'&&p.idx===4),{hero:context.teamS.pool_heroes[0],skills:basics.map(s=>({key:s.key}))});
+events.length=0;calls.length=0;
+run('turnLock=null;chooseAdvice(teamS,startIdxOf(teamS,false,31),false,null)');
+assert.deepEqual(calls,[30],"team observer must recommend R5's second pick, not R4's next turn");
+run('ALL=false');
 // The clear path is still necessary when every seat has a legal, unique full roster.
 context.full=structuredClone(context.S);
 context.full.panels=Array.from({length:10},(_,i)=>({side:i<5?'L':'R',idx:i%5,hero:context.full.pool_heroes[i],
