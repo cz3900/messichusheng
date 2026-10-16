@@ -76,3 +76,46 @@ The optional `--baseline` flag runs only original pixels at native dimensions.
 worker without recognition mocks. It first requires a successful pool lock,
 then feeds dimmed, brightened and restored frames. Search is disabled through
 normal visibility IPC. These checks do not run Windows, Dota or DirectML.
+
+## Self-contained scorer failure integration
+
+`score_guard_pixels.json` contains a lossless PNG of anonymous regions from one
+Oct 15 pool screenshot. Only the central board, public hero-name headers, panel
+rims and skill slots survive; player names, avatars, turn portraits, friend list
+and chat are excluded. The original resolution is retained because a half-size
+version detected only 39 cells, below the production lock threshold of 40.
+This is one static regression fixture, not an accuracy benchmark.
+
+`npm run test:player-scores` now uses those actual pixels in a real worker thread.
+It exercises startup failure and repeated scoring exceptions without mocking
+recognition or requiring the external icon collection. It asserts empty score
+arrays, continued state delivery and error deduplication. Search is suppressed
+through normal visibility IPC. `--frame=/absolute/path.png` overrides the image;
+`--synthetic` retains the legacy icon-based scenario.
+
+## Native window and Windows bundle checks
+
+`npm run test:overlay-native` is an optional GUI test using real Electron windows,
+renderer, preload, IPC, production overlay-controller code and renderer recovery.
+It does not start capture, updates or upload, and uses temporary settings. It
+reports the actual OS; a macOS result cannot establish Windows/Dota fullscreen
+stacking. Scale cases exercise canvas coordinate conversion, not Windows DPI.
+The Windows workflow runs this check on a dedicated hosted runner. It has not
+run merely because the workflow exists in a local branch.
+
+Build on a supported Node runtime (Node 24 was used locally):
+
+```
+npm run pack
+node test/windows_package.js dist/ADAssistant-win32-x64
+node test/player_scores_guard.js --app=dist/ADAssistant-win32-x64/resources/app
+```
+
+The package audit checks PE x64 headers, source/resource hashes, excluded test
+files, JS parsing and CPU scorer agreement. It does not execute the EXE. Missing
+`onnxruntime-node` is reported explicitly: that source-only build cannot certify
+GPU/DirectML search modes as a complete release.
+
+The manually prepared workflow also runs on pushes to the dedicated
+`codex/windows-draft-validation` branch; it does not publish releases. Pushing
+that branch remains a separate user-authorized action.

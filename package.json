@@ -13,6 +13,7 @@
     "test:score-consistency": "node test/player_scores.js && node test/player_scores_consistency.js",
     "test:panel": "node test/overlay_look.js && node test/panel.js && node test/overlay_me.js",
     "test:overlay-lifecycle": "node test/overlay_match_lifecycle.js && node test/overlay_content_visibility.js && node test/overlay_hide.js && node test/overlay_recovery.js && node test/player_scores_overlay.js && node test/live_capture_lifecycle.js && node test/runtime_regressions.js",
+    "test:overlay-native": "electron test/native_overlay_smoke.js",
     "test:overcount": "node test/unpaired_dark_recovery.js && node test/pending_progress.js",
     "pack": "electron-packager . ADAssistant --platform=win32 --arch=x64 --out=dist --overwrite --asar=false --prune=true --ignore='^/dist' --ignore='^/test($|/)' --ignore='^/test_.*' --ignore='^/prof\\.js' --ignore='^/old($|/)' --ignore='^/data/lib\\.bin$' --ignore='^/tools($|/)' --ignore='\\.v0[0-9]$' --ignore='\\.bak$'",
     "test:f21": "node test/f21_model.js"
