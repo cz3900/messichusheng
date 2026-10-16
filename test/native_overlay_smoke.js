@@ -35,6 +35,7 @@ function resources(){const rows=app.getAppMetrics();return {time:Date.now(),wind
   processes:rows.map(r=>({pid:r.pid,type:r.type,cpu:r.cpu.percentCPUUsage,workingSetMB:r.memory.workingSetSize/1024}))};}
 async function main(){
   await app.whenReady();
+  assert.equal(path.resolve(app.getAppPath()),root,"launch through the root test_native_overlay.js entry so production relative loadFile paths resolve correctly");
   const source=fs.readFileSync(path.join(root,"main.js"),"utf8");
   ctx=vm.createContext({BrowserWindow,screen,ipcMain,path,__dirname:root,overlay:null,phase:"idle",cfg:{hidden:false,paused:false,showPlayerScores:true},
     liveWaiting:false,recognitionNotice:false,visibilityNoticeUntil:0,Date,
