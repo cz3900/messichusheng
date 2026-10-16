@@ -586,7 +586,7 @@ function chooseAdvice(S, startIdx, picked, ms) {
   let j = startIdx; while (j < FULL_ORDER.length && !(isTarget(FULL_ORDER[j], S) && isTarget(buildState(S, j).cur, S))) j++;
   if (j >= FULL_ORDER.length) {
     /* v1.46: 我(或团队模式下我方)已选满而这局还没结束 → 不清空, 顶上留一句提示, 小卡上的位置建议继续每手更新(09-28 真机: 满员后推荐框空, 被当成"消失") */
-    const nT = S.skills.filter(x => x.taken).length + (S.taken_heroes || []).length, meFull = panelCount(S, seatIdx(S.me)) >= 5;
+    const nT = R.pickedCount(S), meFull = panelCount(S, seatIdx(S.me)) >= 5;
     if (meFull && nT < 50) { if (lastSig !== "full") { seq++; if (POOL) POOL.cancel(); lastSig = "full"; lastAdvice = null; turnLock = null;
         parentPort.postMessage({ type: "advice", note: `${S.me.side === "L" ? "左" : "右"}${S.me.idx + 1}(我) 已选满 · 各座位小卡上有「预计 / 建议」位置行, 每落一手都会更新`, rows: [], side: S.me.side, seat: seatIdx(S.me), base: 0.5, my_turn: false }); log("advice", `我已选满(已选走 ${nT}) → 显示提示, 不再算推荐`); } return; }
     if (lastSig !== null) { seq++; if (POOL) POOL.cancel(); lastSig = null; lastAdvice = null; parentPort.postMessage({ type: "clear" }); } return; }
@@ -693,7 +693,7 @@ function fastTick(img) {
   const S = JSON.parse(JSON.stringify(lastS));
   /* 这是第几手就归第几手的那个座位 —— 顺序是死的(L1 R1 L2 R2…, 逐轮倒转), 比"当时高亮在谁那儿"可靠:
      完整识别 1~2 秒才一次, 高亮可能已经挪走了。实测有两个英雄被记到同一个 L1, 就是这么来的。 */
-  const nBefore = tracker.turn != null ? tracker.turn : S.skills.filter(x => x.taken).length + S.taken_heroes.length;
+  const nBefore = tracker.turn != null ? tracker.turn : R.pickedCount(S);
   const os = FULL_ORDER[Math.min(nBefore, FULL_ORDER.length - 1)], oseat = [os < 5 ? "L" : "R", os % 5];
   const cs = tracker.curSeat, seat = oseat;
   if (cs && (cs[0] !== seat[0] || cs[1] !== seat[1])) log("fast", `注意:高亮在 ${cs[0]}${cs[1] + 1} 但按顺序这是第 ${nBefore + 1} 手 → 归 ${seat[0]}${seat[1] + 1}`);

@@ -47,3 +47,17 @@ check('legal complete roster clears without requesting another recommendation',(
   run('chooseAdvice(full,49,false,null)');assert(events.some(e=>e.type==='clear'));assert.equal(calls.length,0);
 });
 console.log(`PASS: recorded count50 retained, complete legal roster cleared; ${pairChecks} consecutive-turn cases, missing-panel fallback and other-seat ordering`);
+// The progress counter may exclude a pending skill, but engine availability
+// must still block it; paired fast-path evidence must count immediately.
+context.waiting=structuredClone(context.S);
+context.waiting.skills.forEach(s=>s.taken=false);context.waiting.taken_heroes=[];
+context.waiting.panels.forEach(p=>{p.hero=null;p.skills=[];});
+context.waiting.pendingKeys=[context.waiting.skills[0].key];context.waiting.skills[0].taken=true;
+assert.equal(run('R.pickedCount(waiting)'),0);
+assert(run('buildState(waiting,0).st.blocked.includes(waiting.pendingKeys[0])'));
+assert.equal(run('buildState(waiting,0).st.order.length'),50,"a provisional cell does not consume a player's slot");
+run('waiting.panels[0].skills.push({key:waiting.pendingKeys[0]})');
+assert.equal(run('R.pickedCount(waiting)'),1);
+assert(!run('buildState(waiting,0).st.blocked.includes(waiting.pendingKeys[0])'));
+assert.equal(run('buildState(waiting,0).st.order.length'),49);
+console.log('PASS actual worker: pending skill blocked without consuming a slot; fast-path panel confirmation immediately counts');
