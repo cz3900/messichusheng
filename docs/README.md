@@ -1,5 +1,6 @@
 # 文档索引
 
+- [debug-score-consistency-2026-10-16.html](debug-score-consistency-2026-10-16.html) —— 同局分数卡不一致：1.48.5/1.49.0 模型资源、经济分配口径和中途识别进度；三端真实阵容重算与推荐顺位的可比条件
 - [debug-residual-overcount-2026-10-16.html](debug-residual-overcount-2026-10-16.html) —— 剩余 7 帧：待配对禁选与完成进度分离、第 11 个英雄路径修复；60 条完整历史轨迹、12,965 帧及 3 条有缺口补充回放
 - [debug-draft-fixes-2026-10-16.html](debug-draft-fixes-2026-10-16.html) —— 末轮清空验证、多计永久锁定修复与剩余路径；分数卡随推荐显隐，25 条真实轨迹前后回放
 - [debug-restart-2026-10-16.html](debug-restart-2026-10-16.html) —— 反复重启的后续调查：跨局原生窗 hide/show 回归、常驻透明窗口修复、100 次状态循环及 Windows 真机验证边界
