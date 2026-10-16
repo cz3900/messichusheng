@@ -765,7 +765,14 @@ class Tracker {
          按"连续暗了多久"而不是"确认了多久":误判(暗图标/遮挡)通常暗几帧就亮回来, 那种要照常撤销。
          09-11 那局:左2 第一手拿了美杜莎(认对了), 两分钟后左2 自己回合用鼠标在这张卡上晃, 卡面短暂"亮回来" → 被撤销、
          还把美杜莎推荐给左2, 随后美杜莎被当成右1 选的, 两人英雄对调。撤销只该用来纠正刚认错的(提示框瞬间盖黑之类), 那都在几秒内 */
-      if (this.stable[k] && (this.darkRun[k] || 0) >= 12) { if (st3 === 'T') this.darkRun[k]++; return true; }
+      if (this.stable[k] && (this.darkRun[k] || 0) >= 12) {
+        if (st3 === 'T') { this.darkRun[k]++; this.brightRun[k] = 0; return true; }
+        // A prolonged occlusion can also last twelve frames. Only panel-paired
+        // skills deserve the permanent lock; unpaired ones must recover after
+        // six clear bright observations. Keep them unavailable during the vote.
+        if (k.startsWith('hero:') || this.owner[k]) return true;
+        if ((this.brightRun[k] || 0) + 1 < 6) { this.brightRun[k] = (this.brightRun[k] || 0) + 1; pending = true; return true; }
+      }
       const d = st3 === 'T';
       this.darkRun[k] = d ? (this.darkRun[k] || 0) + 1 : 0; this.brightRun[k] = d ? 0 : (this.brightRun[k] || 0) + 1;
       this.firstT = this.firstT || {}; if (d && this.darkRun[k] === 1 && !this.stable[k]) this.firstT[k] = this.frameNo;   // 这一格开始变暗的时刻(英雄按时间顺序排座位用)

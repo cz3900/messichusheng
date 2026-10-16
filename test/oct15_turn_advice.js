@@ -7,7 +7,7 @@ const events=[],calls=[],context=vm.createContext({Buffer,Uint8Array,Int8Array,F
   console,setTimeout,clearTimeout,setImmediate,clearImmediate,__dirname:root,process:{env:{...process.env,AD_THREADS:'0'}},calls,
   require(name){if(name==='worker_threads')return {parentPort:{on(){},postMessage:m=>events.push(m)}};return realRequire(name);}});
 vm.runInContext(fs.readFileSync(path.join(root,'worker.js'),'utf8'),context);
-let checks=0;
+let checks=0,pairChecks=0;
 const run=code=>vm.runInContext(code,context),check=(name,f)=>{try{f();checks++;}catch(e){e.message=name+': '+e.message;throw e;}};
 run('advise=(S,j)=>calls.push(j);');
 context.S=require('./fixtures/oct15_late_count.json').state;
@@ -26,6 +26,7 @@ for(const [seat,first,before] of [[9,9,0],[9,29,2],[0,19,1],[0,39,3]]){
       const n=first+done+drift;
       check(`seat${seat} pair${first+1}/${first+2}, own${count}, total${n}, fastPick${picked}`,()=>
         assert.equal(run(`startIdxOf(pair,${picked},${n})`),first+done));
+      pairChecks++;
     }
   }
 }
@@ -35,4 +36,14 @@ assert.equal(run('startIdxOf(pair,false,29)'),29);
 // Highlight outside our seat still follows normal observed ordering.
 context.pair={current:{side:'L',idx:4},me:{side:'R',idx:4},panels:[]};
 assert.equal(run('startIdxOf(pair,false,28)'),28);
-console.log(`PASS: recorded count50 retained; ${checks-1} consecutive-turn cases, missing-panel fallback and other-seat ordering`);
+// The clear path is still necessary when every seat has a legal, unique full roster.
+context.full=structuredClone(context.S);
+context.full.panels=Array.from({length:10},(_,i)=>({side:i<5?'L':'R',idx:i%5,hero:context.full.pool_heroes[i],
+  skills:Array.from({length:4},(_,j)=>({key:`complete_${i}_${j}`}))}));
+context.full.skills=context.full.panels.flatMap(p=>p.skills.map((s,j)=>({...s,taken:true,ultslot:j===3})));
+context.full.taken_heroes=context.full.pool_heroes.slice(0,10);
+events.length=0;calls.length=0;
+check('legal complete roster clears without requesting another recommendation',()=>{
+  run('chooseAdvice(full,49,false,null)');assert(events.some(e=>e.type==='clear'));assert.equal(calls.length,0);
+});
+console.log(`PASS: recorded count50 retained, complete legal roster cleared; ${pairChecks} consecutive-turn cases, missing-panel fallback and other-seat ordering`);

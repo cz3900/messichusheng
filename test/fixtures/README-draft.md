@@ -1,5 +1,27 @@
 # Draft lifecycle regression fixtures
 
+`oct15_late_count.json` records an anonymous late-turn observation that reports
+50 total picks while the local player still has a slot open. `oct15_unpaired_dark.json`
+records three bright-cell measurements and their stuck debounce state from the
+Oct 15 C06 trace. The latter tests recovery from an unpaired long-dark false pick;
+it is not an entire screenshot or independent ground truth for every selection.
+
+Run `node test/oct15_turn_advice.js`, `npm run test:overcount`, and
+`node test/overlay_content_visibility.js` for the late-turn, count-recovery and
+unified score-card/advice visibility regressions. The score data and draft pool
+remain retained while presentation is paused.
+
+For private trace diagnosis, use:
+
+```
+node tools/debug_draft/audit_overcount.js /absolute/path/to/trace.jsonl
+OVERCOUNT_RECOG_REF=c022891 node tools/debug_draft/audit_overcount.js /absolute/path/to/trace.jsonl
+```
+
+The optional `--assert-valid` exits with status 1 if any frame still exceeds 50
+or has missing recorded observations. It is expected to fail on the residual
+pending-skill/orphan-hero cases; the diagnostic is separate from passing unit tests.
+
 `draft_overcount.json` is the anonymized recognition state at frame 194 of the
 Oct 14 failure trace (52 counted picks, incomplete panels). It contains game keys
 and seat coordinates, without player names or account identifiers.

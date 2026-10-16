@@ -204,7 +204,7 @@ function holdDraft(mode, reason) {
     taken: previous.taken == null ? Math.max(0, lastTaken) : previous.taken, ms: previous.ms || 0,
     current: previous.current || { side: "L", idx: 0 }, me: previous.me || null,
     playerScores: previous.playerScores || [], draftStage: mode, advicePaused: true, manualRecovery: lifecycle.manual,
-    notice: (lifecycle.manual ? "人工恢复 · " : "") + reason + "（评分为上次确认）" };
+    notice: (lifecycle.manual ? "人工恢复 · " : "") + reason };
   parentPort.postMessage(cachedState);
   const now = Date.now(); if (now - lastHoldFull >= 900) { lastHoldFull = now; want(true); }
 }
