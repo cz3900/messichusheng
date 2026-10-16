@@ -572,8 +572,13 @@ let turnLock = null;   // {cur: 当前选人座位, j: 目标下标, keys: 显�
 function isTarget(seat, S) { const side = seat < 5 ? "L" : "R"; return ALL ? side === S.me.side : (side === S.me.side && seat % 5 === S.me.idx); }
 function chooseAdvice(S, startIdx, picked, ms) {
   if (suppressAdvice || lifecycle.advicePaused) return;
-  const n = R.pickedCount(S);
-  if (n >= 50) { if (lastSig !== "finished") { cancelComputations(); lastSig = "finished"; parentPort.postMessage({ type: "clear" }); } return; }
+  // Unpaired dark cells can make the global count reach 50 before the final
+  // player has picked. Completion belongs to the lifecycle / actual seat slots,
+  // never to this count-only shortcut (Oct 15 R5 last-turn disappearance).
+  if (DraftState.fullRoster(S)) {
+    if (lastSig !== "finished") { cancelComputations(); lastSig = "finished"; parentPort.postMessage({ type: "clear" }); }
+    return;
+  }
   /* 还没认出本人座位(v1.22):不猜, 不出推荐 —— 状态行提示"未确定你是几号位", 托盘可以手动指定 */
   if (!S.me) { if (lastSig !== null) { seq++; if (POOL) POOL.cancel(); lastSig = null; lastAdvice = null; parentPort.postMessage({ type: "clear" }); } turnLock = null; return; }
   /* 目标座位在识别里已经选满时, buildState 排剩余顺序会跳过他, 真正被算的是顺序里下一个还有空位的人 ——
@@ -601,6 +606,17 @@ function chooseAdvice(S, startIdx, picked, ms) {
 /* 该给谁算:当前高亮这位还没落子 → 给他算;已经落子(高亮还没移走但格子已经黑了) → 提前给下一位算。
    nTaken = 已经落子的手数(含刚刚这一手)。返回顺序表下标。 */
 function startIdxOf(S, picked, nTaken) { let i0 = orderIndex(seatIdx(S.current), nTaken - (picked ? 1 : 0));
+  // At a snake boundary the highlight does not move between the two picks.
+  // A delayed / extra dark cell must not move us back and forth between them.
+  // Resolve this local pair using our panel's completed picks instead.
+  if (S.me && seatIdx(S.current) === seatIdx(S.me)) {
+    const seat = seatIdx(S.me), n = panelCount(S, seat);
+    const first = FULL_ORDER[i0 - 1] === seat ? i0 - 1 : FULL_ORDER[i0 + 1] === seat ? i0 : -1;
+    if (n != null && first >= 0) {
+      const done = Math.max(0, Math.min(2, n - seatPicksBefore(seat, first)));
+      return Math.min(first + done, FULL_ORDER.length - 1);
+    }
+  }
   /* 高亮慢一拍:他这一手已经算进已选手数(第 nTaken 手就是他那格), 高亮还停在他身上 → 他已经选完了, 不是"还在选"。
      v1.35 及以前会接着给他算下一手(09-18 日志 7 次, 例: 左2 刚选完又被推荐大招, 其实该算左1) */
   if (!picked && i0 === nTaken - 1) picked = true;

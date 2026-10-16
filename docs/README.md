@@ -1,5 +1,6 @@
 # 文档索引
 
+- [debug-2026-10-15.html](debug-2026-10-15.html) —— 10/15 菜鱼张某四项故障核对；修复末轮计数清空与连选定位，明确账目复核和 Windows 显示尚未解决的部分
 - [recognition.md](recognition.md) —— 识别层：版式定位、逐格贴框、模板匹配、三态判定、空槽判定、读池子
 - [attribution.md](attribution.md) —— 归属层：两条线索如何配对，9 个步骤各治什么病，以及该怎么收口
 - [performance.md](performance.md) —— 快慢双通道、重算触发条件、引擎线程、延迟构成
