@@ -6,6 +6,8 @@ const {app,BrowserWindow,ipcMain,screen}=require("electron");
 const assert=require("assert/strict"),fs=require("fs"),os=require("os"),path=require("path"),vm=require("vm");
 const root=path.resolve(__dirname,".."),temporary=fs.mkdtempSync(path.join(os.tmpdir(),"ad-overlay-check-"));
 app.setPath("userData",temporary);app.setName("AD overlay verification");
+// Match the production tray app: rebuilding its sole window must not quit it.
+app.on("window-all-closed",()=>{});
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 const output=process.argv.find(x=>x.startsWith("--out="))?.slice(6)||path.join(root,"dist/validation/native-overlay-smoke.json");
 const cycles=+(process.argv.find(x=>x.startsWith("--cycles="))?.slice(9)||100);
